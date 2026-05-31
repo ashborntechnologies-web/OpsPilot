@@ -191,6 +191,16 @@ func (s *Service) DetectFramework(ctx context.Context, token, owner, repo string
 	result.HasDocker = fileSet["dockerfile"]
 
 	switch {
+	case fileSet["pom.xml"] || fileSet["build.gradle"] || fileSet["build.gradle.kts"]:
+		result.Framework = models.FrameworkSpring
+		result.Confidence = "high"
+		result.Signals = append(result.Signals, "Maven/Gradle build file detected (Spring Boot)")
+
+	case fileSet["gemfile"]:
+		result.Framework = models.FrameworkRails
+		result.Confidence = "high"
+		result.Signals = append(result.Signals, "Gemfile detected (Ruby on Rails)")
+
 	case fileSet["go.mod"]:
 		result.Framework = models.FrameworkGo
 		result.Confidence = "high"
@@ -264,21 +274,28 @@ func (s *Service) DetectFramework(ctx context.Context, token, owner, repo string
 		}
 
 	default:
-		hasPy := false
-		for _, f := range files {
-			if strings.HasSuffix(strings.ToLower(f), ".py") {
-				hasPy = true
-				break
-			}
-		}
-		if hasPy {
-			result.Framework = models.FrameworkPython
+		switch {
+		case fileSet["index.html"]:
+			result.Framework = models.FrameworkStatic
 			result.Confidence = "medium"
-			result.Signals = append(result.Signals, "Python files detected (no requirements.txt)")
-		} else {
-			result.Framework = ""
-			result.Confidence = "low"
-			result.Signals = append(result.Signals, "no recognized framework files found")
+			result.Signals = append(result.Signals, "index.html found, no backend detected")
+		default:
+			hasPy := false
+			for _, f := range files {
+				if strings.HasSuffix(strings.ToLower(f), ".py") {
+					hasPy = true
+					break
+				}
+			}
+			if hasPy {
+				result.Framework = models.FrameworkPython
+				result.Confidence = "medium"
+				result.Signals = append(result.Signals, "Python files detected (no requirements.txt)")
+			} else {
+				result.Framework = ""
+				result.Confidence = "low"
+				result.Signals = append(result.Signals, "no recognized framework files found")
+			}
 		}
 	}
 

@@ -47,7 +47,28 @@ const FRAMEWORK_GROUPS = [
     group: "Go",
     color: "bg-cyan-400",
     items: [
-      { value: "go", label: "Go", desc: "Any Go HTTP server" },
+      { value: "go", label: "Go", desc: "net/http · Gin · Fiber" },
+    ],
+  },
+  {
+    group: "Ruby",
+    color: "bg-red-400",
+    items: [
+      { value: "rails", label: "Ruby on Rails", desc: "Rails + Puma" },
+    ],
+  },
+  {
+    group: "Java",
+    color: "bg-orange-400",
+    items: [
+      { value: "spring", label: "Spring Boot", desc: "Maven or Gradle" },
+    ],
+  },
+  {
+    group: "Static",
+    color: "bg-zinc-400",
+    items: [
+      { value: "static", label: "Static / HTML", desc: "Nginx serving HTML/CSS/JS" },
     ],
   },
 ] as const;
@@ -66,6 +87,9 @@ const DEFAULT_START_COMMANDS: Record<string, string> = {
   svelte:   "node build/index.js",
   astro:    "node ./dist/server/entry.mjs",
   go:       "./server",
+  rails:    "bundle exec puma -C config/puma.rb",
+  spring:   "java -jar app.jar",
+  static:   "nginx -g 'daemon off;'",
 };
 
 export default function NewProjectPage() {

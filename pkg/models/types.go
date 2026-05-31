@@ -149,6 +149,15 @@ const (
 
 	// Go
 	FrameworkGo = "go"
+
+	// Ruby
+	FrameworkRails = "rails"
+
+	// Java
+	FrameworkSpring = "spring"
+
+	// Static
+	FrameworkStatic = "static"
 )
 
 // Deployment status constants

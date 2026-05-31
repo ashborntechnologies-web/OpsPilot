@@ -19,7 +19,10 @@ export interface AWSAccount {
 export type Framework =
   | "fastapi" | "flask" | "django" | "python"
   | "nodejs" | "express" | "nestjs" | "nextjs" | "remix" | "nuxtjs" | "svelte" | "astro"
-  | "go";
+  | "go"
+  | "rails"
+  | "spring"
+  | "static";
 
 export interface Project {
   id: string;

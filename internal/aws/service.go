@@ -1109,6 +1109,15 @@ func defaultStartCommand(framework string) string {
 	// Go
 	case "go":
 		return "./server"
+	// Ruby
+	case "rails":
+		return "bundle exec puma -C config/puma.rb"
+	// Java
+	case "spring":
+		return "java -jar app.jar"
+	// Static
+	case "static":
+		return "nginx -g 'daemon off;'"
 	default:
 		return "./start.sh"
 	}
@@ -1224,6 +1233,40 @@ COPY --from=builder /app/server .
 EXPOSE %d
 %s`, port, cmd)
 
+	case "rails":
+		return fmt.Sprintf(`FROM public.ecr.aws/docker/library/ruby:3.2-slim
+RUN apt-get update -qq && apt-get install -y build-essential libpq-dev nodejs && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY Gemfile Gemfile.lock ./
+RUN bundle install --without development test
+COPY . .
+RUN SECRET_KEY_BASE=dummy bundle exec rake assets:precompile 2>/dev/null || true
+EXPOSE %d
+%s`, port, cmd)
+
+	case "spring":
+		return fmt.Sprintf(`FROM public.ecr.aws/docker/library/eclipse-temurin:21-jdk-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN chmod +x mvnw 2>/dev/null; chmod +x gradlew 2>/dev/null; true
+RUN if [ -f mvnw ]; then ./mvnw package -DskipTests -q; \
+    elif [ -f pom.xml ]; then mvn package -DskipTests -q; \
+    elif [ -f gradlew ]; then ./gradlew bootJar -x test -q; \
+    else gradle bootJar -x test -q; fi && \
+    find . -name "*.jar" -not -name "*sources*" -not -name "*javadoc*" | head -1 | xargs -I{} cp {} /app.jar
+
+FROM public.ecr.aws/docker/library/eclipse-temurin:21-jre-alpine
+WORKDIR /app
+COPY --from=builder /app.jar app.jar
+EXPOSE %d
+%s`, port, cmd)
+
+	case "static":
+		return fmt.Sprintf(`FROM public.ecr.aws/nginx/nginx:stable-alpine
+COPY . /usr/share/nginx/html
+EXPOSE %d
+CMD ["nginx", "-g", "daemon off;"]`, port)
+
 	default:
 		return fmt.Sprintf(`FROM public.ecr.aws/ubuntu/ubuntu:22.04
 WORKDIR /app
@@ -1236,19 +1279,23 @@ EXPOSE %d
 // frameworkPort returns the container port for each supported framework.
 func frameworkPort(framework string) int32 {
 	switch framework {
-	case "nodejs", "express", "nestjs", "nextjs", "remix", "nuxtjs", "svelte", "astro":
+	case "nodejs", "express", "nestjs", "nextjs", "remix", "nuxtjs", "svelte", "astro", "rails":
 		return 3000
-	case "go":
+	case "go", "spring":
 		return 8080
+	case "static":
+		return 80
 	default:
 		return 8000
 	}
 }
 
-// taskResources returns CPU and memory strings for Fargate based on environment name.
+// taskResources returns Fargate CPU and memory for an environment tier.
+// Staging:    512 vCPU units / 1024 MB — handles JVM cold-start (Spring Boot, Rails)
+// Production: 1024 vCPU units / 2048 MB — headroom for real traffic
 func taskResources(envName string) (cpu, memory string) {
 	if envName == "production" {
-		return "512", "1024"
+		return "1024", "2048"
 	}
-	return "256", "512"
+	return "512", "1024"
 }
