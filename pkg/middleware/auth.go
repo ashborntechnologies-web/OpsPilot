@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -14,45 +15,40 @@ import (
 const UserIDContextKey = "user_id"   // uuid.UUID
 const ClerkIDContextKey = "clerk_id" // string
 
-// RequireAuth validates the Clerk JWT, upserts the user in Postgres, and sets
-// user_id (uuid.UUID) and clerk_id (string) on the Gin context for downstream handlers.
+// ResolveToken validates a raw Clerk JWT string and returns the platform user ID.
+// Used by both the HTTP middleware and the WebSocket first-message auth handler.
+func ResolveToken(ctx context.Context, db *models.DB, authSvc *auth.Service, tokenString string) (uuid.UUID, error) {
+	claims, err := authSvc.ValidateToken(tokenString)
+	if err != nil {
+		return uuid.UUID{}, fmt.Errorf("invalid token: %w", err)
+	}
+	return upsertUser(ctx, db, authSvc, claims.Subject)
+}
+
+// RequireAuth validates the Clerk JWT from the Authorization header, upserts the user
+// in Postgres, and sets user_id / clerk_id on the Gin context for downstream handlers.
 func RequireAuth(authSvc *auth.Service, db *models.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Prefer Authorization header; fall back to ?token= query param.
-		// The query-param fallback is required for WebSocket upgrades — browsers
-		// cannot set custom headers on the native WebSocket API.
-		tokenString := ""
-		if authHeader := c.GetHeader("Authorization"); authHeader != "" {
-			parts := strings.SplitN(authHeader, " ", 2)
-			if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid authorization header format"})
-				return
-			}
-			tokenString = parts[1]
-		} else if t := c.Query("token"); t != "" {
-			tokenString = t
-		}
-
-		if tokenString == "" {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing authorization"})
 			return
 		}
 
-		claims, err := authSvc.ValidateToken(tokenString)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid authorization header format"})
 			return
 		}
 
-		clerkID := claims.Subject
-
-		userID, err := upsertUser(c.Request.Context(), db, authSvc, clerkID)
+		userID, err := ResolveToken(c.Request.Context(), db, authSvc, parts[1])
 		if err != nil {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve user"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 			return
 		}
 
-		c.Set(ClerkIDContextKey, clerkID)
+		claims, _ := authSvc.ValidateToken(parts[1])
+		c.Set(ClerkIDContextKey, claims.Subject)
 		c.Set(UserIDContextKey, userID)
 		c.Next()
 	}

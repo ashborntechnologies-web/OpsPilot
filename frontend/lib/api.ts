@@ -204,9 +204,11 @@ export function getBootstrapTemplate(region: string) {
 
 // ---- WebSocket URL -----------------------------------------------------------
 // WebSocket can't go through the Next.js proxy, so it uses the backend URL directly.
+// The bearer token is NOT included in the URL — it is sent as the first WebSocket
+// message after the connection opens to keep it out of server logs and browser history.
 
-export function wsURL(projectId: string, token: string) {
+export function wsURL(projectId: string) {
   const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
   const base = apiUrl.replace(/^http/, "ws");
-  return `${base}/api/v1/ws/${projectId}?token=${encodeURIComponent(token)}`;
+  return `${base}/api/v1/ws/${projectId}`;
 }

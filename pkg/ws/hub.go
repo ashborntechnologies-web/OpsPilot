@@ -6,8 +6,8 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
-	"github.com/convdeploy/platform/pkg/middleware"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -24,6 +24,10 @@ type Message struct {
 type MessageHandler interface {
 	ProcessMessage(ctx context.Context, projectID uuid.UUID, userID uuid.UUID, message string) (string, error)
 }
+
+// AuthFunc validates a bearer token and returns the platform user ID.
+// Injected at startup so the hub stays decoupled from the auth package.
+type AuthFunc func(ctx context.Context, token string) (uuid.UUID, error)
 
 type client struct {
 	conn      *websocket.Conn
@@ -54,16 +58,49 @@ func NewHub() *Hub {
 func (h *Hub) Run() {}
 
 // HandleUpgrade upgrades an HTTP connection to WebSocket and starts the read/write loops.
-func (h *Hub) HandleUpgrade(c *gin.Context, handler MessageHandler) {
+// Authentication is performed via the first client message:
+//
+//	{"type":"auth","token":"<clerk_jwt>"}
+//
+// The connection is closed immediately if the first message is missing, malformed,
+// or carries an invalid token. This keeps the bearer token out of server logs and
+// browser history (no ?token= query parameter).
+func (h *Hub) HandleUpgrade(c *gin.Context, authFn AuthFunc, handler MessageHandler) {
 	projectID := c.Param("projectId")
-
-	userID, _ := middleware.GetUserID(c)
+	pid, pidErr := uuid.Parse(projectID)
 
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("WebSocket upgrade error: %v", err)
 		return
 	}
+
+	// ── First-message auth ──────────────────────────────────────────────────
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, raw, err := conn.ReadMessage()
+	conn.SetReadDeadline(time.Time{}) // clear deadline
+	if err != nil {
+		conn.Close()
+		return
+	}
+
+	var authMsg struct {
+		Type  string `json:"type"`
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &authMsg); err != nil || authMsg.Type != "auth" || authMsg.Token == "" {
+		conn.WriteMessage(websocket.TextMessage, mustMarshal(Message{Type: "error", Payload: "first message must be {type:auth,token:...}"}))
+		conn.Close()
+		return
+	}
+
+	userID, err := authFn(c.Request.Context(), authMsg.Token)
+	if err != nil {
+		conn.WriteMessage(websocket.TextMessage, mustMarshal(Message{Type: "error", Payload: "unauthorized"}))
+		conn.Close()
+		return
+	}
+	// ────────────────────────────────────────────────────────────────────────
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cl := &client{
@@ -87,9 +124,7 @@ func (h *Hub) HandleUpgrade(c *gin.Context, handler MessageHandler) {
 		}
 	}()
 
-	// Read loop — one goroutine per connected client
-	pid, pidErr := uuid.Parse(projectID)
-
+	// Read loop
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
@@ -108,13 +143,12 @@ func (h *Hub) HandleUpgrade(c *gin.Context, handler MessageHandler) {
 			continue
 		}
 
-		// Process in a goroutine so the read loop stays unblocked for future messages
 		go func(msg string) {
 			cl.safeSend(Message{Type: "thinking", Payload: ""})
 
 			response, err := handler.ProcessMessage(cl.ctx, pid, userID, msg)
 			if cl.ctx.Err() != nil {
-				return // connection dropped while processing — discard
+				return
 			}
 			if err != nil {
 				cl.safeSend(Message{Type: "error", Payload: err.Error()})
@@ -123,6 +157,11 @@ func (h *Hub) HandleUpgrade(c *gin.Context, handler MessageHandler) {
 			cl.safeSend(Message{Type: "assistant_message", Payload: response})
 		}(incoming.Message)
 	}
+}
+
+func mustMarshal(m Message) []byte {
+	b, _ := json.Marshal(m)
+	return b
 }
 
 // Broadcast sends a message to all clients subscribed to a projectID.

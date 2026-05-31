@@ -33,10 +33,14 @@ export function useProjectWS(projectId: string, token: string | null) {
   useEffect(() => {
     if (!token || !projectId) return;
 
-    const ws = new WebSocket(wsURL(projectId, token));
+    const ws = new WebSocket(wsURL(projectId));
     wsRef.current = ws;
 
-    ws.onopen = () => setConnected(true);
+    ws.onopen = () => {
+      // Send auth token as first message — keeps it out of the URL / server logs.
+      ws.send(JSON.stringify({ type: "auth", token }));
+      setConnected(true);
+    };
     ws.onclose = () => setConnected(false);
 
     ws.onmessage = (ev) => {

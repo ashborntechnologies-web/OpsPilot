@@ -153,7 +153,10 @@ export default function ProjectPage() {
     let closed = false;
     getToken().then((token) => {
       if (!token || closed) return;
-      ws = new WebSocket(wsURL(id, token));
+      ws = new WebSocket(wsURL(id));
+      ws.onopen = () => {
+        ws?.send(JSON.stringify({ type: "auth", token }));
+      };
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data) as WsMessage;

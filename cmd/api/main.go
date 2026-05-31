@@ -21,7 +21,7 @@ import (
 	"github.com/convdeploy/platform/internal/queue"
 	"github.com/convdeploy/platform/pkg/middleware"
 	"github.com/convdeploy/platform/pkg/models"
-	"github.com/convdeploy/platform/pkg/ws"
+	pkgws "github.com/convdeploy/platform/pkg/ws"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -81,11 +81,17 @@ func main() {
 	}
 
 	// Init WebSocket hub
-	hub := ws.NewHub()
+	hub := pkgws.NewHub()
 	go hub.Run()
 
 	// Init services
 	authSvc := auth.NewService(os.Getenv("CLERK_PUBLISHABLE_KEY"), os.Getenv("CLERK_SECRET_KEY"))
+
+	// wsAuthFn is injected into the WebSocket hub so it can validate the first-message token
+	// without taking a URL query parameter (which leaks into server logs and browser history).
+	wsAuthFn := pkgws.AuthFunc(func(ctx context.Context, token string) (uuid.UUID, error) {
+		return middleware.ResolveToken(ctx, db, authSvc, token)
+	})
 	githubSvc := githubsvc.NewService(
 		os.Getenv("GITHUB_CLIENT_ID"),
 		os.Getenv("GITHUB_CLIENT_SECRET"),
@@ -183,11 +189,13 @@ func main() {
 		protected.POST("/projects/:id/conversation", conversationSvc.HandleMessage)
 		protected.GET("/projects/:id/conversation/history", conversationSvc.HandleHistory)
 
-		// WebSocket
-		protected.GET("/ws/:projectId", func(c *gin.Context) {
-			hub.HandleUpgrade(c, conversationSvc)
-		})
+		// (WebSocket is registered below, outside this group)
 	}
+
+	// WebSocket — outside the auth middleware; auth is done via first-message token.
+	v1.GET("/ws/:projectId", func(c *gin.Context) {
+		hub.HandleUpgrade(c, wsAuthFn, conversationSvc)
+	})
 
 	// Start server
 	port := os.Getenv("PORT")
