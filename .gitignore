@@ -1,7 +1,14 @@
 .env
 bin/
+/api
 *.exe
 *.test
 *.out
 vendor/
 .DS_Store
+
+# Office documents — keep locally, never commit
+*.docx
+*.xlsx
+*.pptx
+*.pdf
