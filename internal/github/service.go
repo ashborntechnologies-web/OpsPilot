@@ -191,23 +191,34 @@ func (s *Service) DetectFramework(ctx context.Context, token, owner, repo string
 	result.HasDocker = fileSet["dockerfile"]
 
 	switch {
+	case fileSet["go.mod"]:
+		result.Framework = models.FrameworkGo
+		result.Confidence = "high"
+		result.Signals = append(result.Signals, "go.mod detected")
+
 	case fileSet["next.config.js"] || fileSet["next.config.ts"] || fileSet["next.config.mjs"]:
 		result.Framework = models.FrameworkNextJS
 		result.Confidence = "high"
-		result.Signals = append(result.Signals, "next.config.js detected")
+		result.Signals = append(result.Signals, "next.config.* detected")
+
+	case fileSet["manage.py"]:
+		result.Framework = models.FrameworkDjango
+		result.Confidence = "high"
+		result.Signals = append(result.Signals, "manage.py detected (Django)")
 
 	case fileSet["requirements.txt"] || fileSet["pyproject.toml"]:
 		if fileSet["main.py"] {
 			content, _ := s.fetchFileContentDecoded(ctx, token, owner, repo, "main.py")
-			if strings.Contains(content, "fastapi") || strings.Contains(content, "FastAPI") {
+			switch {
+			case strings.Contains(content, "fastapi") || strings.Contains(content, "FastAPI"):
 				result.Framework = models.FrameworkFastAPI
 				result.Confidence = "high"
 				result.Signals = append(result.Signals, "FastAPI import in main.py")
-			} else if strings.Contains(content, "flask") || strings.Contains(content, "Flask") {
+			case strings.Contains(content, "flask") || strings.Contains(content, "Flask"):
 				result.Framework = models.FrameworkFlask
 				result.Confidence = "high"
 				result.Signals = append(result.Signals, "Flask import in main.py")
-			} else {
+			default:
 				result.Framework = models.FrameworkPython
 				result.Confidence = "medium"
 				result.Signals = append(result.Signals, "Python requirements found, no specific framework detected")
@@ -219,12 +230,40 @@ func (s *Service) DetectFramework(ctx context.Context, token, owner, repo string
 		}
 
 	case fileSet["package.json"]:
-		result.Framework = models.FrameworkNodeJS
-		result.Confidence = "high"
-		result.Signals = append(result.Signals, "package.json detected")
+		// Read package.json to detect specific JS/TS frameworks by their deps
+		pkg, _ := s.fetchFileContentDecoded(ctx, token, owner, repo, "package.json")
+		switch {
+		case strings.Contains(pkg, `"@nestjs/core"`):
+			result.Framework = models.FrameworkNestJS
+			result.Confidence = "high"
+			result.Signals = append(result.Signals, "@nestjs/core in package.json")
+		case strings.Contains(pkg, `"@remix-run/node"`) || strings.Contains(pkg, `"@remix-run/react"`):
+			result.Framework = models.FrameworkRemix
+			result.Confidence = "high"
+			result.Signals = append(result.Signals, "@remix-run in package.json")
+		case strings.Contains(pkg, `"nuxt"`):
+			result.Framework = models.FrameworkNuxtJS
+			result.Confidence = "high"
+			result.Signals = append(result.Signals, "nuxt in package.json")
+		case strings.Contains(pkg, `"@sveltejs/kit"`):
+			result.Framework = models.FrameworkSvelteKit
+			result.Confidence = "high"
+			result.Signals = append(result.Signals, "@sveltejs/kit in package.json")
+		case strings.Contains(pkg, `"astro"`):
+			result.Framework = models.FrameworkAstro
+			result.Confidence = "high"
+			result.Signals = append(result.Signals, "astro in package.json")
+		case strings.Contains(pkg, `"express"`):
+			result.Framework = models.FrameworkExpress
+			result.Confidence = "high"
+			result.Signals = append(result.Signals, "express in package.json")
+		default:
+			result.Framework = models.FrameworkNodeJS
+			result.Confidence = "medium"
+			result.Signals = append(result.Signals, "package.json detected, no specific framework identified")
+		}
 
 	default:
-		// Check for bare Python scripts with no requirements file
 		hasPy := false
 		for _, f := range files {
 			if strings.HasSuffix(strings.ToLower(f), ".py") {

@@ -131,11 +131,24 @@ type Conversation struct {
 
 // Framework constants
 const (
+	// Python
 	FrameworkFastAPI = "fastapi"
 	FrameworkFlask   = "flask"
-	FrameworkNodeJS  = "nodejs"
-	FrameworkNextJS  = "nextjs"
+	FrameworkDjango  = "django"
 	FrameworkPython  = "python"
+
+	// Node.js / JavaScript
+	FrameworkNodeJS   = "nodejs"
+	FrameworkExpress  = "express"
+	FrameworkNextJS   = "nextjs"
+	FrameworkNestJS   = "nestjs"
+	FrameworkRemix    = "remix"
+	FrameworkNuxtJS   = "nuxtjs"
+	FrameworkSvelteKit = "svelte"
+	FrameworkAstro    = "astro"
+
+	// Go
+	FrameworkGo = "go"
 )
 
 // Deployment status constants

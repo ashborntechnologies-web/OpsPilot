@@ -16,6 +16,11 @@ export interface AWSAccount {
   updated_at: string;
 }
 
+export type Framework =
+  | "fastapi" | "flask" | "django" | "python"
+  | "nodejs" | "express" | "nestjs" | "nextjs" | "remix" | "nuxtjs" | "svelte" | "astro"
+  | "go";
+
 export interface Project {
   id: string;
   user_id: string;
@@ -23,7 +28,7 @@ export interface Project {
   repo_url: string;
   repo_owner: string;
   repo_name: string;
-  framework: "fastapi" | "flask" | "python" | "nodejs" | "nextjs";
+  framework: Framework;
   branch: string | null;
   start_command: string | null;
   account_id: string | null;

@@ -18,20 +18,54 @@ import { GitBranch, Search, ArrowLeft, Check, Plus, Cloud } from "lucide-react";
 
 type Step = "github" | "repo" | "details";
 
-const FRAMEWORKS = [
-  { value: "fastapi", label: "FastAPI" },
-  { value: "flask", label: "Flask" },
-  { value: "python", label: "Python (script)" },
-  { value: "nodejs", label: "Node.js" },
-  { value: "nextjs", label: "Next.js" },
-];
+const FRAMEWORK_GROUPS = [
+  {
+    group: "Python",
+    color: "bg-yellow-400",
+    items: [
+      { value: "fastapi",  label: "FastAPI",        desc: "Async Python API" },
+      { value: "flask",    label: "Flask",           desc: "Lightweight Python" },
+      { value: "django",   label: "Django",          desc: "Batteries-included" },
+      { value: "python",   label: "Python Script",   desc: "Any Python app" },
+    ],
+  },
+  {
+    group: "JavaScript / TypeScript",
+    color: "bg-blue-400",
+    items: [
+      { value: "nextjs",  label: "Next.js",    desc: "React + SSR" },
+      { value: "remix",   label: "Remix",      desc: "Full-stack React" },
+      { value: "nuxtjs",  label: "Nuxt.js",    desc: "Vue framework" },
+      { value: "svelte",  label: "SvelteKit",  desc: "Svelte framework" },
+      { value: "astro",   label: "Astro",      desc: "Content-first" },
+      { value: "nestjs",  label: "NestJS",     desc: "Enterprise Node.js" },
+      { value: "express", label: "Express.js", desc: "Minimal Node.js" },
+      { value: "nodejs",  label: "Node.js",    desc: "Any Node.js app" },
+    ],
+  },
+  {
+    group: "Go",
+    color: "bg-cyan-400",
+    items: [
+      { value: "go", label: "Go", desc: "Any Go HTTP server" },
+    ],
+  },
+] as const;
 
 const DEFAULT_START_COMMANDS: Record<string, string> = {
-  fastapi: "uvicorn main:app --host 0.0.0.0 --port 8000",
-  flask:   "gunicorn main:app -b 0.0.0.0:8000",
-  python:  "python main.py",
-  nodejs:  "node index.js",
-  nextjs:  "node server.js",
+  fastapi:  "uvicorn main:app --host 0.0.0.0 --port 8000",
+  flask:    "gunicorn main:app -b 0.0.0.0:8000",
+  django:   "gunicorn config.wsgi:application -b 0.0.0.0:8000",
+  python:   "python main.py",
+  nodejs:   "node index.js",
+  express:  "node index.js",
+  nestjs:   "node dist/main.js",
+  nextjs:   "node server.js",
+  remix:    "node server.js",
+  nuxtjs:   "node .output/server/index.mjs",
+  svelte:   "node build/index.js",
+  astro:    "node ./dist/server/entry.mjs",
+  go:       "./server",
 };
 
 export default function NewProjectPage() {
@@ -298,28 +332,42 @@ export default function NewProjectPage() {
                   </SelectContent>
                 </Select>
               </div>
-              <div className="space-y-1.5">
+              <div className="space-y-2">
                 <Label>Framework</Label>
-                <Select value={framework} onValueChange={(v) => {
-                  if (v) {
-                    setFramework(v);
-                    // Auto-populate start command with framework default if user hasn't customised it
-                    setStartCommand((prev) =>
-                      !prev || Object.values(DEFAULT_START_COMMANDS).includes(prev)
-                        ? (DEFAULT_START_COMMANDS[v] ?? "")
-                        : prev
-                    );
-                  }
-                }}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Select framework" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {FRAMEWORKS.map((f) => (
-                      <SelectItem key={f.value} value={f.value}>{f.label}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <div className="space-y-3">
+                  {FRAMEWORK_GROUPS.map((group) => (
+                    <div key={group.group}>
+                      <p className="text-xs text-muted-foreground font-medium mb-1.5 flex items-center gap-1.5">
+                        <span className={`inline-block h-2 w-2 rounded-full ${group.color}`} />
+                        {group.group}
+                      </p>
+                      <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+                        {group.items.map((f) => (
+                          <button
+                            key={f.value}
+                            type="button"
+                            onClick={() => {
+                              setFramework(f.value);
+                              setStartCommand((prev) =>
+                                !prev || Object.values(DEFAULT_START_COMMANDS).includes(prev)
+                                  ? (DEFAULT_START_COMMANDS[f.value] ?? "")
+                                  : prev
+                              );
+                            }}
+                            className={`text-left rounded-lg border px-3 py-2 transition-colors ${
+                              framework === f.value
+                                ? "border-indigo-500 bg-indigo-50 ring-1 ring-indigo-500"
+                                : "border-input hover:bg-zinc-50"
+                            }`}
+                          >
+                            <p className="text-xs font-medium leading-none">{f.label}</p>
+                            <p className="text-xs text-muted-foreground mt-0.5">{f.desc}</p>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
               <div className="space-y-1.5">
                 <Label>Start command</Label>

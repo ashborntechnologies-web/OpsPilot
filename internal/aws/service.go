@@ -1084,16 +1084,31 @@ phases:
 // This is used as a placeholder in the UI and as a fallback when no start_command is saved.
 func defaultStartCommand(framework string) string {
 	switch framework {
+	// Python
 	case "fastapi":
 		return "uvicorn main:app --host 0.0.0.0 --port 8000"
 	case "flask":
 		return "gunicorn main:app -b 0.0.0.0:8000"
+	case "django":
+		return "gunicorn config.wsgi:application -b 0.0.0.0:8000"
 	case "python":
 		return "python main.py"
-	case "nodejs":
+	// Node.js / JS
+	case "nodejs", "express":
 		return "node index.js"
-	case "nextjs":
+	case "nextjs", "remix":
 		return "node server.js"
+	case "nestjs":
+		return "node dist/main.js"
+	case "nuxtjs":
+		return "node .output/server/index.mjs"
+	case "svelte":
+		return "node build/index.js"
+	case "astro":
+		return "node ./dist/server/entry.mjs"
+	// Go
+	case "go":
+		return "./server"
 	default:
 		return "./start.sh"
 	}
@@ -1112,7 +1127,7 @@ func defaultDockerfile(framework, startCommand string) string {
 	// Use ECR Public Gallery mirrors to avoid Docker Hub unauthenticated pull rate limits.
 	// These are identical images served from AWS infrastructure — no auth required from CodeBuild.
 	switch framework {
-	case "fastapi", "flask":
+	case "fastapi", "flask", "django":
 		return fmt.Sprintf(`FROM public.ecr.aws/docker/library/python:3.11-slim
 WORKDIR /app
 COPY requirements*.txt pyproject.toml* ./
@@ -1130,12 +1145,28 @@ COPY . .
 EXPOSE %d
 %s`, port, cmd)
 
-	case "nodejs":
+	case "nodejs", "express":
 		return fmt.Sprintf(`FROM public.ecr.aws/docker/library/node:20-alpine
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci --only=production
 COPY . .
+EXPOSE %d
+%s`, port, cmd)
+
+	case "nestjs":
+		return fmt.Sprintf(`FROM public.ecr.aws/docker/library/node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM public.ecr.aws/docker/library/node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
 EXPOSE %d
 %s`, port, cmd)
 
@@ -1161,6 +1192,38 @@ ENV PORT=%d
 EXPOSE %d
 %s`, port, port, cmd)
 
+	case "remix", "nuxtjs", "svelte", "astro":
+		return fmt.Sprintf(`FROM public.ecr.aws/docker/library/node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM public.ecr.aws/docker/library/node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=builder /app/build ./build
+COPY --from=builder /app/.output ./.output
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+EXPOSE %d
+%s`, port, cmd)
+
+	case "go":
+		return fmt.Sprintf(`FROM public.ecr.aws/docker/library/golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o server .
+
+FROM public.ecr.aws/docker/library/alpine:3.19
+WORKDIR /app
+COPY --from=builder /app/server .
+EXPOSE %d
+%s`, port, cmd)
+
 	default:
 		return fmt.Sprintf(`FROM public.ecr.aws/ubuntu/ubuntu:22.04
 WORKDIR /app
@@ -1173,8 +1236,10 @@ EXPOSE %d
 // frameworkPort returns the container port for each supported framework.
 func frameworkPort(framework string) int32 {
 	switch framework {
-	case "nodejs", "nextjs":
+	case "nodejs", "express", "nestjs", "nextjs", "remix", "nuxtjs", "svelte", "astro":
 		return 3000
+	case "go":
+		return 8080
 	default:
 		return 8000
 	}

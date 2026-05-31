@@ -113,19 +113,24 @@ export function ConnectAWSModal({ open, onClose, onConnected }: Props) {
 
   return (
     <Dialog open={open} onOpenChange={(v) => !v && handleClose()}>
-      <DialogContent className="max-w-xl">
-        <DialogHeader>
-          <DialogTitle>Connect AWS Account</DialogTitle>
-        </DialogHeader>
-
-        {/* Step tracker */}
-        <div className="flex items-center gap-4 py-1 border-b pb-3">
-          <StepIndicator current={step} step={1} label="Your details" />
-          <div className="h-px flex-1 bg-border" />
-          <StepIndicator current={step} step={2} label="Run setup" />
-          <div className="h-px flex-1 bg-border" />
-          <StepIndicator current={step} step={3} label="Paste ARN" />
+      <DialogContent className="max-w-xl flex flex-col gap-0 p-0 max-h-[90vh]">
+        {/* Fixed header — never scrolls away */}
+        <div className="px-6 pt-6 pb-4 border-b shrink-0">
+          <DialogHeader className="mb-3">
+            <DialogTitle>Connect AWS Account</DialogTitle>
+          </DialogHeader>
+          {/* Step tracker */}
+          <div className="flex items-center gap-3">
+            <StepIndicator current={step} step={1} label="Your details" />
+            <div className="h-px flex-1 bg-border" />
+            <StepIndicator current={step} step={2} label="Run setup" />
+            <div className="h-px flex-1 bg-border" />
+            <StepIndicator current={step} step={3} label="Paste ARN" />
+          </div>
         </div>
+
+        {/* Scrollable body */}
+        <div className="overflow-y-auto flex-1 px-6 py-4">
 
         {/* Step 1: AWS details */}
         {step === 1 && (
@@ -292,6 +297,7 @@ export function ConnectAWSModal({ open, onClose, onConnected }: Props) {
             </div>
           </div>
         )}
+        </div>{/* end scrollable body */}
       </DialogContent>
     </Dialog>
   );
