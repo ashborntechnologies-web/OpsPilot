@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { wsURL } from "@/lib/api";
-import type { WsMessage } from "@/types/api";
+import type { WsMessage, ConversationMessage } from "@/types/api";
 
 export interface ChatEntry {
   id: string;
@@ -37,9 +37,9 @@ export function useProjectWS(projectId: string, token: string | null) {
     wsRef.current = ws;
 
     ws.onopen = () => {
-      // Send auth token as first message — keeps it out of the URL / server logs.
+      // Send auth token as the first message — token never appears in the URL.
+      // connected is set to true only after the server ACKs with auth_ok.
       ws.send(JSON.stringify({ type: "auth", token }));
-      setConnected(true);
     };
     ws.onclose = () => setConnected(false);
 
@@ -47,6 +47,10 @@ export function useProjectWS(projectId: string, token: string | null) {
       const msg: WsMessage = JSON.parse(ev.data);
 
       switch (msg.type) {
+        case "auth_ok":
+          setConnected(true);
+          break;
+
         case "thinking":
           setThinking(true);
           push({ role: "assistant", content: "...", type: "thinking" });
@@ -98,5 +102,19 @@ export function useProjectWS(projectId: string, token: string | null) {
     [push]
   );
 
-  return { entries, connected, thinking, send };
+  // Populate entries from persisted conversation history.
+  // Call once after the initial API fetch; live messages then stream in via WS.
+  const loadHistory = useCallback((messages: ConversationMessage[]) => {
+    if (!messages.length) return;
+    setEntries(
+      messages.map((m) => ({
+        id: m.id,
+        role: m.role as ChatEntry["role"],
+        content: m.message,
+        type: "response" as WsMessage["type"],
+      }))
+    );
+  }, []);
+
+  return { entries, connected, thinking, send, loadHistory };
 }

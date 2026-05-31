@@ -95,6 +95,7 @@ export interface GithubRepo {
 
 export interface WsMessage {
   type:
+    | "auth_ok"
     | "thinking"
     | "response"
     | "deploy_progress"

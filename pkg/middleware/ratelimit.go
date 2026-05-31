@@ -49,7 +49,9 @@ func (rl *RateLimiter) get(userID uuid.UUID) *rate.Limiter {
 }
 
 func (rl *RateLimiter) cleanup() {
-	for range time.Tick(5 * time.Minute) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
 		cutoff := time.Now().Add(-10 * time.Minute)
 		rl.mu.Lock()
 		for id, e := range rl.users {

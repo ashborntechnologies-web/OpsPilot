@@ -94,7 +94,7 @@ export default function ChatPage() {
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  const { entries, connected, thinking, send } = useProjectWS(id, token);
+  const { entries, connected, thinking, send, loadHistory } = useProjectWS(id, token);
 
   // Refresh token periodically (Clerk tokens expire after ~60s)
   useEffect(() => {
@@ -117,8 +117,7 @@ export default function ChatPage() {
       getProject(token, id).then(setProject),
       getConversationHistory(token, id),
     ]).then(([, history]) => {
-      // History is loaded once at mount; live messages come through WS
-      void history;
+      if (history?.length) loadHistory(history);
       setHistoryLoaded(true);
     }).catch(() => setHistoryLoaded(true));
   }, [token, id]);

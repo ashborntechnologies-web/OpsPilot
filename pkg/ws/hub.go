@@ -42,20 +42,16 @@ type client struct {
 
 // Hub manages all active WebSocket connections, keyed by projectID.
 type Hub struct {
-	mu      sync.RWMutex
-	clients map[string][]*client
+	mu            sync.RWMutex
+	clients       map[string][]*client
+	allowedOrigin string // FRONTEND_URL; empty = allow all (dev mode)
 }
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true // TODO: validate origin in production
-	},
-}
-
-func NewHub() *Hub {
-	return &Hub{clients: make(map[string][]*client)}
+func NewHub(allowedOrigin string) *Hub {
+	return &Hub{
+		clients:       make(map[string][]*client),
+		allowedOrigin: allowedOrigin,
+	}
 }
 
 func (h *Hub) Run() {}
@@ -65,12 +61,23 @@ func (h *Hub) Run() {}
 //
 //	{"type":"auth","token":"<clerk_jwt>"}
 //
-// The connection is closed immediately if the first message is missing, malformed,
-// or carries an invalid token. This keeps the bearer token out of server logs and
-// browser history (no ?token= query parameter).
+// On success the server sends {"type":"auth_ok"} so the client knows the connection
+// is live. The connection is closed immediately if the auth message is missing,
+// malformed, or carries an invalid token.
 func (h *Hub) HandleUpgrade(c *gin.Context, authFn AuthFunc, handler MessageHandler) {
 	projectID := c.Param("projectId")
 	pid, pidErr := uuid.Parse(projectID)
+
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			if h.allowedOrigin == "" {
+				return true // dev: no FRONTEND_URL set
+			}
+			return r.Header.Get("Origin") == h.allowedOrigin
+		},
+	}
 
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
@@ -81,7 +88,7 @@ func (h *Hub) HandleUpgrade(c *gin.Context, authFn AuthFunc, handler MessageHand
 	// ── First-message auth ──────────────────────────────────────────────────
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, raw, err := conn.ReadMessage()
-	conn.SetReadDeadline(time.Time{}) // clear deadline
+	conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		conn.Close()
 		return
@@ -103,6 +110,9 @@ func (h *Hub) HandleUpgrade(c *gin.Context, authFn AuthFunc, handler MessageHand
 		conn.Close()
 		return
 	}
+
+	// ACK the auth so the client can safely set connected=true.
+	conn.WriteMessage(websocket.TextMessage, mustMarshal(Message{Type: "auth_ok"}))
 	// ────────────────────────────────────────────────────────────────────────
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -163,7 +173,8 @@ func (h *Hub) HandleUpgrade(c *gin.Context, authFn AuthFunc, handler MessageHand
 				cl.safeSend(Message{Type: "error", Payload: err.Error()})
 				return
 			}
-			cl.safeSend(Message{Type: "assistant_message", Payload: response})
+			// Use "response" to match the frontend WsMessage type switch.
+			cl.safeSend(Message{Type: "response", Payload: response})
 		}(incoming.Message)
 	}
 }
@@ -194,7 +205,7 @@ func (h *Hub) unregister(cl *client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	cl.cancel() // signal in-flight goroutines to stop
+	cl.cancel()
 
 	clients := h.clients[cl.projectID]
 	for i, c := range clients {

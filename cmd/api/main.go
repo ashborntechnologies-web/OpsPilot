@@ -81,7 +81,7 @@ func main() {
 	}
 
 	// Init WebSocket hub
-	hub := pkgws.NewHub()
+	hub := pkgws.NewHub(os.Getenv("FRONTEND_URL"))
 	go hub.Run()
 
 	// Init services
