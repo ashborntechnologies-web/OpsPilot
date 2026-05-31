@@ -22,8 +22,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbtypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/convdeploy/platform/pkg/middleware"
-	"github.com/convdeploy/platform/pkg/models"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -322,7 +322,7 @@ func (s *Service) HandleCreateEnvironment(c *gin.Context) {
 
 	// Look up the project's account_id so we can inherit it on the environment.
 	var projectAccountID *uuid.UUID
-	err = s.db.Pool.QueryRow(context.Background(),
+	err = s.db.Pool.QueryRow(c.Request.Context(),
 		`SELECT account_id FROM projects WHERE id = $1`, projectID,
 	).Scan(&projectAccountID)
 	if err != nil {
@@ -343,7 +343,7 @@ func (s *Service) HandleCreateEnvironment(c *gin.Context) {
 		StackStatus: stackStatus,
 	}
 
-	err = s.db.Pool.QueryRow(context.Background(),
+	err = s.db.Pool.QueryRow(c.Request.Context(),
 		`INSERT INTO environments (project_id, name, aws_region, account_id, stack_status)
 		 VALUES ($1, $2, $3, $4, $5)
 		 RETURNING id, created_at, updated_at`,
@@ -369,7 +369,7 @@ func (s *Service) HandleListEnvironments(c *gin.Context) {
 		return
 	}
 
-	rows, err := s.db.Pool.Query(context.Background(),
+	rows, err := s.db.Pool.Query(c.Request.Context(),
 		`SELECT id, project_id, name, aws_region, account_id,
 		        cloudformation_stack_id, stack_status, alb_dns,
 		        ecr_repo_uri, ecs_cluster_name, ecs_service_name,
@@ -409,7 +409,7 @@ func (s *Service) HandleListAWSAccounts(c *gin.Context) {
 		return
 	}
 
-	rows, err := s.db.Pool.Query(context.Background(),
+	rows, err := s.db.Pool.Query(c.Request.Context(),
 		`SELECT id, user_id, label, aws_account_id, iam_role_arn, created_at, updated_at
 		 FROM aws_accounts WHERE user_id = $1 ORDER BY created_at ASC`, userID)
 	if err != nil {
@@ -453,7 +453,7 @@ func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 	}
 
 	// Verify the role can actually be assumed before persisting it.
-	if _, err := s.assumeRole(context.Background(), req.IAMRoleARN, "us-east-1", "verify"); err != nil {
+	if _, err := s.assumeRole(c.Request.Context(), req.IAMRoleARN, "us-east-1", "verify"); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "could not assume provided IAM role — check permissions"})
 		return
 	}
@@ -465,7 +465,7 @@ func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 		IAMRoleARN:   req.IAMRoleARN,
 	}
 
-	err := s.db.Pool.QueryRow(context.Background(),
+	err := s.db.Pool.QueryRow(c.Request.Context(),
 		`INSERT INTO aws_accounts (user_id, label, aws_account_id, iam_role_arn)
 		 VALUES ($1, $2, $3, $4)
 		 RETURNING id, created_at, updated_at`,
@@ -493,7 +493,7 @@ func (s *Service) HandleDeleteAWSAccount(c *gin.Context) {
 		return
 	}
 
-	result, err := s.db.Pool.Exec(context.Background(),
+	result, err := s.db.Pool.Exec(c.Request.Context(),
 		`DELETE FROM aws_accounts WHERE id = $1 AND user_id = $2`,
 		accountID, userID,
 	)
@@ -525,7 +525,7 @@ func (s *Service) HandleRetryProvision(c *gin.Context) {
 	}
 
 	// Reset status to provisioning.
-	_, err = s.db.Pool.Exec(context.Background(),
+	_, err = s.db.Pool.Exec(c.Request.Context(),
 		`UPDATE environments SET stack_status = $1, updated_at = NOW() WHERE id = $2 AND project_id = $3`,
 		models.StackStatusProvisioning, envID, projectID,
 	)

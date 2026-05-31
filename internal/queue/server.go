@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/convdeploy/platform/internal/deploy"
-	"github.com/convdeploy/platform/internal/diagnosis"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 )

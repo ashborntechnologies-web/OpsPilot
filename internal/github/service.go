@@ -18,8 +18,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/convdeploy/platform/pkg/middleware"
-	"github.com/convdeploy/platform/pkg/models"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -31,7 +31,11 @@ type Service struct {
 	clientSecret  string
 	redirectURL   string
 	encryptionKey string
-	db            *models.DB
+	// prevKey is the previous ENCRYPTION_KEY used during rotation.
+	// Set via ENCRYPTION_KEY_PREV. Old tokens are decrypted with this key;
+	// new encryptions always use encryptionKey.
+	prevKey string
+	db      *models.DB
 }
 
 type Repo struct {
@@ -60,6 +64,7 @@ func NewService(clientID, clientSecret, redirectURL, encryptionKey string, db *m
 		clientSecret:  clientSecret,
 		redirectURL:   redirectURL,
 		encryptionKey: encryptionKey,
+		prevKey:       os.Getenv("ENCRYPTION_KEY_PREV"),
 		db:            db,
 	}
 }
@@ -119,7 +124,7 @@ func (s *Service) HandleOAuthCallback(c *gin.Context) {
 		return
 	}
 
-	_, err = s.db.Pool.Exec(context.Background(),
+	_, err = s.db.Pool.Exec(c.Request.Context(),
 		`UPDATE users SET github_token = $1, updated_at = NOW() WHERE id = $2`,
 		encrypted, userID,
 	)
@@ -141,7 +146,7 @@ func (s *Service) HandleListRepos(c *gin.Context) {
 		return
 	}
 
-	repos, err := s.fetchRepos(token)
+	repos, err := s.fetchRepos(c.Request.Context(), token)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch repos"})
 		return
@@ -161,7 +166,7 @@ func (s *Service) HandleDetectFramework(c *gin.Context) {
 		return
 	}
 
-	result, err := s.DetectFramework(context.Background(), token, owner, repo)
+	result, err := s.DetectFramework(c.Request.Context(), token, owner, repo)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to detect framework"})
 		return
@@ -313,7 +318,7 @@ func (s *Service) GetTokenForDeployment(ctx context.Context, userID uuid.UUID) (
 	if encryptedToken == nil {
 		return "", fmt.Errorf("GitHub not connected for this user")
 	}
-	return decryptToken(*encryptedToken, s.encryptionKey)
+	return decryptToken(*encryptedToken, s.encryptionKey, s.prevKey)
 }
 
 // ---- private helpers ----
@@ -358,8 +363,8 @@ func (s *Service) exchangeCode(code string) (string, error) {
 	return result.AccessToken, nil
 }
 
-func (s *Service) fetchRepos(token string) ([]Repo, error) {
-	body, err := s.doRequest(context.Background(), token, githubAPIBase+"/user/repos?per_page=100&sort=updated")
+func (s *Service) fetchRepos(ctx context.Context, token string) ([]Repo, error) {
+	body, err := s.doRequest(ctx, token, githubAPIBase+"/user/repos?per_page=100&sort=updated")
 	if err != nil {
 		return nil, err
 	}
@@ -457,8 +462,11 @@ func deriveKey(encKey string) []byte {
 	return h[:]
 }
 
-// encryptToken encrypts a plaintext token with AES-256-GCM.
-// Output format: base64(nonce + ciphertext_with_tag)
+const tokenVersion = "v1"
+
+// encryptToken encrypts a plaintext token with AES-256-GCM and prefixes the
+// result with a version tag so key rotation can be handled transparently.
+// Output format: "v1:<base64(nonce + ciphertext_with_tag)>"
 func encryptToken(plaintext, encKey string) (string, error) {
 	key := deriveKey(encKey)
 
@@ -477,16 +485,40 @@ func encryptToken(plaintext, encKey string) (string, error) {
 		return "", err
 	}
 
-	// Seal appends ciphertext+tag to nonce
 	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
+	return tokenVersion + ":" + base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
-// decryptToken reverses encryptToken.
-func decryptToken(encrypted, encKey string) (string, error) {
+// decryptToken reverses encryptToken. It handles two formats:
+//   - "v1:<base64>" — current format; decrypts with currentKey
+//   - "<bare base64>" — legacy format (no version prefix); tries currentKey,
+//     then prevKey (set via ENCRYPTION_KEY_PREV during key rotation)
+func decryptToken(encrypted, currentKey, prevKey string) (string, error) {
+	var payload, keyToUse string
+
+	if strings.HasPrefix(encrypted, tokenVersion+":") {
+		payload = strings.TrimPrefix(encrypted, tokenVersion+":")
+		keyToUse = currentKey
+	} else {
+		// Legacy token — try current key first, fall back to prev key.
+		payload = encrypted
+		plain, err := decryptPayload(payload, currentKey)
+		if err == nil {
+			return plain, nil
+		}
+		if prevKey == "" {
+			return "", fmt.Errorf("failed to decrypt legacy token (no ENCRYPTION_KEY_PREV set)")
+		}
+		keyToUse = prevKey
+	}
+
+	return decryptPayload(payload, keyToUse)
+}
+
+func decryptPayload(payload, encKey string) (string, error) {
 	key := deriveKey(encKey)
 
-	data, err := base64.StdEncoding.DecodeString(encrypted)
+	data, err := base64.StdEncoding.DecodeString(payload)
 	if err != nil {
 		return "", fmt.Errorf("failed to decode token: %w", err)
 	}

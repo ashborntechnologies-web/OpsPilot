@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/convdeploy/platform/internal/auth"
-	"github.com/convdeploy/platform/pkg/models"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/auth"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )

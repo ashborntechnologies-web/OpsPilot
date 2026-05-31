@@ -11,17 +11,17 @@ import (
 
 	awssdk "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/convdeploy/platform/internal/auth"
-	"github.com/convdeploy/platform/internal/aws"
-	"github.com/convdeploy/platform/internal/conversation"
-	"github.com/convdeploy/platform/internal/deploy"
-	"github.com/convdeploy/platform/internal/diagnosis"
-	"github.com/convdeploy/platform/internal/events"
-	githubsvc "github.com/convdeploy/platform/internal/github"
-	"github.com/convdeploy/platform/internal/queue"
-	"github.com/convdeploy/platform/pkg/middleware"
-	"github.com/convdeploy/platform/pkg/models"
-	pkgws "github.com/convdeploy/platform/pkg/ws"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/auth"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/aws"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/conversation"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
+	githubsvc "github.com/ashborntechnologies-web/OpsPilot/internal/github"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/queue"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
+	pkgws "github.com/ashborntechnologies-web/OpsPilot/pkg/ws"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -146,6 +146,12 @@ func main() {
 	// Bootstrap template — public so the frontend can show it before auth
 	v1.GET("/cloudformation/bootstrap-template", awsSvc.HandleGetBootstrapTemplate)
 
+	// Rate limiters — applied per-user after auth on expensive endpoints.
+	// conversation: 10 req/min (burst 5) — each message hits the Claude API
+	// deploy:       5  req/min (burst 2) — each deploy triggers a CodeBuild job
+	conversationRL := middleware.NewRateLimiter(10.0/60, 5)
+	deployRL := middleware.NewRateLimiter(5.0/60, 2)
+
 	// Protected routes
 	protected := v1.Group("/")
 	protected.Use(middleware.RequireAuth(authSvc, db))
@@ -173,7 +179,7 @@ func main() {
 		protected.GET("/projects/:id/environments/:envId/logs", deploySvc.HandleGetLogs)
 
 		// Deployments
-		protected.POST("/projects/:id/environments/:envId/deploy", deploySvc.HandleDeploy)
+		protected.POST("/projects/:id/environments/:envId/deploy", deployRL.Middleware(), deploySvc.HandleDeploy)
 		protected.GET("/projects/:id/deployments", deploySvc.HandleListDeployments)
 		protected.POST("/projects/:id/deployments/:deployId/rollback", deploySvc.HandleRollback)
 		protected.POST("/projects/:id/deployments/:deployId/redeploy", deploySvc.HandleRedeploy)
@@ -186,7 +192,7 @@ func main() {
 		protected.GET("/projects/:id/deployments/:deployId/diagnose", diagnosisSvc.HandleDiagnose)
 
 		// Conversation (REST fallback — primary is WebSocket)
-		protected.POST("/projects/:id/conversation", conversationSvc.HandleMessage)
+		protected.POST("/projects/:id/conversation", conversationRL.Middleware(), conversationSvc.HandleMessage)
 		protected.GET("/projects/:id/conversation/history", conversationSvc.HandleHistory)
 
 		// (WebSocket is registered below, outside this group)

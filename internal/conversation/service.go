@@ -8,11 +8,11 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/convdeploy/platform/internal/deploy"
-	"github.com/convdeploy/platform/internal/diagnosis"
-	"github.com/convdeploy/platform/pkg/middleware"
-	"github.com/convdeploy/platform/pkg/models"
-	"github.com/convdeploy/platform/pkg/ws"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/ws"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )

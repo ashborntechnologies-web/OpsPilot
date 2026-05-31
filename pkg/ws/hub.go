@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
 )
 
 // Message is the envelope sent over WebSocket to the frontend.
@@ -35,6 +36,8 @@ type client struct {
 	send      chan Message
 	ctx       context.Context
 	cancel    context.CancelFunc
+	// limiter enforces per-connection message rate: 10 msg/min, burst 5.
+	limiter *rate.Limiter
 }
 
 // Hub manages all active WebSocket connections, keyed by projectID.
@@ -109,6 +112,7 @@ func (h *Hub) HandleUpgrade(c *gin.Context, authFn AuthFunc, handler MessageHand
 		send:      make(chan Message, 64),
 		ctx:       ctx,
 		cancel:    cancel,
+		limiter:   rate.NewLimiter(rate.Every(6*time.Second), 5), // 10 msg/min, burst 5
 	}
 
 	h.register(cl)
@@ -135,6 +139,11 @@ func (h *Hub) HandleUpgrade(c *gin.Context, authFn AuthFunc, handler MessageHand
 			Message string `json:"message"`
 		}
 		if err := json.Unmarshal(raw, &incoming); err != nil || incoming.Message == "" {
+			continue
+		}
+
+		if !cl.limiter.Allow() {
+			cl.safeSend(Message{Type: "error", Payload: "rate limit exceeded — please wait before sending another message"})
 			continue
 		}
 

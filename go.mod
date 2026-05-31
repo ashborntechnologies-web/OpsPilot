@@ -1,4 +1,4 @@
-module github.com/convdeploy/platform
+module github.com/ashborntechnologies-web/OpsPilot
 
 go 1.24
 

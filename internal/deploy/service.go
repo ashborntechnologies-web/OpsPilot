@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
-	awssvc "github.com/convdeploy/platform/internal/aws"
-	"github.com/convdeploy/platform/internal/events"
-	githubsvc "github.com/convdeploy/platform/internal/github"
-	"github.com/convdeploy/platform/pkg/middleware"
-	"github.com/convdeploy/platform/pkg/models"
-	"github.com/convdeploy/platform/pkg/ws"
+	awssvc "github.com/ashborntechnologies-web/OpsPilot/internal/aws"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
+	githubsvc "github.com/ashborntechnologies-web/OpsPilot/internal/github"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/ws"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -85,7 +85,7 @@ func (s *Service) HandleCreateProject(c *gin.Context) {
 		AccountID:    accountID,
 	}
 
-	err := s.db.Pool.QueryRow(context.Background(),
+	err := s.db.Pool.QueryRow(c.Request.Context(),
 		`INSERT INTO projects (user_id, name, repo_url, repo_owner, repo_name, framework, branch, start_command, account_id)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING id, created_at, updated_at`,
@@ -107,7 +107,7 @@ func (s *Service) HandleListProjects(c *gin.Context) {
 		return
 	}
 
-	rows, err := s.db.Pool.Query(context.Background(),
+	rows, err := s.db.Pool.Query(c.Request.Context(),
 		`SELECT id, user_id, name, repo_url, repo_owner, repo_name, framework, branch, start_command, account_id, created_at, updated_at
 		 FROM projects WHERE user_id = $1 ORDER BY created_at DESC`, userID,
 	)
@@ -179,7 +179,7 @@ func (s *Service) HandleListDeployments(c *gin.Context) {
 		return
 	}
 
-	rows, err := s.db.Pool.Query(context.Background(),
+	rows, err := s.db.Pool.Query(c.Request.Context(),
 		`SELECT id, project_id, environment_id, commit_sha, commit_message, image_uri, status, failure_reason, created_at, updated_at
 		 FROM deployments WHERE project_id = $1 ORDER BY created_at DESC LIMIT 20`, projectID,
 	)
