@@ -26,9 +26,11 @@ type MessageHandler interface {
 	ProcessMessage(ctx context.Context, projectID uuid.UUID, userID uuid.UUID, message string) (string, error)
 }
 
-// AuthFunc validates a bearer token and returns the platform user ID.
-// Injected at startup so the hub stays decoupled from the auth package.
-type AuthFunc func(ctx context.Context, token string) (uuid.UUID, error)
+// AuthFunc validates a bearer token for a specific project and returns the platform
+// user ID. It must also verify the user owns projectID, returning an error otherwise,
+// so a client cannot subscribe to another tenant's project stream. Injected at startup
+// so the hub stays decoupled from the auth and models packages.
+type AuthFunc func(ctx context.Context, token, projectID string) (uuid.UUID, error)
 
 type client struct {
 	conn      *websocket.Conn
@@ -104,7 +106,7 @@ func (h *Hub) HandleUpgrade(c *gin.Context, authFn AuthFunc, handler MessageHand
 		return
 	}
 
-	userID, err := authFn(c.Request.Context(), authMsg.Token)
+	userID, err := authFn(c.Request.Context(), authMsg.Token, projectID)
 	if err != nil {
 		conn.WriteMessage(websocket.TextMessage, mustMarshal(Message{Type: "error", Payload: "unauthorized"}))
 		conn.Close()

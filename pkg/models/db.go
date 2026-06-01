@@ -4,11 +4,34 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type DB struct {
 	Pool *pgxpool.Pool
+}
+
+// UserOwnsProject reports whether the given project belongs to the given user.
+// Used as the tenant-isolation guard on every /projects/:id/... handler so a user
+// cannot read or mutate another tenant's project by guessing its UUID.
+func (db *DB) UserOwnsProject(ctx context.Context, userID, projectID uuid.UUID) (bool, error) {
+	var exists bool
+	err := db.Pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1 AND user_id = $2)`,
+		projectID, userID,
+	).Scan(&exists)
+	return exists, err
+}
+
+// UserOwnsAccount reports whether the given AWS account belongs to the given user.
+func (db *DB) UserOwnsAccount(ctx context.Context, userID, accountID uuid.UUID) (bool, error) {
+	var exists bool
+	err := db.Pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM aws_accounts WHERE id = $1 AND user_id = $2)`,
+		accountID, userID,
+	).Scan(&exists)
+	return exists, err
 }
 
 func NewDB(databaseURL string) (*DB, error) {

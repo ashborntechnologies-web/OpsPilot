@@ -13,9 +13,10 @@ import (
 )
 
 const (
-	TaskDeploy     = "deploy:run"
-	TaskDiagnose   = "diagnosis:run"
-	TaskProvision  = "provision:run"
+	TaskDeploy    = "deploy:run"
+	TaskDiagnose  = "diagnosis:run"
+	TaskProvision = "provision:run"
+	TaskRollback  = "rollback:run"
 )
 
 type DeployPayload struct {
@@ -23,6 +24,13 @@ type DeployPayload struct {
 	EnvironmentID string `json:"environment_id"`
 	DeploymentID  string `json:"deployment_id"`
 	CommitSHA     string `json:"commit_sha"`
+}
+
+type RollbackPayload struct {
+	ProjectID            string `json:"project_id"`
+	EnvironmentID        string `json:"environment_id"`
+	DeploymentID         string `json:"deployment_id"`          // the new rollback deployment record
+	PreviousDeploymentID string `json:"previous_deployment_id"` // the deployment being rolled back from
 }
 
 type DiagnosePayload struct {
@@ -65,13 +73,17 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 	s.mux.HandleFunc(TaskDeploy, s.handleDeploy)
 	s.mux.HandleFunc(TaskDiagnose, s.handleDiagnose)
 	s.mux.HandleFunc(TaskProvision, s.handleProvision)
+	s.mux.HandleFunc(TaskRollback, s.handleRollback)
 
 	return s
 }
 
+// Start runs the Asynq worker loop. It blocks until the server stops. On error it
+// logs rather than calling log.Fatal so a transient worker failure does not take down
+// the HTTP API running in the same process.
 func (s *Server) Start() {
 	if err := s.server.Run(s.mux); err != nil {
-		log.Fatalf("Asynq server error: %v", err)
+		log.Printf("Asynq server stopped with error: %v", err)
 	}
 }
 
@@ -137,6 +149,41 @@ func (s *Server) handleProvision(ctx context.Context, t *asynq.Task) error {
 	return nil
 }
 
+// handleRollback re-deploys a previously-built image to the ECS service. It never
+// rebuilds, so it does not auto-retry (a rollback that fails is surfaced to the user).
+func (s *Server) handleRollback(ctx context.Context, t *asynq.Task) error {
+	var p RollbackPayload
+	if err := json.Unmarshal(t.Payload(), &p); err != nil {
+		return fmt.Errorf("%w: unmarshal rollback payload: %w", asynq.SkipRetry, err)
+	}
+
+	projectID, err := uuid.Parse(p.ProjectID)
+	if err != nil {
+		return fmt.Errorf("%w: invalid project ID: %w", asynq.SkipRetry, err)
+	}
+	environmentID, err := uuid.Parse(p.EnvironmentID)
+	if err != nil {
+		return fmt.Errorf("%w: invalid environment ID: %w", asynq.SkipRetry, err)
+	}
+	deploymentID, err := uuid.Parse(p.DeploymentID)
+	if err != nil {
+		return fmt.Errorf("%w: invalid deployment ID: %w", asynq.SkipRetry, err)
+	}
+	var previousID *uuid.UUID
+	if p.PreviousDeploymentID != "" {
+		if pid, perr := uuid.Parse(p.PreviousDeploymentID); perr == nil {
+			previousID = &pid
+		}
+	}
+
+	log.Printf("[rollback] starting job project=%s env=%s deploy=%s", p.ProjectID[:8], p.EnvironmentID[:8], p.DeploymentID[:8])
+
+	if err := s.deploySvc.RunRollbackWorkflow(ctx, projectID, environmentID, deploymentID, previousID); err != nil {
+		return fmt.Errorf("%w: %w", asynq.SkipRetry, err)
+	}
+	return nil
+}
+
 func (s *Server) handleDiagnose(ctx context.Context, t *asynq.Task) error {
 	var p DiagnosePayload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
@@ -176,6 +223,21 @@ func NewDeployTask(projectID, environmentID, deploymentID, commitSHA string) (*a
 		return nil, err
 	}
 	return asynq.NewTask(TaskDeploy, payload, asynq.Queue("critical")), nil
+}
+
+func NewRollbackTask(projectID, environmentID, deploymentID, previousDeploymentID string) (*asynq.Task, error) {
+	payload, err := json.Marshal(RollbackPayload{
+		ProjectID:            projectID,
+		EnvironmentID:        environmentID,
+		DeploymentID:         deploymentID,
+		PreviousDeploymentID: previousDeploymentID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Rollbacks must not auto-retry — they re-deploy an existing image and any
+	// failure (e.g. infra drift) needs human attention, not a silent retry loop.
+	return asynq.NewTask(TaskRollback, payload, asynq.Queue("critical"), asynq.MaxRetry(0)), nil
 }
 
 func NewDiagnoseTask(projectID, deploymentID string) (*asynq.Task, error) {
@@ -218,6 +280,16 @@ func (c *Client) EnqueueDeploy(projectID, environmentID, deploymentID, commitSHA
 // EnqueueProvision implements deploy.Enqueuer.
 func (c *Client) EnqueueProvision(projectID, environmentID string) error {
 	task, err := NewProvisionTask(projectID, environmentID)
+	if err != nil {
+		return err
+	}
+	_, err = c.c.Enqueue(task)
+	return err
+}
+
+// EnqueueRollback implements deploy.Enqueuer.
+func (c *Client) EnqueueRollback(projectID, environmentID, deploymentID, previousDeploymentID string) error {
+	task, err := NewRollbackTask(projectID, environmentID, deploymentID, previousDeploymentID)
 	if err != nil {
 		return err
 	}
