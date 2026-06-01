@@ -17,6 +17,7 @@ const (
 	TaskDiagnose  = "diagnosis:run"
 	TaskProvision = "provision:run"
 	TaskRollback  = "rollback:run"
+	TaskWatchdog  = "watchdog:run"
 )
 
 type DeployPayload struct {
@@ -74,6 +75,7 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 	s.mux.HandleFunc(TaskDiagnose, s.handleDiagnose)
 	s.mux.HandleFunc(TaskProvision, s.handleProvision)
 	s.mux.HandleFunc(TaskRollback, s.handleRollback)
+	s.mux.HandleFunc(TaskWatchdog, s.handleWatchdog)
 
 	return s
 }
@@ -184,6 +186,11 @@ func (s *Server) handleRollback(ctx context.Context, t *asynq.Task) error {
 	return nil
 }
 
+// handleWatchdog runs the stuck-resource reconciler. Enqueued periodically by the Scheduler.
+func (s *Server) handleWatchdog(ctx context.Context, _ *asynq.Task) error {
+	return s.deploySvc.ReconcileStuckResources(ctx)
+}
+
 func (s *Server) handleDiagnose(ctx context.Context, t *asynq.Task) error {
 	var p DiagnosePayload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
@@ -240,6 +247,11 @@ func NewRollbackTask(projectID, environmentID, deploymentID, previousDeploymentI
 	return asynq.NewTask(TaskRollback, payload, asynq.Queue("critical"), asynq.MaxRetry(0)), nil
 }
 
+func NewWatchdogTask() *asynq.Task {
+	// Idempotent reconciler — never retry; the next scheduled tick covers any miss.
+	return asynq.NewTask(TaskWatchdog, nil, asynq.Queue("default"), asynq.MaxRetry(0))
+}
+
 func NewDiagnoseTask(projectID, deploymentID string) (*asynq.Task, error) {
 	payload, err := json.Marshal(DiagnosePayload{
 		ProjectID:    projectID,
@@ -249,6 +261,31 @@ func NewDiagnoseTask(projectID, deploymentID string) (*asynq.Task, error) {
 		return nil, err
 	}
 	return asynq.NewTask(TaskDiagnose, payload, asynq.Queue("default")), nil
+}
+
+// ---- Scheduler — enqueues periodic tasks (stuck-resource watchdog) ----
+
+// Scheduler wraps asynq.Scheduler so the periodic watchdog can be started from main
+// without leaking the asynq dependency. It enqueues a watchdog task every 5 minutes; the
+// Server's handleWatchdog processes it.
+type Scheduler struct {
+	s *asynq.Scheduler
+}
+
+func NewScheduler(redisURL string) *Scheduler {
+	return &Scheduler{s: asynq.NewScheduler(asynq.RedisClientOpt{Addr: redisURL}, nil)}
+}
+
+// Start registers the watchdog schedule and starts the scheduler in the background.
+func (sc *Scheduler) Start() error {
+	if _, err := sc.s.Register("@every 5m", NewWatchdogTask()); err != nil {
+		return err
+	}
+	return sc.s.Start()
+}
+
+func (sc *Scheduler) Stop() {
+	sc.s.Shutdown()
 }
 
 // ---- Client — used by other services to enqueue jobs ----

@@ -86,7 +86,7 @@ export function listAWSAccounts(token: string) {
 
 export function connectAWSAccount(
   token: string,
-  body: { label: string; aws_account_id: string; iam_role_arn: string }
+  body: { label: string; aws_account_id: string; iam_role_arn: string; external_id?: string }
 ) {
   return request<AWSAccount>("/aws-accounts", token, {
     method: "POST",
@@ -199,7 +199,7 @@ export function getConversationHistory(token: string, projectId: string) {
 
 export function getBootstrapTemplate(region: string) {
   return fetch(`/api/v1/cloudformation/bootstrap-template?region=${region}`)
-    .then((r) => r.json()) as Promise<{ template: string; script: string; error?: string }>;
+    .then((r) => r.json()) as Promise<{ template: string; script: string; external_id?: string; error?: string }>;
 }
 
 // ---- WebSocket URL -----------------------------------------------------------

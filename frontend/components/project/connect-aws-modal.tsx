@@ -52,6 +52,7 @@ export function ConnectAWSModal({ open, onClose, onConnected }: Props) {
   const [accountId, setAccountId] = useState("");
   const [region, setRegion] = useState("us-east-1");
   const [script, setScript] = useState("");
+  const [externalId, setExternalId] = useState("");
   const [roleArn, setRoleArn] = useState("");
   const [copied, setCopied] = useState(false);
   const [loadingScript, setLoadingScript] = useState(false);
@@ -63,6 +64,7 @@ export function ConnectAWSModal({ open, onClose, onConnected }: Props) {
     setAccountId("");
     setRegion("us-east-1");
     setScript("");
+    setExternalId("");
     setRoleArn("");
     onClose();
   }
@@ -76,6 +78,9 @@ export function ConnectAWSModal({ open, onClose, onConnected }: Props) {
         return;
       }
       setScript(data.script);
+      // Capture the per-connection external ID embedded in this script so we can send it
+      // back on connect — it must match the trust policy the user is about to deploy.
+      setExternalId(data.external_id ?? "");
       setStep(2);
     } catch {
       toast.error("Failed to load setup script — is the backend running?");
@@ -100,6 +105,7 @@ export function ConnectAWSModal({ open, onClose, onConnected }: Props) {
         label: label.trim(),
         aws_account_id: accountId.trim(),
         iam_role_arn: roleArn.trim(),
+        external_id: externalId || undefined,
       });
       toast.success("AWS account connected!");
       onConnected(account);

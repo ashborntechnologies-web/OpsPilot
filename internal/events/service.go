@@ -64,6 +64,37 @@ func (s *Service) Emit(ctx context.Context, ev Event) {
 	}()
 }
 
+// EmitAccount persists an account-scoped operational event (no project context) — e.g.
+// external_id.generated at AWS account connection. Uses the same table/service as Emit;
+// project_id is left NULL. Errors are logged, never returned.
+func (s *Service) EmitAccount(ctx context.Context, accountID uuid.UUID, eventType, severity, source string, payload map[string]any) {
+	if severity == "" {
+		severity = models.SeverityInfo
+	}
+	if source == "" {
+		source = models.SourceDeployer
+	}
+
+	payloadJSON := json.RawMessage("{}")
+	if payload != nil {
+		if b, err := json.Marshal(payload); err == nil {
+			payloadJSON = b
+		}
+	}
+
+	go func() {
+		_, err := s.db.Pool.Exec(context.Background(),
+			`INSERT INTO operational_events
+			 (account_id, event_type, severity, source, actor_type, payload)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
+			accountID, eventType, severity, source, models.ActorUser, payloadJSON,
+		)
+		if err != nil {
+			log.Printf("events.EmitAccount: failed to persist %s: %v", eventType, err)
+		}
+	}()
+}
+
 // HandleGetDeploymentEvents returns all operational events for a given deployment.
 func (s *Service) HandleGetDeploymentEvents(c *gin.Context) {
 	projectID, err := uuid.Parse(c.Param("id"))

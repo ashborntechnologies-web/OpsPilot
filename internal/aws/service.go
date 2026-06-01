@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"hash/crc32"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -21,7 +22,10 @@ import (
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbtypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
@@ -32,7 +36,30 @@ type Service struct {
 	db                *models.DB
 	platformAccountID string // AWS account ID of the entity running ConvDeploy
 	platformCallerARN string // full ARN of the entity running ConvDeploy (user or role)
+	events            *events.Service // optional; set via SetEvents for audit events
 	onEnvCreated      func(projectID, environmentID uuid.UUID)
+}
+
+// SetEvents injects the operational-event service so account-level actions
+// (e.g. external_id.generated) can be audited. Optional — Emit calls are nil-guarded.
+func (s *Service) SetEvents(e *events.Service) {
+	s.events = e
+}
+
+// LegacyExternalID is the shared external ID used before per-tenant external IDs existed.
+// Accounts connected before that change keep this value (DB default) so their already
+// deployed bootstrap roles continue to be assumable.
+const LegacyExternalID = "convdeploy"
+
+// externalIDPlaceholder is the token in BootstrapTemplate replaced at render time with
+// the connection's actual external ID.
+const externalIDPlaceholder = "CONVDEPLOY_EXTERNAL_ID"
+
+// NewExternalID returns a fresh per-connection STS external ID. Embedding a unique value
+// in each role's trust policy prevents the confused-deputy attack: a tenant cannot assume
+// another tenant's role even if they learn its ARN, because they cannot know its external ID.
+func NewExternalID() string {
+	return "convdeploy-" + uuid.NewString()
 }
 
 // SetOnEnvCreated registers a callback invoked after an environment is created
@@ -50,33 +77,43 @@ type ClientBundle struct {
 	CloudFormation *cloudformation.Client
 	CloudWatch     *cloudwatchlogs.Client
 	CodeBuild      *codebuild.Client
+	SSM            *ssm.Client
 	Region         string
 }
 
 func NewService(db *models.DB, platformAccountID, platformCallerARN string) *Service {
-	return &Service{db: db, platformAccountID: platformAccountID, platformCallerARN: platformCallerARN}
+	return &Service{
+		db:                db,
+		platformAccountID: platformAccountID,
+		platformCallerARN: platformCallerARN,
+	}
 }
 
 // AssumeRoleForEnvironment creates scoped AWS SDK clients by assuming the IAM role
-// associated with the environment's linked AWS account.
+// associated with the environment's linked AWS account, using that account's stored
+// per-tenant external ID.
 func (s *Service) AssumeRoleForEnvironment(ctx context.Context, env *models.Environment) (*ClientBundle, error) {
 	if env.AccountID == nil {
 		return nil, fmt.Errorf("environment %s has no AWS account linked", env.ID)
 	}
 
-	var iamRoleARN string
+	var iamRoleARN, externalID string
 	err := s.db.Pool.QueryRow(ctx,
-		`SELECT iam_role_arn FROM aws_accounts WHERE id = $1`, env.AccountID,
-	).Scan(&iamRoleARN)
+		`SELECT iam_role_arn, external_id FROM aws_accounts WHERE id = $1`, env.AccountID,
+	).Scan(&iamRoleARN, &externalID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS account for environment %s: %w", env.ID, err)
 	}
+	if externalID == "" {
+		externalID = LegacyExternalID
+	}
 
-	return s.assumeRole(ctx, iamRoleARN, env.AWSRegion, env.ID.String())
+	return s.assumeRole(ctx, iamRoleARN, env.AWSRegion, env.ID.String(), externalID)
 }
 
-// assumeRole is the shared helper that loads config and assumes a role ARN.
-func (s *Service) assumeRole(ctx context.Context, iamRoleARN, region, sessionSuffix string) (*ClientBundle, error) {
+// assumeRole is the shared helper that loads config and assumes a role ARN with the
+// given STS external ID.
+func (s *Service) assumeRole(ctx context.Context, iamRoleARN, region, sessionSuffix, externalID string) (*ClientBundle, error) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
@@ -85,7 +122,7 @@ func (s *Service) assumeRole(ctx context.Context, iamRoleARN, region, sessionSuf
 	stsClient := sts.NewFromConfig(cfg)
 	provider := stscreds.NewAssumeRoleProvider(stsClient, iamRoleARN, func(o *stscreds.AssumeRoleOptions) {
 		o.RoleSessionName = fmt.Sprintf("convdeploy-%s", sessionSuffix)
-		o.ExternalID = aws.String("convdeploy")
+		o.ExternalID = aws.String(externalID)
 	})
 
 	assumedCfg, err := config.LoadDefaultConfig(ctx,
@@ -103,18 +140,44 @@ func (s *Service) assumeRole(ctx context.Context, iamRoleARN, region, sessionSuf
 		CloudFormation: cloudformation.NewFromConfig(assumedCfg),
 		CloudWatch:     cloudwatchlogs.NewFromConfig(assumedCfg),
 		CodeBuild:      codebuild.NewFromConfig(assumedCfg),
+		SSM:            ssm.NewFromConfig(assumedCfg),
 		Region:         region,
 	}, nil
 }
 
 // ---- CodeBuild ----
 
-// StartCodeBuildJob kicks off a build in the user's AWS account.
-// It passes the GitHub token and build parameters as environment variable overrides
-// so the statically configured CodeBuild project stays generic.
+// githubTokenParamName returns the SSM parameter path that holds the GitHub token for a
+// given project+commit build. Scoped under /convdeploy/ so the IAM policies can grant
+// narrowly. Deleted after the build completes.
+func githubTokenParamName(projectID, commitSHA string) string {
+	sha := commitSHA
+	if len(sha) > 8 {
+		sha = sha[:8]
+	}
+	return fmt.Sprintf("/convdeploy/%s/%s/github-token", projectID, sha)
+}
+
+// StartCodeBuildResult is returned by StartCodeBuildJob.
+type StartCodeBuildResult struct {
+	BuildID string
+	// TokenParamName is the SSM parameter holding the GitHub token, if the secure path was
+	// used. Empty when the token was passed inline (legacy fallback). The caller deletes it
+	// after the build finishes.
+	TokenParamName string
+	// SecretStored is true when the token was stored in SSM (secure path), false on fallback.
+	SecretStored bool
+}
+
+// StartCodeBuildJob kicks off a build in the user's AWS account. The GitHub token is
+// stored in SSM Parameter Store as a SecureString and referenced by name (PARAMETER_STORE
+// env override) so it never appears in the StartBuild request or CodeBuild's plaintext env.
+// If storing the secret fails (e.g. a pre-upgrade bootstrap role without ssm:PutParameter),
+// it falls back to passing the token inline so existing accounts keep deploying.
 func (s *Service) StartCodeBuildJob(
 	ctx context.Context,
 	clients *ClientBundle,
+	projectID string,
 	projectName string,
 	githubToken string,
 	repoOwner string,
@@ -124,15 +187,37 @@ func (s *Service) StartCodeBuildJob(
 	ecrRegistry string,
 	framework string,
 	startCommand string,
-) (string, error) {
+) (*StartCodeBuildResult, error) {
 	bs := buildspec()
 	dockerfileB64 := base64.StdEncoding.EncodeToString([]byte(defaultDockerfile(framework, startCommand)))
+
+	// The build always reads the token from $GITHUB_TOKEN; only how we inject it differs.
+	tokenEnv := cbtypes.EnvironmentVariable{
+		Name:  aws.String("GITHUB_TOKEN"),
+		Value: aws.String(githubToken),
+		Type:  cbtypes.EnvironmentVariableTypePlaintext,
+	}
+
+	paramName := githubTokenParamName(projectID, commitSHA)
+	secretStored := false
+	if err := s.putSecureParameter(ctx, clients, paramName, githubToken); err != nil {
+		// Legacy role without SSM permissions — fall back to inline token so deploys keep
+		// working. The operator should re-run the bootstrap stack to enable the secure path.
+		log.Printf("WARNING: SSM PutParameter failed (%v) — falling back to inline GitHub token for project %s. Re-run the bootstrap stack to enable the secure path.", err, projectID)
+	} else {
+		secretStored = true
+		tokenEnv = cbtypes.EnvironmentVariable{
+			Name:  aws.String("GITHUB_TOKEN"),
+			Value: aws.String(paramName),
+			Type:  cbtypes.EnvironmentVariableTypeParameterStore,
+		}
+	}
 
 	input := &codebuild.StartBuildInput{
 		ProjectName:       aws.String(projectName),
 		BuildspecOverride: aws.String(bs),
 		EnvironmentVariablesOverride: []cbtypes.EnvironmentVariable{
-			{Name: aws.String("GITHUB_TOKEN"), Value: aws.String(githubToken), Type: cbtypes.EnvironmentVariableTypePlaintext},
+			tokenEnv,
 			{Name: aws.String("REPO_OWNER"), Value: aws.String(repoOwner), Type: cbtypes.EnvironmentVariableTypePlaintext},
 			{Name: aws.String("REPO_NAME"), Value: aws.String(repoName), Type: cbtypes.EnvironmentVariableTypePlaintext},
 			{Name: aws.String("COMMIT_SHA"), Value: aws.String(commitSHA), Type: cbtypes.EnvironmentVariableTypePlaintext},
@@ -144,10 +229,41 @@ func (s *Service) StartCodeBuildJob(
 
 	out, err := clients.CodeBuild.StartBuild(ctx, input)
 	if err != nil {
-		return "", fmt.Errorf("failed to start CodeBuild job: %w", err)
+		// Don't leak the secret if the build failed to start.
+		if secretStored {
+			s.DeleteSSMParameter(ctx, clients, paramName)
+		}
+		return nil, fmt.Errorf("failed to start CodeBuild job: %w", err)
 	}
 
-	return aws.ToString(out.Build.Id), nil
+	res := &StartCodeBuildResult{BuildID: aws.ToString(out.Build.Id), SecretStored: secretStored}
+	if secretStored {
+		res.TokenParamName = paramName
+	}
+	return res, nil
+}
+
+// putSecureParameter writes a SecureString SSM parameter, overwriting any existing value.
+func (s *Service) putSecureParameter(ctx context.Context, clients *ClientBundle, name, value string) error {
+	_, err := clients.SSM.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(name),
+		Value:     aws.String(value),
+		Type:      ssmtypes.ParameterTypeSecureString,
+		Overwrite: aws.Bool(true),
+	})
+	return err
+}
+
+// DeleteSSMParameter removes an SSM parameter. Best-effort: errors are logged, not returned,
+// since cleanup failure must not fail a deploy.
+func (s *Service) DeleteSSMParameter(ctx context.Context, clients *ClientBundle, name string) {
+	if name == "" {
+		return
+	}
+	_, err := clients.SSM.DeleteParameter(ctx, &ssm.DeleteParameterInput{Name: aws.String(name)})
+	if err != nil && !strings.Contains(err.Error(), "ParameterNotFound") {
+		log.Printf("WARNING: failed to delete SSM parameter %s: %v", name, err)
+	}
 }
 
 // WaitForCodeBuild polls the build until it succeeds or fails, calling onProgress for each tick.
@@ -445,6 +561,7 @@ func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 		Label        string `json:"label" binding:"required"`
 		AWSAccountID string `json:"aws_account_id" binding:"required"`
 		IAMRoleARN   string `json:"iam_role_arn" binding:"required"`
+		ExternalID   string `json:"external_id"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -452,9 +569,18 @@ func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 		return
 	}
 
-	// Verify the role can actually be assumed before persisting it.
-	if _, err := s.assumeRole(c.Request.Context(), req.IAMRoleARN, "us-east-1", "verify"); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "could not assume provided IAM role — check permissions"})
+	// The external ID is the per-connection value embedded in the bootstrap template the
+	// user just deployed (returned by HandleGetBootstrapTemplate). Older clients that don't
+	// send one fall back to the legacy shared value so their pre-existing roles still work.
+	externalID := req.ExternalID
+	if externalID == "" {
+		externalID = LegacyExternalID
+	}
+
+	// Verify the role can actually be assumed with this external ID before persisting it.
+	// This also enforces that the stored external ID matches the deployed role's trust policy.
+	if _, err := s.assumeRole(c.Request.Context(), req.IAMRoleARN, "us-east-1", "verify", externalID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "could not assume provided IAM role — check permissions and that you ran the latest setup script"})
 		return
 	}
 
@@ -463,17 +589,25 @@ func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 		Label:        req.Label,
 		AWSAccountID: req.AWSAccountID,
 		IAMRoleARN:   req.IAMRoleARN,
+		ExternalID:   externalID,
 	}
 
 	err := s.db.Pool.QueryRow(c.Request.Context(),
-		`INSERT INTO aws_accounts (user_id, label, aws_account_id, iam_role_arn)
-		 VALUES ($1, $2, $3, $4)
+		`INSERT INTO aws_accounts (user_id, label, aws_account_id, iam_role_arn, external_id)
+		 VALUES ($1, $2, $3, $4, $5)
 		 RETURNING id, created_at, updated_at`,
-		account.UserID, account.Label, account.AWSAccountID, account.IAMRoleARN,
+		account.UserID, account.Label, account.AWSAccountID, account.IAMRoleARN, account.ExternalID,
 	).Scan(&account.ID, &account.CreatedAt, &account.UpdatedAt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save AWS account"})
 		return
+	}
+
+	if s.events != nil {
+		perTenant := externalID != LegacyExternalID
+		s.events.EmitAccount(c.Request.Context(), account.ID, models.EventExternalIDGenerated,
+			models.SeverityInfo, models.SourceDeployer,
+			map[string]any{"per_tenant": perTenant, "aws_account_id": req.AWSAccountID})
 	}
 
 	c.JSON(http.StatusCreated, account)
@@ -558,7 +692,11 @@ func (s *Service) HandleGetBootstrapTemplate(c *gin.Context) {
 		return
 	}
 
-	rendered := renderBootstrapTemplate(s.platformAccountID)
+	// Generate a fresh per-connection external ID and embed it in the trust policy.
+	// The frontend echoes this value back on connect (HandleConnectAWSAccount) so the
+	// stored external ID matches the one the user deployed into their role.
+	externalID := NewExternalID()
+	rendered := renderBootstrapTemplate(s.platformAccountID, externalID)
 	script := renderCloudShellScript(rendered, region, s.platformAccountID, s.platformCallerARN)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -566,18 +704,22 @@ func (s *Service) HandleGetBootstrapTemplate(c *gin.Context) {
 		"script":              script,
 		"platform_account_id": s.platformAccountID,
 		"region":              region,
+		"external_id":         externalID,
 	})
 }
 
 // renderBootstrapTemplate returns the bootstrap YAML with the ConvDeployAccountId
-// parameter replaced by the actual platform account ID, so users get a complete template.
-func renderBootstrapTemplate(platformAccountID string) string {
+// parameter replaced by the platform account ID and the external-ID placeholder replaced
+// by this connection's external ID, so users get a complete, ready-to-run template.
+func renderBootstrapTemplate(platformAccountID, externalID string) string {
 	// Replace the parameter reference and remove the Parameters block.
 	rendered := strings.ReplaceAll(
 		BootstrapTemplate,
 		"!Sub 'arn:aws:iam::${ConvDeployAccountId}:root'",
 		fmt.Sprintf("'arn:aws:iam::%s:root'", platformAccountID),
 	)
+	// Substitute the per-connection external ID into the trust condition and output.
+	rendered = strings.ReplaceAll(rendered, externalIDPlaceholder, externalID)
 	// Strip the Parameters block — no longer needed now that we've hardcoded the value.
 	start := strings.Index(rendered, "\nParameters:")
 	end := strings.Index(rendered, "\nResources:")
