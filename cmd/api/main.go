@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -89,8 +90,24 @@ func main() {
 
 	// wsAuthFn is injected into the WebSocket hub so it can validate the first-message token
 	// without taking a URL query parameter (which leaks into server logs and browser history).
-	wsAuthFn := pkgws.AuthFunc(func(ctx context.Context, token string) (uuid.UUID, error) {
-		return middleware.ResolveToken(ctx, db, authSvc, token)
+	// It also enforces project ownership so a client cannot subscribe to another tenant's stream.
+	wsAuthFn := pkgws.AuthFunc(func(ctx context.Context, token, projectID string) (uuid.UUID, error) {
+		userID, err := middleware.ResolveToken(ctx, db, authSvc, token)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
+		pid, err := uuid.Parse(projectID)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
+		owned, err := db.UserOwnsProject(ctx, userID, pid)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
+		if !owned {
+			return uuid.UUID{}, errors.New("forbidden: user does not own project")
+		}
+		return userID, nil
 	})
 	githubSvc := githubsvc.NewService(
 		os.Getenv("GITHUB_CLIENT_ID"),
@@ -132,8 +149,15 @@ func main() {
 	r := gin.Default()
 	r.Use(middleware.CORS(os.Getenv("FRONTEND_URL")))
 
-	// Health check
+	// Health check — verifies database connectivity so load balancers don't route to
+	// an instance that can't serve requests.
 	r.GET("/health", func(c *gin.Context) {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		defer cancel()
+		if err := db.Pool.Ping(ctx); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "degraded", "database": "unreachable"})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
@@ -152,7 +176,7 @@ func main() {
 	conversationRL := middleware.NewRateLimiter(10.0/60, 5)
 	deployRL := middleware.NewRateLimiter(5.0/60, 2)
 
-	// Protected routes
+	// Protected routes (require a valid Clerk JWT)
 	protected := v1.Group("/")
 	protected.Use(middleware.RequireAuth(authSvc, db))
 	{
@@ -162,43 +186,51 @@ func main() {
 		protected.GET("/github/repos/:owner/:repo/branches", githubSvc.HandleListBranches)
 		protected.GET("/github/repos/:owner/:repo/detect", githubSvc.HandleDetectFramework)
 
-		// Projects
+		// Projects (collection — ownership enforced inside the handlers)
 		protected.POST("/projects", deploySvc.HandleCreateProject)
 		protected.GET("/projects", deploySvc.HandleListProjects)
-		protected.GET("/projects/:id", deploySvc.HandleGetProject)
 
-		// AWS Accounts (user-level)
+		// AWS Accounts (user-level — ownership enforced inside the handlers)
 		protected.GET("/aws-accounts", awsSvc.HandleListAWSAccounts)
 		protected.POST("/aws-accounts", awsSvc.HandleConnectAWSAccount)
 		protected.DELETE("/aws-accounts/:id", awsSvc.HandleDeleteAWSAccount)
-
-		// Environments
-		protected.POST("/projects/:id/environments", awsSvc.HandleCreateEnvironment)
-		protected.GET("/projects/:id/environments", awsSvc.HandleListEnvironments)
-		protected.POST("/projects/:id/environments/:envId/retry-provision", awsSvc.HandleRetryProvision)
-		protected.GET("/projects/:id/environments/:envId/logs", deploySvc.HandleGetLogs)
-
-		// Deployments
-		protected.POST("/projects/:id/environments/:envId/deploy", deployRL.Middleware(), deploySvc.HandleDeploy)
-		protected.GET("/projects/:id/deployments", deploySvc.HandleListDeployments)
-		protected.POST("/projects/:id/deployments/:deployId/rollback", deploySvc.HandleRollback)
-		protected.POST("/projects/:id/deployments/:deployId/redeploy", deploySvc.HandleRedeploy)
-		protected.DELETE("/projects/:id/deployments/:deployId", deploySvc.HandleDeleteDeployment)
-
-		// Deployment events (operational timeline)
-		protected.GET("/projects/:id/deployments/:deployId/events", eventSvc.HandleGetDeploymentEvents)
-
-		// Diagnosis
-		protected.GET("/projects/:id/deployments/:deployId/diagnose", diagnosisSvc.HandleDiagnose)
-
-		// Conversation (REST fallback — primary is WebSocket)
-		protected.POST("/projects/:id/conversation", conversationRL.Middleware(), conversationSvc.HandleMessage)
-		protected.GET("/projects/:id/conversation/history", conversationSvc.HandleHistory)
-
-		// (WebSocket is registered below, outside this group)
 	}
 
-	// WebSocket — outside the auth middleware; auth is done via first-message token.
+	// Project-scoped routes — every handler here operates on a single project the
+	// caller must own. RequireProjectOwnership is the single tenant-isolation guard
+	// so individual handlers no longer need to re-check ownership of ":id".
+	proj := v1.Group("/projects/:id")
+	proj.Use(middleware.RequireAuth(authSvc, db))
+	proj.Use(middleware.RequireProjectOwnership(db))
+	{
+		proj.GET("", deploySvc.HandleGetProject)
+
+		// Environments
+		proj.POST("/environments", awsSvc.HandleCreateEnvironment)
+		proj.GET("/environments", awsSvc.HandleListEnvironments)
+		proj.POST("/environments/:envId/retry-provision", awsSvc.HandleRetryProvision)
+		proj.GET("/environments/:envId/logs", deploySvc.HandleGetLogs)
+
+		// Deployments
+		proj.POST("/environments/:envId/deploy", deployRL.Middleware(), deploySvc.HandleDeploy)
+		proj.GET("/deployments", deploySvc.HandleListDeployments)
+		proj.POST("/deployments/:deployId/rollback", deploySvc.HandleRollback)
+		proj.POST("/deployments/:deployId/redeploy", deploySvc.HandleRedeploy)
+		proj.DELETE("/deployments/:deployId", deploySvc.HandleDeleteDeployment)
+
+		// Deployment events (operational timeline)
+		proj.GET("/deployments/:deployId/events", eventSvc.HandleGetDeploymentEvents)
+
+		// Diagnosis
+		proj.GET("/deployments/:deployId/diagnose", diagnosisSvc.HandleDiagnose)
+
+		// Conversation (REST fallback — primary is WebSocket)
+		proj.POST("/conversation", conversationRL.Middleware(), conversationSvc.HandleMessage)
+		proj.GET("/conversation/history", conversationSvc.HandleHistory)
+	}
+
+	// WebSocket — outside the auth middleware; auth + project-ownership are verified
+	// via the first-message token (see wsAuthFn).
 	v1.GET("/ws/:projectId", func(c *gin.Context) {
 		hub.HandleUpgrade(c, wsAuthFn, conversationSvc)
 	})

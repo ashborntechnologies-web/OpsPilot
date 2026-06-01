@@ -23,6 +23,7 @@ import (
 type Enqueuer interface {
 	EnqueueDeploy(projectID, environmentID, deploymentID, commitSHA string) error
 	EnqueueProvision(projectID, environmentID string) error
+	EnqueueRollback(projectID, environmentID, deploymentID, previousDeploymentID string) error
 }
 
 type Service struct {
@@ -214,8 +215,25 @@ func (s *Service) HandleRollback(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
 		return
 	}
+	deploymentID, err := uuid.Parse(c.Param("deployId"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid deployment id"})
+		return
+	}
 
-	response, err := s.TriggerRollback(c.Request.Context(), projectID, "production")
+	// Resolve which environment to roll back from the referenced deployment.
+	dep, err := s.getDeployment(c.Request.Context(), deploymentID)
+	if err != nil || dep.ProjectID != projectID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "deployment not found"})
+		return
+	}
+	env, err := s.getEnvironmentByID(c.Request.Context(), dep.EnvironmentID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "environment not found"})
+		return
+	}
+
+	response, err := s.TriggerRollback(c.Request.Context(), projectID, env.Name)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -690,28 +708,279 @@ func (s *Service) markEnvFailed(ctx context.Context, environmentID uuid.UUID) {
 	)
 }
 
-// TriggerRollback rolls back to the previous live deployment (item 6).
+// TriggerRollback rolls the environment back to the previous successful image. It finds
+// the two most recent deployments that produced a runnable image, creates a new deployment
+// record pinned to the previous one's image, and enqueues a rollback job (no rebuild).
 func (s *Service) TriggerRollback(ctx context.Context, projectID uuid.UUID, envName string) (string, error) {
-	// TODO: fetch previous live deployment → re-register its task definition → update service
-	return "Rollback initiated — this will be implemented in the next iteration.", nil
+	env, err := s.getEnvironment(ctx, projectID, envName)
+	if err != nil {
+		return "", fmt.Errorf("environment %q not found", envName)
+	}
+
+	deployable, err := s.getRecentDeployableDeployments(ctx, env.ID, 2)
+	if err != nil {
+		return "", fmt.Errorf("failed to load deployment history: %w", err)
+	}
+	if len(deployable) < 2 {
+		return "Nothing to roll back to — this environment needs at least one previous successful deployment.", nil
+	}
+
+	current := deployable[0] // most recent good deployment (rolling back from)
+	target := deployable[1]  // the one before it (rolling back to)
+	if target.ImageURI == nil {
+		return "The previous deployment has no image to roll back to.", nil
+	}
+
+	commitMsg := ""
+	if target.CommitMessage != nil {
+		commitMsg = *target.CommitMessage
+	}
+	newDep, err := s.createDeploymentWithImage(ctx, projectID, env.ID, target.CommitSHA, commitMsg, *target.ImageURI)
+	if err != nil {
+		return "", fmt.Errorf("failed to create rollback deployment record: %w", err)
+	}
+
+	if err := s.enqueuer.EnqueueRollback(
+		projectID.String(), env.ID.String(), newDep.ID.String(), current.ID.String(),
+	); err != nil {
+		return "", fmt.Errorf("failed to queue rollback job: %w", err)
+	}
+
+	return fmt.Sprintf("Rolling back %s to commit `%s` — I'll stream updates as it deploys.", envName, target.CommitSHA[:8]), nil
 }
 
-// FetchLogsForProject returns recent log lines (item 6).
+// FetchLogsForProject returns recent application log lines for the project's deployable
+// environment, fetched live from CloudWatch.
 func (s *Service) FetchLogsForProject(ctx context.Context, projectID uuid.UUID) (string, error) {
-	// TODO: get environment → assume role → list CloudWatch log streams → fetch latest
-	return "Log fetching will be wired in the next iteration.", nil
+	env, err := s.getDeployableEnvironment(ctx, projectID)
+	if err != nil {
+		return "", err
+	}
+	if env.LogGroupName == nil {
+		return "That environment isn't provisioned yet — no logs to show.", nil
+	}
+
+	clients, err := s.awsSvc.AssumeRoleForEnvironment(ctx, env)
+	if err != nil {
+		return "", fmt.Errorf("failed to connect to AWS: %w", err)
+	}
+
+	lines, err := s.awsSvc.FetchRecentECSLogs(ctx, clients, *env.LogGroupName, 100)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch logs: %w", err)
+	}
+	if len(lines) == 0 {
+		return fmt.Sprintf("No recent logs found for the %s environment.", env.Name), nil
+	}
+
+	// Show the last ~40 lines in chat; the Logs tab has the full view.
+	if len(lines) > 40 {
+		lines = lines[len(lines)-40:]
+	}
+	return fmt.Sprintf("Recent logs from **%s**:\n```\n%s\n```", env.Name, strings.Join(lines, "\n")), nil
 }
 
-// CheckHealth returns current deployment health (item 6).
+// CheckHealth describes the ECS service for the project's deployable environment and
+// returns a human-readable running/desired summary plus rollout state.
 func (s *Service) CheckHealth(ctx context.Context, projectID uuid.UUID) (string, error) {
-	// TODO: describe ECS service → return running count, task health
-	return "Health check will be wired in the next iteration.", nil
+	env, err := s.getDeployableEnvironment(ctx, projectID)
+	if err != nil {
+		return "", err
+	}
+	if env.ECSServiceName == nil {
+		return fmt.Sprintf("The %s environment hasn't been deployed yet — nothing running to check.", env.Name), nil
+	}
+
+	clusterName, _, _, _, err := s.resolveNetworking(ctx, env)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve cluster: %w", err)
+	}
+
+	clients, err := s.awsSvc.AssumeRoleForEnvironment(ctx, env)
+	if err != nil {
+		return "", fmt.Errorf("failed to connect to AWS: %w", err)
+	}
+
+	h, err := s.awsSvc.DescribeECSService(ctx, clients, clusterName, *env.ECSServiceName)
+	if err != nil {
+		return "", err
+	}
+
+	status := "healthy"
+	if h.RunningCount < h.DesiredCount {
+		status = "degraded"
+	}
+	if h.RunningCount == 0 && h.DesiredCount > 0 {
+		status = "down"
+	}
+
+	msg := fmt.Sprintf("**%s** is %s — %d/%d tasks running", env.Name, status, h.RunningCount, h.DesiredCount)
+	if h.PendingCount > 0 {
+		msg += fmt.Sprintf(" (%d pending)", h.PendingCount)
+	}
+	if h.RolloutState != "" && h.RolloutState != "COMPLETED" {
+		msg += fmt.Sprintf(". Rollout: %s", h.RolloutState)
+		if h.Reason != "" {
+			msg += fmt.Sprintf(" — %s", h.Reason)
+		}
+	}
+	if env.ALBDNS != nil {
+		msg += fmt.Sprintf("\nURL: http://%s", *env.ALBDNS)
+	}
+	return msg, nil
 }
 
-// ScaleService updates the ECS service desired count (item 6).
+// ScaleService updates the ECS service desired count for the project's deployable environment.
 func (s *Service) ScaleService(ctx context.Context, projectID uuid.UUID, replicas int) (string, error) {
-	// TODO: assume role → update ECS service desired count
-	return fmt.Sprintf("Scaling to %d replicas will be wired in the next iteration.", replicas), nil
+	if replicas < 0 || replicas > 10 {
+		return "Replica count must be between 0 and 10.", nil
+	}
+
+	env, err := s.getDeployableEnvironment(ctx, projectID)
+	if err != nil {
+		return "", err
+	}
+	if env.ECSServiceName == nil {
+		return fmt.Sprintf("The %s environment hasn't been deployed yet — deploy before scaling.", env.Name), nil
+	}
+
+	clusterName, _, _, _, err := s.resolveNetworking(ctx, env)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve cluster: %w", err)
+	}
+
+	clients, err := s.awsSvc.AssumeRoleForEnvironment(ctx, env)
+	if err != nil {
+		return "", fmt.Errorf("failed to connect to AWS: %w", err)
+	}
+
+	if err := s.awsSvc.UpdateServiceDesiredCount(ctx, clients, clusterName, *env.ECSServiceName, int32(replicas)); err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("Scaling **%s** to %d replica(s) — ECS is rolling the change out now.", env.Name, replicas), nil
+}
+
+// RunRollbackWorkflow re-deploys an already-built image (no CodeBuild) to the ECS service.
+// deploymentID is the new rollback deployment record (its image_uri is the rollback target);
+// previousDeploymentID, if set, is marked rolled_back once the new image is live.
+func (s *Service) RunRollbackWorkflow(ctx context.Context, projectID, environmentID, deploymentID uuid.UUID, previousDeploymentID *uuid.UUID) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+
+	project, err := s.getProject(ctx, projectID)
+	if err != nil {
+		return fmt.Errorf("project not found: %w", err)
+	}
+	env, err := s.getEnvironmentByID(ctx, environmentID)
+	if err != nil {
+		return fmt.Errorf("environment not found: %w", err)
+	}
+	deployment, err := s.getDeployment(ctx, deploymentID)
+	if err != nil {
+		return fmt.Errorf("deployment record not found: %w", err)
+	}
+	if deployment.ImageURI == nil {
+		return s.failDeployment(ctx, projectID, deploymentID, "rollback target has no image URI")
+	}
+
+	if env.StackStatus != models.StackStatusReady {
+		return s.failDeployment(ctx, projectID, deploymentID,
+			fmt.Sprintf("environment not ready (stack status: %s)", env.StackStatus))
+	}
+	if env.TaskExecutionRoleARN == nil || env.LogGroupName == nil {
+		return s.failDeployment(ctx, projectID, deploymentID, "environment infrastructure not fully provisioned")
+	}
+
+	clusterName, subnets, sgID, ps, err := s.resolveNetworking(ctx, env)
+	if err != nil {
+		return s.failDeployment(ctx, projectID, deploymentID, fmt.Sprintf("failed to resolve networking: %s", err))
+	}
+
+	clients, err := s.awsSvc.AssumeRoleForEnvironment(ctx, env)
+	if err != nil {
+		return s.failDeployment(ctx, projectID, deploymentID, fmt.Sprintf("failed to assume IAM role: %s", err))
+	}
+
+	imageURI := *deployment.ImageURI
+	envIDPtr := &env.ID
+	depIDPtr := &deploymentID
+
+	s.events.Emit(ctx, events.Event{
+		ProjectID:     projectID,
+		EnvironmentID: envIDPtr,
+		DeploymentID:  depIDPtr,
+		Type:          models.EventRollbackTriggered,
+		ActorType:     models.ActorUser,
+		Payload:       map[string]any{"image_uri": imageURI, "commit_sha": deployment.CommitSHA},
+	})
+
+	s.updateDeploymentStatus(ctx, deploymentID, models.DeployStatusDeploying, nil, &imageURI)
+	s.broadcast(projectID, ws.Message{Type: "deploy_progress", Payload: "Rolling back — registering previous task definition..."})
+
+	taskDefARN, err := s.awsSvc.RegisterECSTaskDefinition(ctx, clients, env, project, imageURI)
+	if err != nil {
+		return s.failDeployment(ctx, projectID, deploymentID, fmt.Sprintf("failed to register task definition: %s", err))
+	}
+
+	s.broadcast(projectID, ws.Message{Type: "deploy_progress", Payload: "Ensuring ALB target group..."})
+	tgARN, err := s.awsSvc.EnsureTargetGroup(ctx, clients, ps, env, project)
+	if err != nil {
+		return s.failDeployment(ctx, projectID, deploymentID, fmt.Sprintf("failed to ensure target group: %s", err))
+	}
+	env.ALBTargetGroupARN = &tgARN
+
+	if ps != nil {
+		if _, err = s.awsSvc.EnsureListenerRule(ctx, clients, ps, env, tgARN); err != nil {
+			return s.failDeployment(ctx, projectID, deploymentID, fmt.Sprintf("failed to ensure listener rule: %s", err))
+		}
+	}
+
+	s.broadcast(projectID, ws.Message{Type: "deploy_progress", Payload: "Deploying previous version to ECS..."})
+	s.events.Emit(ctx, events.Event{
+		ProjectID:     projectID,
+		EnvironmentID: envIDPtr,
+		DeploymentID:  depIDPtr,
+		Type:          models.EventECSRolloutStarted,
+		Source:        models.SourceECS,
+		Payload:       map[string]any{"task_def_arn": taskDefARN, "cluster": clusterName, "rollback": true},
+	})
+
+	if err = s.awsSvc.EnsureECSService(ctx, clients, env, project, taskDefARN, clusterName, subnets, sgID); err != nil {
+		return s.failDeployment(ctx, projectID, deploymentID, fmt.Sprintf("failed to update ECS service: %s", err))
+	}
+
+	if err = s.awsSvc.WaitForECSServiceStable(ctx, clients, clusterName, env, func(msg string) {
+		s.broadcast(projectID, ws.Message{Type: "deploy_progress", Payload: msg})
+	}); err != nil {
+		return s.failDeployment(ctx, projectID, deploymentID, fmt.Sprintf("rollback failed to stabilize: %s", err))
+	}
+
+	s.events.Emit(ctx, events.Event{
+		ProjectID:     projectID,
+		EnvironmentID: envIDPtr,
+		DeploymentID:  depIDPtr,
+		Type:          models.EventECSStable,
+		Source:        models.SourceECS,
+		Payload:       map[string]any{"cluster": clusterName, "image_uri": imageURI, "rollback": true},
+	})
+
+	s.updateDeploymentStatus(ctx, deploymentID, models.DeployStatusLive, nil, &imageURI)
+
+	// Mark the deployment we rolled back from as rolled_back.
+	if previousDeploymentID != nil {
+		s.db.Pool.Exec(ctx,
+			`UPDATE deployments SET status = $1, updated_at = NOW() WHERE id = $2`,
+			models.DeployStatusRolledBack, *previousDeploymentID,
+		)
+	}
+
+	liveMsg := fmt.Sprintf("Rolled back! Commit `%s` is live again.", deployment.CommitSHA[:8])
+	if env.ALBDNS != nil {
+		liveMsg = fmt.Sprintf("Rolled back! Commit `%s` is live again at http://%s", deployment.CommitSHA[:8], *env.ALBDNS)
+	}
+	s.broadcast(projectID, ws.Message{Type: "deploy_done", Payload: liveMsg})
+	return nil
 }
 
 // HandleGetLogs streams recent ECS application logs for an environment from CloudWatch.
@@ -837,6 +1106,76 @@ func (s *Service) getDeployment(ctx context.Context, deploymentID uuid.UUID) (*m
 	return &d, nil
 }
 
+// getDeployableEnvironment returns the environment to act on for conversational commands
+// (logs/health/scale). It prefers production, then staging, then any provisioned environment.
+func (s *Service) getDeployableEnvironment(ctx context.Context, projectID uuid.UUID) (*models.Environment, error) {
+	for _, name := range []string{"production", "staging"} {
+		if env, err := s.getEnvironment(ctx, projectID, name); err == nil && env.StackStatus == models.StackStatusReady {
+			return env, nil
+		}
+	}
+	// Fall back to any ready environment.
+	for _, name := range []string{"production", "staging"} {
+		if env, err := s.getEnvironment(ctx, projectID, name); err == nil {
+			return env, nil
+		}
+	}
+	return nil, fmt.Errorf("no environment found — create and provision one first")
+}
+
+// getRecentDeployableDeployments returns up to `limit` most recent deployments for an
+// environment that produced a runnable image (have image_uri and reached live or rolled_back),
+// newest first. Used to find rollback targets.
+func (s *Service) getRecentDeployableDeployments(ctx context.Context, envID uuid.UUID, limit int) ([]models.Deployment, error) {
+	rows, err := s.db.Pool.Query(ctx,
+		`SELECT id, project_id, environment_id, commit_sha, commit_message, image_uri, status, failure_reason, created_at, updated_at
+		 FROM deployments
+		 WHERE environment_id = $1 AND image_uri IS NOT NULL AND status IN ('live', 'rolled_back')
+		 ORDER BY created_at DESC LIMIT $2`, envID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deps []models.Deployment
+	for rows.Next() {
+		var d models.Deployment
+		if err := rows.Scan(
+			&d.ID, &d.ProjectID, &d.EnvironmentID, &d.CommitSHA, &d.CommitMessage,
+			&d.ImageURI, &d.Status, &d.FailureReason, &d.CreatedAt, &d.UpdatedAt,
+		); err != nil {
+			continue
+		}
+		deps = append(deps, d)
+	}
+	return deps, nil
+}
+
+// createDeploymentWithImage creates a deployment record with a pre-set image URI (used by
+// rollback, which reuses an already-built image rather than rebuilding).
+func (s *Service) createDeploymentWithImage(ctx context.Context, projectID, envID uuid.UUID, commitSHA, commitMsg, imageURI string) (*models.Deployment, error) {
+	d := &models.Deployment{
+		ProjectID:     projectID,
+		EnvironmentID: envID,
+		CommitSHA:     commitSHA,
+		CommitMessage: &commitMsg,
+		ImageURI:      &imageURI,
+		Status:        models.DeployStatusPending,
+	}
+
+	err := s.db.Pool.QueryRow(ctx,
+		`INSERT INTO deployments (project_id, environment_id, commit_sha, commit_message, image_uri, status)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 RETURNING id, created_at, updated_at`,
+		d.ProjectID, d.EnvironmentID, d.CommitSHA, d.CommitMessage, d.ImageURI, d.Status,
+	).Scan(&d.ID, &d.CreatedAt, &d.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
 func (s *Service) createDeployment(ctx context.Context, projectID, envID uuid.UUID, commitSHA, commitMsg string) (*models.Deployment, error) {
 	d := &models.Deployment{
 		ProjectID:     projectID,
@@ -872,7 +1211,7 @@ func (s *Service) updateDeploymentStatus(ctx context.Context, deploymentID uuid.
 func (s *Service) failDeployment(ctx context.Context, projectID, deploymentID uuid.UUID, reason string) error {
 	s.updateDeploymentStatus(ctx, deploymentID, models.DeployStatusFailed, &reason, nil)
 	s.broadcast(projectID, ws.Message{Type: "deploy_failed", Payload: reason})
-	return fmt.Errorf(reason)
+	return fmt.Errorf("%s", reason)
 }
 
 func (s *Service) broadcast(projectID uuid.UUID, msg ws.Message) {

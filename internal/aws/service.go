@@ -991,6 +991,59 @@ func (s *Service) WaitForECSServiceStable(ctx context.Context, clients *ClientBu
 	}
 }
 
+// ServiceHealth is a point-in-time snapshot of an ECS service's runtime state.
+type ServiceHealth struct {
+	RunningCount int32
+	DesiredCount int32
+	PendingCount int32
+	RolloutState string // COMPLETED | IN_PROGRESS | FAILED | "" (no primary deployment)
+	Reason       string // rollout state reason, when present
+}
+
+// DescribeECSService returns the current running/desired counts and rollout state for a service.
+// Used by the health-check workflow. Returns an error if the service does not exist.
+func (s *Service) DescribeECSService(ctx context.Context, clients *ClientBundle, clusterName, serviceName string) (*ServiceHealth, error) {
+	out, err := clients.ECS.DescribeServices(ctx, &ecs.DescribeServicesInput{
+		Cluster:  aws.String(clusterName),
+		Services: []string{serviceName},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to describe ECS service: %w", err)
+	}
+	if len(out.Services) == 0 || (out.Services[0].Status != nil && *out.Services[0].Status == "INACTIVE") {
+		return nil, fmt.Errorf("service %q not found or inactive — deploy first", serviceName)
+	}
+
+	svc := out.Services[0]
+	h := &ServiceHealth{
+		RunningCount: svc.RunningCount,
+		DesiredCount: svc.DesiredCount,
+		PendingCount: svc.PendingCount,
+	}
+	for _, d := range svc.Deployments {
+		if d.Status != nil && *d.Status == "PRIMARY" {
+			h.RolloutState = string(d.RolloutState)
+			h.Reason = aws.ToString(d.RolloutStateReason)
+			break
+		}
+	}
+	return h, nil
+}
+
+// UpdateServiceDesiredCount changes the desired task count of an existing ECS service.
+// Used by the scale workflow. The service must already exist (created at first deploy).
+func (s *Service) UpdateServiceDesiredCount(ctx context.Context, clients *ClientBundle, clusterName, serviceName string, desiredCount int32) error {
+	_, err := clients.ECS.UpdateService(ctx, &ecs.UpdateServiceInput{
+		Cluster:      aws.String(clusterName),
+		Service:      aws.String(serviceName),
+		DesiredCount: aws.Int32(desiredCount),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update desired count: %w", err)
+	}
+	return nil
+}
+
 // tgName returns the Target Group name for a project-environment. Max 32 chars (ALB limit).
 func tgName(projectID, envName string) string {
 	short := projectID

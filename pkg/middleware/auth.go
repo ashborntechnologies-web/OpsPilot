@@ -64,6 +64,35 @@ func GetUserID(c *gin.Context) (uuid.UUID, bool) {
 	return id, ok
 }
 
+// RequireProjectOwnership is a tenant-isolation guard for routes under /projects/:id.
+// It rejects requests where the authenticated user does not own the project in the
+// path, returning 404 (not 403) so project existence is not leaked across tenants.
+// Must run after RequireAuth. Apply only to a group whose ":id" param is a project ID.
+func RequireProjectOwnership(db *models.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userID, ok := GetUserID(c)
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "user not authenticated"})
+			return
+		}
+		projectID, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+			return
+		}
+		owned, err := db.UserOwnsProject(c.Request.Context(), userID, projectID)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "failed to verify project access"})
+			return
+		}
+		if !owned {
+			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "project not found"})
+			return
+		}
+		c.Next()
+	}
+}
+
 // upsertUser looks up the user by clerk_id; if not found, fetches from Clerk and inserts.
 func upsertUser(ctx context.Context, db *models.DB, authSvc *auth.Service, clerkID string) (uuid.UUID, error) {
 	// Fast path: user already exists
