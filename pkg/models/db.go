@@ -68,6 +68,8 @@ func RunMigrations(db *DB) error {
 		createPlatformStacksTable,
 		addPlatformStackToEnvironments,
 		createOperationalEventsTable,
+		addExternalIDToAWSAccounts,
+		addAccountScopeToOperationalEvents,
 	}
 
 	for _, m := range migrations {
@@ -219,6 +221,20 @@ const addPlatformStackToEnvironments = `
 ALTER TABLE environments
     ADD COLUMN IF NOT EXISTS platform_stack_id UUID REFERENCES platform_stacks(id),
     ADD COLUMN IF NOT EXISTS alb_listener_rule_arn TEXT;`
+
+// addExternalIDToAWSAccounts adds the per-tenant STS external ID used in the role trust
+// policy. Existing accounts default to the legacy shared value 'convdeploy' so their
+// already-deployed bootstrap roles keep working; new accounts get a derived per-user value.
+const addExternalIDToAWSAccounts = `
+ALTER TABLE aws_accounts ADD COLUMN IF NOT EXISTS external_id TEXT NOT NULL DEFAULT 'convdeploy';`
+
+// addAccountScopeToOperationalEvents lets the event system record account-scoped actions
+// (e.g. external_id.generated) that occur before any project link exists. project_id is
+// made nullable and an optional account_id is added. Existing project-scoped events are
+// unaffected (they continue to set project_id).
+const addAccountScopeToOperationalEvents = `
+ALTER TABLE operational_events ALTER COLUMN project_id DROP NOT NULL;
+ALTER TABLE operational_events ADD COLUMN IF NOT EXISTS account_id UUID REFERENCES aws_accounts(id);`
 
 // createOperationalEventsTable stores structured state-transition events for every
 // deploy and provision operation. AI reasons over these events rather than raw log text.

@@ -125,6 +125,7 @@ func main() {
 	defer queueClient.Close()
 
 	eventSvc := events.NewService(db)
+	awsSvc.SetEvents(eventSvc) // enable account-level audit events (e.g. external_id.generated)
 	deploySvc := deploy.NewService(db, awsSvc, githubSvc, hub, queueClient, eventSvc)
 
 	// After an environment is created with a linked AWS account, auto-trigger provisioning.
@@ -133,7 +134,7 @@ func main() {
 			log.Printf("failed to enqueue provision job for env %s: %v", environmentID, err)
 		}
 	})
-	diagnosisSvc := diagnosis.NewService(db, awsSvc, os.Getenv("ANTHROPIC_API_KEY"))
+	diagnosisSvc := diagnosis.NewService(db, awsSvc, eventSvc, os.Getenv("ANTHROPIC_API_KEY"))
 	conversationSvc := conversation.NewService(db, deploySvc, diagnosisSvc, os.Getenv("ANTHROPIC_API_KEY"), hub)
 
 	// Init job queue server
@@ -144,6 +145,13 @@ func main() {
 	)
 	go queueServer.Start()
 	defer queueServer.Stop()
+
+	// Periodic watchdog — enqueues a stuck-resource reconcile every 5 minutes.
+	scheduler := queue.NewScheduler(os.Getenv("REDIS_URL"))
+	if err := scheduler.Start(); err != nil {
+		log.Printf("WARNING: failed to start watchdog scheduler: %v", err)
+	}
+	defer scheduler.Stop()
 
 	// Setup router
 	r := gin.Default()

@@ -40,7 +40,7 @@ Resources:
             Action: sts:AssumeRole
             Condition:
               StringEquals:
-                sts:ExternalId: convdeploy
+                sts:ExternalId: CONVDEPLOY_EXTERNAL_ID
       Policies:
         - PolicyName: ConvDeployPermissions
           PolicyDocument:
@@ -191,13 +191,20 @@ Resources:
                 Effect: Allow
                 Action: sts:GetCallerIdentity
                 Resource: '*'
+              - Sid: SSMParameters
+                Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                  - ssm:DeleteParameter
+                Resource: !Sub 'arn:aws:ssm:*:${AWS::AccountId}:parameter/convdeploy/*'
 
 Outputs:
   RoleArn:
     Value: !GetAtt ConvDeployRole.Arn
     Description: Paste this ARN into ConvDeploy to complete AWS connection.
   ExternalId:
-    Value: convdeploy
+    Value: CONVDEPLOY_EXTERNAL_ID
     Description: External ID is already configured - no action needed.
 `
 
@@ -485,6 +492,18 @@ Resources:
                   - ecr:CompleteLayerUpload
                   - ecr:PutImage
                 Resource: '*'
+              # Resolve the SecureString GitHub token injected as a PARAMETER_STORE env var.
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                Resource: !Sub 'arn:aws:ssm:*:${AWS::AccountId}:parameter/convdeploy/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
 
   # ── CodeBuild ────────────────────────────────────────────────────────────────
 

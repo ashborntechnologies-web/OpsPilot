@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -451,8 +452,9 @@ func (s *Service) RunDeployWorkflow(ctx context.Context, projectID, environmentI
 	if project.StartCommand != nil {
 		startCommand = *project.StartCommand
 	}
-	buildID, err := s.awsSvc.StartCodeBuildJob(
+	buildRes, err := s.awsSvc.StartCodeBuildJob(
 		ctx, clients,
+		projectID.String(),
 		*env.CodeBuildProjectName,
 		token,
 		project.RepoOwner, project.RepoName,
@@ -472,11 +474,40 @@ func (s *Service) RunDeployWorkflow(ctx context.Context, projectID, environmentI
 		})
 		return s.failDeployment(ctx, projectID, deploymentID, fmt.Sprintf("failed to start build: %s", err))
 	}
+	buildID := buildRes.BuildID
+
+	// The GitHub token is stored in SSM for the duration of the build (secure path) and
+	// deleted once the build finishes, win or lose. cleanupSecret is idempotent and safe.
+	cleanupSecret := func() {
+		if buildRes.TokenParamName == "" {
+			return
+		}
+		s.awsSvc.DeleteSSMParameter(ctx, clients, buildRes.TokenParamName)
+		s.events.Emit(ctx, events.Event{
+			ProjectID:     projectID,
+			EnvironmentID: envIDPtr,
+			DeploymentID:  depIDPtr,
+			Type:          models.EventSecretDeleted,
+			Source:        models.SourceBuild,
+			Payload:       map[string]any{"param": buildRes.TokenParamName},
+		})
+	}
+	if buildRes.SecretStored {
+		s.events.Emit(ctx, events.Event{
+			ProjectID:     projectID,
+			EnvironmentID: envIDPtr,
+			DeploymentID:  depIDPtr,
+			Type:          models.EventSecretCreated,
+			Source:        models.SourceBuild,
+			Payload:       map[string]any{"param": buildRes.TokenParamName, "store": "ssm-securestring"},
+		})
+	}
 
 	// Step 2 — wait for build
 	if err = s.awsSvc.WaitForCodeBuild(ctx, clients, buildID, func(msg string) {
 		s.broadcast(projectID, ws.Message{Type: "deploy_progress", Payload: msg})
 	}); err != nil {
+		cleanupSecret()
 		s.events.Emit(ctx, events.Event{
 			ProjectID:     projectID,
 			EnvironmentID: envIDPtr,
@@ -488,6 +519,7 @@ func (s *Service) RunDeployWorkflow(ctx context.Context, projectID, environmentI
 		})
 		return s.failDeployment(ctx, projectID, deploymentID, fmt.Sprintf("build failed: %s", err))
 	}
+	cleanupSecret()
 
 	s.events.Emit(ctx, events.Event{
 		ProjectID:     projectID,
@@ -698,6 +730,103 @@ func (s *Service) RunProvisionWorkflow(ctx context.Context, projectID, environme
 		Payload: "Infrastructure ready! You can now deploy your first version.",
 	})
 
+	return nil
+}
+
+// stuckThresholdMinutes is how long a deployment/environment may sit in an in-progress
+// state before the watchdog considers it stuck. It is deliberately larger than the 45-minute
+// workflow context timeout so a legitimately running job is never falsely failed.
+const stuckThresholdMinutes = 60
+
+// ReconcileStuckResources is the watchdog entrypoint (invoked periodically by the queue
+// scheduler). It marks deployments stuck in building/deploying and environments stuck in
+// provisioning past the threshold as failed, emitting operational events for each. It is
+// idempotent: once a row is marked failed it no longer matches, so repeated runs are safe.
+func (s *Service) ReconcileStuckResources(ctx context.Context) error {
+	reason := fmt.Sprintf("Automatically failed: stuck in progress for over %d minutes (the worker may have crashed).", stuckThresholdMinutes)
+
+	// ── Stuck deployments ──────────────────────────────────────────────────────
+	type stuckDep struct {
+		id      uuid.UUID
+		project uuid.UUID
+		env     uuid.UUID
+		status  string
+	}
+	var deps []stuckDep
+	rows, err := s.db.Pool.Query(ctx,
+		`UPDATE deployments
+		    SET status = $1, failure_reason = $2, updated_at = NOW()
+		  WHERE status IN ('building', 'deploying')
+		    AND updated_at < NOW() - make_interval(mins => $3)
+		 RETURNING id, project_id, environment_id, status`,
+		models.DeployStatusFailed, reason, stuckThresholdMinutes,
+	)
+	if err != nil {
+		return fmt.Errorf("watchdog: failed to scan stuck deployments: %w", err)
+	}
+	for rows.Next() {
+		var d stuckDep
+		if err := rows.Scan(&d.id, &d.project, &d.env, &d.status); err != nil {
+			continue
+		}
+		deps = append(deps, d)
+	}
+	rows.Close()
+
+	for _, d := range deps {
+		envID, depID := d.env, d.id
+		s.events.Emit(ctx, events.Event{
+			ProjectID: d.project, EnvironmentID: &envID, DeploymentID: &depID,
+			Type: models.EventDeploymentStuck, Severity: models.SeverityWarn, Source: models.SourceScheduler,
+			Payload: map[string]any{"threshold_minutes": stuckThresholdMinutes},
+		})
+		s.events.Emit(ctx, events.Event{
+			ProjectID: d.project, EnvironmentID: &envID, DeploymentID: &depID,
+			Type: models.EventDeploymentAutoFailed, Severity: models.SeverityError, Source: models.SourceScheduler,
+			Payload: map[string]any{"reason": reason},
+		})
+		s.broadcast(d.project, ws.Message{Type: "deploy_failed", Payload: reason})
+	}
+
+	// ── Stuck environments (provisioning) ──────────────────────────────────────
+	type stuckEnv struct {
+		id      uuid.UUID
+		project uuid.UUID
+	}
+	var envs []stuckEnv
+	rows2, err := s.db.Pool.Query(ctx,
+		`UPDATE environments
+		    SET stack_status = $1, updated_at = NOW()
+		  WHERE stack_status = 'provisioning'
+		    AND updated_at < NOW() - make_interval(mins => $2)
+		 RETURNING id, project_id`,
+		models.StackStatusFailed, stuckThresholdMinutes,
+	)
+	if err != nil {
+		return fmt.Errorf("watchdog: failed to scan stuck environments: %w", err)
+	}
+	for rows2.Next() {
+		var e stuckEnv
+		if err := rows2.Scan(&e.id, &e.project); err != nil {
+			continue
+		}
+		envs = append(envs, e)
+	}
+	rows2.Close()
+
+	for _, e := range envs {
+		envID := e.id
+		s.events.Emit(ctx, events.Event{
+			ProjectID: e.project, EnvironmentID: &envID,
+			Type: models.EventProvisionFailed, Severity: models.SeverityError, Source: models.SourceScheduler,
+			Payload: map[string]any{"reason": reason, "threshold_minutes": stuckThresholdMinutes},
+		})
+		s.broadcast(e.project, ws.Message{Type: "provision_failed", Payload: reason})
+	}
+
+	if len(deps) > 0 || len(envs) > 0 {
+		log.Printf("[watchdog] auto-failed %d stuck deployment(s) and %d stuck environment(s)", len(deps), len(envs))
+	}
 	return nil
 }
 

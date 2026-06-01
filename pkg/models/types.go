@@ -21,6 +21,7 @@ type AWSAccount struct {
 	Label        string    `json:"label" db:"label"`
 	AWSAccountID string    `json:"aws_account_id" db:"aws_account_id"`
 	IAMRoleARN   string    `json:"iam_role_arn" db:"iam_role_arn"`
+	ExternalID   string    `json:"-" db:"external_id"` // STS external ID; per-tenant, not exposed in JSON
 	CreatedAt    time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
 }
@@ -218,6 +219,19 @@ const (
 	EventProvisionStarted  = "provision.started"
 	EventProvisionReady    = "provision.ready"
 	EventProvisionFailed   = "provision.failed"
+
+	// Phase 2 — security
+	EventExternalIDGenerated = "external_id.generated"
+	EventSecretCreated       = "secret.created"
+	EventSecretDeleted       = "secret.deleted"
+
+	// Phase 2 — AI diagnosis
+	EventDiagnosisStarted   = "diagnosis.started"
+	EventDiagnosisCompleted = "diagnosis.completed"
+
+	// Phase 2 — reliability watchdog
+	EventDeploymentStuck      = "deployment.stuck"
+	EventDeploymentAutoFailed = "deployment.auto_failed"
 )
 
 // Severity constants
