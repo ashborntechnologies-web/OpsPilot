@@ -85,7 +85,7 @@ export default function ProjectsPage() {
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
-                    <p className="text-xs text-muted-foreground">{p.aws_region}</p>
+                    <p className="text-xs text-muted-foreground">{p.branch ?? "default branch"}</p>
                   </CardContent>
                 </Card>
               </Link>
