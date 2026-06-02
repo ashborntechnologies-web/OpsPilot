@@ -17,6 +17,7 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/conversation"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/envvars"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
 	githubsvc "github.com/ashborntechnologies-web/OpsPilot/internal/github"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/queue"
@@ -115,6 +116,7 @@ func main() {
 		os.Getenv("GITHUB_REDIRECT_URL"),
 		os.Getenv("ENCRYPTION_KEY"),
 		db,
+		os.Getenv("ANTHROPIC_API_KEY"),
 	)
 	platformAccountID, platformCallerARN := resolvePlatformIdentity()
 	awsSvc := aws.NewService(db, platformAccountID, platformCallerARN)
@@ -126,7 +128,8 @@ func main() {
 
 	eventSvc := events.NewService(db)
 	awsSvc.SetEvents(eventSvc) // enable account-level audit events (e.g. external_id.generated)
-	deploySvc := deploy.NewService(db, awsSvc, githubSvc, hub, queueClient, eventSvc)
+	envVarSvc := envvars.NewService(db)
+	deploySvc := deploy.NewService(db, awsSvc, githubSvc, hub, queueClient, eventSvc, envVarSvc)
 
 	// After an environment is created with a linked AWS account, auto-trigger provisioning.
 	awsSvc.SetOnEnvCreated(func(projectID, environmentID uuid.UUID) {
@@ -218,6 +221,11 @@ func main() {
 		proj.GET("/environments", awsSvc.HandleListEnvironments)
 		proj.POST("/environments/:envId/retry-provision", awsSvc.HandleRetryProvision)
 		proj.GET("/environments/:envId/logs", deploySvc.HandleGetLogs)
+
+		// Env vars (injected into the ECS task definition at deploy time)
+		proj.GET("/environments/:envId/env-vars", envVarSvc.HandleList)
+		proj.PUT("/environments/:envId/env-vars", envVarSvc.HandleUpsert)
+		proj.DELETE("/environments/:envId/env-vars/:varId", envVarSvc.HandleDelete)
 
 		// Deployments
 		proj.POST("/environments/:envId/deploy", deployRL.Middleware(), deploySvc.HandleDeploy)

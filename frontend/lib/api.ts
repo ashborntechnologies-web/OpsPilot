@@ -171,6 +171,31 @@ export function listGithubBranches(token: string, owner: string, repo: string) {
   return request<string[]>(`/github/repos/${owner}/${repo}/branches`, token);
 }
 
+// ---- Env Vars ---------------------------------------------------------------
+
+export function listEnvVars(token: string, projectId: string, envId: string) {
+  return request<import("@/types/api").EnvVar[]>(
+    `/projects/${projectId}/environments/${envId}/env-vars`, token
+  );
+}
+
+export function upsertEnvVar(
+  token: string, projectId: string, envId: string,
+  body: { key: string; value: string; is_secret: boolean }
+) {
+  return request<import("@/types/api").EnvVar>(
+    `/projects/${projectId}/environments/${envId}/env-vars`, token,
+    { method: "PUT", body: JSON.stringify(body) }
+  );
+}
+
+export function deleteEnvVar(token: string, projectId: string, envId: string, varId: string) {
+  return request<{ message: string }>(
+    `/projects/${projectId}/environments/${envId}/env-vars/${varId}`, token,
+    { method: "DELETE" }
+  );
+}
+
 export function getEnvironmentLogs(token: string, projectId: string, envId: string, lines = 200) {
   return request<{ lines: string[]; log_group: string }>(
     `/projects/${projectId}/environments/${envId}/logs?lines=${lines}`,

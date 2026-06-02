@@ -41,6 +41,8 @@ const FRAMEWORK_GROUPS = [
       { value: "nestjs",  label: "NestJS",     desc: "Enterprise Node.js" },
       { value: "express", label: "Express.js", desc: "Minimal Node.js" },
       { value: "nodejs",  label: "Node.js",    desc: "Any Node.js app" },
+      { value: "react-spa", label: "React (Create React App)", desc: "CRA SPA · Nginx" },
+      { value: "vite",      label: "Vite (React / Vue SPA)",   desc: "Vite SPA · Nginx" },
     ],
   },
   {
@@ -86,6 +88,8 @@ const DEFAULT_START_COMMANDS: Record<string, string> = {
   nuxtjs:   "node .output/server/index.mjs",
   svelte:   "node build/index.js",
   astro:    "node ./dist/server/entry.mjs",
+  "react-spa": "nginx -g 'daemon off;'",
+  vite:        "nginx -g 'daemon off;'",
   go:       "./server",
   rails:    "bundle exec puma -C config/puma.rb",
   spring:   "java -jar app.jar",

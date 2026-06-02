@@ -19,6 +19,7 @@ export interface AWSAccount {
 export type Framework =
   | "fastapi" | "flask" | "django" | "python"
   | "nodejs" | "express" | "nestjs" | "nextjs" | "remix" | "nuxtjs" | "svelte" | "astro"
+  | "react-spa" | "vite"
   | "go"
   | "rails"
   | "spring"
@@ -122,6 +123,16 @@ export interface ConversationMessage {
   message: string;
   intent?: string;
   created_at: string;
+}
+
+export interface EnvVar {
+  id: string;
+  environment_id: string;
+  key: string;
+  value: string; // "***" for secrets in list responses
+  is_secret: boolean;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface OperationalEvent {

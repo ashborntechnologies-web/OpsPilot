@@ -10,6 +10,7 @@ import (
 	"time"
 
 	awssvc "github.com/ashborntechnologies-web/OpsPilot/internal/aws"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/envvars"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
 	githubsvc "github.com/ashborntechnologies-web/OpsPilot/internal/github"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
@@ -34,10 +35,11 @@ type Service struct {
 	hub       *ws.Hub
 	enqueuer  Enqueuer
 	events    *events.Service
+	envVars   *envvars.Service
 }
 
-func NewService(db *models.DB, awsSvc *awssvc.Service, githubSvc *githubsvc.Service, hub *ws.Hub, enqueuer Enqueuer, eventSvc *events.Service) *Service {
-	return &Service{db: db, awsSvc: awsSvc, githubSvc: githubSvc, hub: hub, enqueuer: enqueuer, events: eventSvc}
+func NewService(db *models.DB, awsSvc *awssvc.Service, githubSvc *githubsvc.Service, hub *ws.Hub, enqueuer Enqueuer, eventSvc *events.Service, envVarSvc *envvars.Service) *Service {
+	return &Service{db: db, awsSvc: awsSvc, githubSvc: githubSvc, hub: hub, enqueuer: enqueuer, events: eventSvc, envVars: envVarSvc}
 }
 
 // ---- HTTP handlers ----
@@ -530,11 +532,12 @@ func (s *Service) RunDeployWorkflow(ctx context.Context, projectID, environmentI
 		Payload:       map[string]any{"build_id": buildID, "image_uri": imageURI},
 	})
 
-	// Step 3 — register task definition
+	// Step 3 — register task definition (with env vars injected)
 	s.updateDeploymentStatus(ctx, deploymentID, models.DeployStatusDeploying, nil, &imageURI)
 	s.broadcast(projectID, ws.Message{Type: "deploy_progress", Payload: "Build complete. Registering task definition..."})
 
-	taskDefARN, err := s.awsSvc.RegisterECSTaskDefinition(ctx, clients, env, project, imageURI)
+	envVarPairs, _ := s.envVars.LoadForEnvironment(ctx, env.ID)
+	taskDefARN, err := s.awsSvc.RegisterECSTaskDefinition(ctx, clients, env, project, imageURI, envVarPairs)
 	if err != nil {
 		return s.failDeployment(ctx, projectID, deploymentID, fmt.Sprintf("failed to register task definition: %s", err))
 	}
@@ -1047,7 +1050,9 @@ func (s *Service) RunRollbackWorkflow(ctx context.Context, projectID, environmen
 	s.updateDeploymentStatus(ctx, deploymentID, models.DeployStatusDeploying, nil, &imageURI)
 	s.broadcast(projectID, ws.Message{Type: "deploy_progress", Payload: "Rolling back — registering previous task definition..."})
 
-	taskDefARN, err := s.awsSvc.RegisterECSTaskDefinition(ctx, clients, env, project, imageURI)
+	// Re-inject current env vars so the rolled-back image still gets the latest config.
+	envVarPairs, _ := s.envVars.LoadForEnvironment(ctx, env.ID)
+	taskDefARN, err := s.awsSvc.RegisterECSTaskDefinition(ctx, clients, env, project, imageURI, envVarPairs)
 	if err != nil {
 		return s.failDeployment(ctx, projectID, deploymentID, fmt.Sprintf("failed to register task definition: %s", err))
 	}
