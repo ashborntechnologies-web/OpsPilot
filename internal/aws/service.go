@@ -3,6 +3,7 @@ package aws
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"log"
@@ -30,6 +31,7 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type Service struct {
@@ -353,12 +355,14 @@ func (s *Service) buildFailureError(ctx context.Context, clients *ClientBundle, 
 // ---- ECS ----
 
 // RegisterECSTaskDefinition creates a new task definition revision for the given image.
+// envVars are injected into the container definition; pass nil to run with no env vars.
 func (s *Service) RegisterECSTaskDefinition(
 	ctx context.Context,
 	clients *ClientBundle,
 	env *models.Environment,
 	project *models.Project,
 	imageURI string,
+	envVars []ecstypes.KeyValuePair,
 ) (string, error) {
 	if env.TaskExecutionRoleARN == nil {
 		return "", fmt.Errorf("task execution role ARN not set on environment")
@@ -381,9 +385,10 @@ func (s *Service) RegisterECSTaskDefinition(
 		TaskRoleArn:             aws.String(*env.TaskExecutionRoleARN),
 		ContainerDefinitions: []ecstypes.ContainerDefinition{
 			{
-				Name:      aws.String("app"),
-				Image:     aws.String(imageURI),
-				Essential: aws.Bool(true),
+				Name:        aws.String("app"),
+				Image:       aws.String(imageURI),
+				Essential:   aws.Bool(true),
+				Environment: envVars,
 				PortMappings: []ecstypes.PortMapping{
 					{ContainerPort: aws.Int32(port), Protocol: ecstypes.TransportProtocolTcp},
 				},
@@ -632,6 +637,13 @@ func (s *Service) HandleDeleteAWSAccount(c *gin.Context) {
 		accountID, userID,
 	)
 	if err != nil {
+		// Foreign-key violation (23503): the account is still linked to projects or
+		// environments. Surface a clear 409 instead of a generic 500.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+			c.JSON(http.StatusConflict, gin.H{"error": "This AWS account is still linked to one or more projects or environments — remove those first, then disconnect the account."})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete AWS account"})
 		return
 	}
@@ -1313,6 +1325,8 @@ func defaultStartCommand(framework string) string {
 	// Static
 	case "static":
 		return "nginx -g 'daemon off;'"
+	case "react-spa", "vite":
+		return "nginx -g 'daemon off;'"
 	default:
 		return "./start.sh"
 	}
@@ -1353,7 +1367,7 @@ EXPOSE %d
 		return fmt.Sprintf(`FROM public.ecr.aws/docker/library/node:20-alpine
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci --only=production
+RUN [ -f package-lock.json ] && npm ci --only=production || npm install --only=production
 COPY . .
 EXPOSE %d
 %s`, port, cmd)
@@ -1362,7 +1376,7 @@ EXPOSE %d
 		return fmt.Sprintf(`FROM public.ecr.aws/docker/library/node:20-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci
+RUN [ -f package-lock.json ] && npm ci || npm install
 COPY . .
 RUN npm run build
 
@@ -1378,7 +1392,7 @@ EXPOSE %d
 		return fmt.Sprintf(`FROM public.ecr.aws/docker/library/node:20-alpine AS deps
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci
+RUN [ -f package-lock.json ] && npm ci || npm install
 
 FROM public.ecr.aws/docker/library/node:20-alpine AS builder
 WORKDIR /app
@@ -1400,7 +1414,7 @@ EXPOSE %d
 		return fmt.Sprintf(`FROM public.ecr.aws/docker/library/node:20-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci
+RUN [ -f package-lock.json ] && npm ci || npm install
 COPY . .
 RUN npm run build
 
@@ -1462,6 +1476,32 @@ COPY . /usr/share/nginx/html
 EXPOSE %d
 CMD ["nginx", "-g", "daemon off;"]`, port)
 
+	case "react-spa":
+		return `FROM public.ecr.aws/docker/library/node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN [ -f package-lock.json ] && npm ci || npm install
+COPY . .
+RUN npm run build
+
+FROM public.ecr.aws/nginx/nginx:stable-alpine
+COPY --from=builder /app/build /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]`
+
+	case "vite":
+		return `FROM public.ecr.aws/docker/library/node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN [ -f package-lock.json ] && npm ci || npm install
+COPY . .
+RUN npm run build
+
+FROM public.ecr.aws/nginx/nginx:stable-alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]`
+
 	default:
 		return fmt.Sprintf(`FROM public.ecr.aws/ubuntu/ubuntu:22.04
 WORKDIR /app
@@ -1479,6 +1519,8 @@ func frameworkPort(framework string) int32 {
 	case "go", "spring":
 		return 8080
 	case "static":
+		return 80
+	case "react-spa", "vite":
 		return 80
 	default:
 		return 8000

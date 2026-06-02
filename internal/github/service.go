@@ -35,7 +35,10 @@ type Service struct {
 	// Set via ENCRYPTION_KEY_PREV. Old tokens are decrypted with this key;
 	// new encryptions always use encryptionKey.
 	prevKey string
-	db      *models.DB
+	// anthropicKey enables the AI framework-detection fallback. Empty = AI path
+	// never runs (rule-based detection only).
+	anthropicKey string
+	db           *models.DB
 }
 
 type Repo struct {
@@ -56,15 +59,22 @@ type DetectResult struct {
 	Confidence string   `json:"confidence"` // high | medium | low
 	Signals    []string `json:"signals"`
 	HasDocker  bool     `json:"has_dockerfile"`
+
+	// AI-inferred fields — populated only when the AI fallback runs (AIDetected=true).
+	StartCommand string   `json:"start_command,omitempty"` // AI-inferred production start command
+	BuildCommand string   `json:"build_command,omitempty"` // AI-inferred build command (SPA/static)
+	Warnings     []string `json:"warnings,omitempty"`      // AI-noticed deployment concerns
+	AIDetected   bool     `json:"ai_detected"`             // true if the AI fallback produced this result
 }
 
-func NewService(clientID, clientSecret, redirectURL, encryptionKey string, db *models.DB) *Service {
+func NewService(clientID, clientSecret, redirectURL, encryptionKey string, db *models.DB, anthropicKey string) *Service {
 	return &Service{
 		clientID:      clientID,
 		clientSecret:  clientSecret,
 		redirectURL:   redirectURL,
 		encryptionKey: encryptionKey,
 		prevKey:       os.Getenv("ENCRYPTION_KEY_PREV"),
+		anthropicKey:  anthropicKey,
 		db:            db,
 	}
 }
@@ -243,6 +253,16 @@ func (s *Service) DetectFramework(ctx context.Context, token, owner, repo string
 		// Read package.json to detect specific JS/TS frameworks by their deps
 		pkg, _ := s.fetchFileContentDecoded(ctx, token, owner, repo, "package.json")
 		switch {
+		case strings.Contains(pkg, `"react-scripts"`):
+			result.Framework = models.FrameworkReactSPA
+			result.Confidence = "high"
+			result.Signals = append(result.Signals, "react-scripts in package.json (Create React App)")
+		case strings.Contains(pkg, `"vite"`) &&
+			!strings.Contains(pkg, `"express"`) &&
+			!strings.Contains(pkg, `"fastify"`):
+			result.Framework = models.FrameworkVite
+			result.Confidence = "high"
+			result.Signals = append(result.Signals, "vite in package.json (Vite SPA)")
 		case strings.Contains(pkg, `"@nestjs/core"`):
 			result.Framework = models.FrameworkNestJS
 			result.Confidence = "high"
@@ -299,7 +319,184 @@ func (s *Service) DetectFramework(ctx context.Context, token, owner, repo string
 		}
 	}
 
+	// AI fallback: kick in when rule-based detection is not confident.
+	if result.Confidence != "high" && s.anthropicKey != "" {
+		if aiResult, err := s.aiDetect(ctx, token, owner, repo, files, result); err == nil {
+			return aiResult, nil
+		}
+	}
+
 	return result, nil
+}
+
+// aiDetectSystemPrompt instructs Claude to return a strict JSON deployment profile.
+const aiDetectSystemPrompt = `You are a deployment configuration expert. Analyze the repository structure and file contents provided and return a JSON object identifying the framework and deployment configuration.
+
+You must respond with ONLY a valid JSON object — no markdown, no explanation, no backticks. The JSON must have exactly these fields:
+{
+  "framework": "<one of: fastapi|flask|django|python|nodejs|express|nestjs|nextjs|remix|nuxtjs|svelte|astro|react-spa|vite|go|rails|spring|static|unknown>",
+  "confidence": "<high|medium|low>",
+  "signals": ["<what you saw that led to this conclusion>"],
+  "start_command": "<the command to start this app in production, e.g. uvicorn main:app --host 0.0.0.0 --port 8000>",
+  "build_command": "<build command if needed, e.g. npm run build, else empty string>",
+  "warnings": ["<any deployment concerns, e.g. hardcoded localhost URLs, missing env vars, non-standard structure>"]
+}
+
+Framework selection rules:
+- react-spa: React app using react-scripts (Create React App) — no server, builds to /build, serve with Nginx
+- vite: Vite-based SPA (React/Vue/Svelte without SvelteKit) — no server, builds to /dist, serve with Nginx
+- static: plain HTML/CSS/JS with no build step
+- svelte: SvelteKit (has @sveltejs/kit, has a server)
+- If a Dockerfile exists, still identify the framework but note it in signals
+
+For warnings, specifically check for:
+- Hardcoded localhost or 127.0.0.1 URLs in source files
+- Missing common required env vars (SECRET_KEY_BASE for Rails, DATABASE_URL for Django/Rails, JAVA_OPTS for Spring)
+- Non-standard project structure (e.g. main package not at root for Go)
+- package.json scripts that use webpack-dev-server or react-scripts start (wrong for production)`
+
+// aiDetect is the AI fallback for framework detection. It gathers key config/source files,
+// asks Claude to classify the project and infer deployment commands, and merges the result
+// with the rule-based one. It never blocks the main flow: on any failure (no key, network,
+// bad JSON) it returns the original ruleResult so detection degrades gracefully.
+func (s *Service) aiDetect(
+	ctx context.Context,
+	token, owner, repo string,
+	files []string,
+	ruleResult *DetectResult,
+) (*DetectResult, error) {
+	// (a) Collect context — fetch known config files plus one source hint, ignoring errors.
+	lowerToActual := make(map[string]string, len(files))
+	for _, f := range files {
+		lowerToActual[strings.ToLower(f)] = f
+	}
+
+	type namedFile struct {
+		name    string
+		content string
+	}
+	var collected []namedFile
+
+	targets := []string{
+		"package.json", "go.mod", "requirements.txt", "pyproject.toml",
+		"Gemfile", "pom.xml", "build.gradle", "build.gradle.kts",
+	}
+	for _, t := range targets {
+		actual, ok := lowerToActual[strings.ToLower(t)]
+		if !ok {
+			continue
+		}
+		if content, err := s.fetchFileContentDecoded(ctx, token, owner, repo, actual); err == nil {
+			collected = append(collected, namedFile{name: actual, content: content})
+		}
+	}
+
+	// One source hint: first *.py or main.go at root level.
+	for _, f := range files {
+		lf := strings.ToLower(f)
+		if strings.HasSuffix(lf, ".py") || lf == "main.go" {
+			if content, err := s.fetchFileContentDecoded(ctx, token, owner, repo, f); err == nil {
+				collected = append(collected, namedFile{name: f, content: content})
+			}
+			break
+		}
+	}
+
+	// (b) Build the user message.
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Repository: %s/%s\n\n", owner, repo)
+	sb.WriteString("File tree (root level):\n")
+	sb.WriteString(strings.Join(files, "\n"))
+	sb.WriteString("\n\nFile contents:\n")
+	for _, f := range collected {
+		fmt.Fprintf(&sb, "=== %s ===\n%s\n", f.name, f.content)
+	}
+
+	// (c) Call the Anthropic API.
+	reqBody := map[string]any{
+		"model":      "claude-sonnet-4-20250514",
+		"max_tokens": 1024,
+		"system":     aiDetectSystemPrompt,
+		"messages": []map[string]string{
+			{"role": "user", "content": sb.String()},
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return ruleResult, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", strings.NewReader(string(body)))
+	if err != nil {
+		return ruleResult, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", s.anthropicKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ruleResult, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ruleResult, err
+	}
+
+	// (d) Parse the response.
+	var claudeResp struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(respBody, &claudeResp); err != nil || len(claudeResp.Content) == 0 {
+		return ruleResult, fmt.Errorf("empty or invalid Claude response")
+	}
+
+	text := stripJSONFences(claudeResp.Content[0].Text)
+
+	var ai struct {
+		Framework    string   `json:"framework"`
+		Confidence   string   `json:"confidence"`
+		Signals      []string `json:"signals"`
+		StartCommand string   `json:"start_command"`
+		BuildCommand string   `json:"build_command"`
+		Warnings     []string `json:"warnings"`
+	}
+	if err := json.Unmarshal([]byte(text), &ai); err != nil {
+		return ruleResult, fmt.Errorf("failed to parse AI detection JSON: %w", err)
+	}
+
+	// (e) Merge — AI drives framework/commands/warnings; rule signals are kept and extended.
+	mergedSignals := make([]string, 0, len(ruleResult.Signals)+len(ai.Signals))
+	mergedSignals = append(mergedSignals, ruleResult.Signals...)
+	mergedSignals = append(mergedSignals, ai.Signals...)
+
+	return &DetectResult{
+		Framework:    ai.Framework,
+		Confidence:   ai.Confidence,
+		Signals:      mergedSignals,
+		HasDocker:    ruleResult.HasDocker,
+		StartCommand: ai.StartCommand,
+		BuildCommand: ai.BuildCommand,
+		Warnings:     ai.Warnings,
+		AIDetected:   true,
+	}, nil
+}
+
+// stripJSONFences removes accidental markdown code fences (```json ... ```) around a
+// JSON payload so it can be parsed directly.
+func stripJSONFences(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```") {
+		s = strings.TrimPrefix(s, "```json")
+		s = strings.TrimPrefix(s, "```")
+		s = strings.TrimSuffix(s, "```")
+		s = strings.TrimSpace(s)
+	}
+	return s
 }
 
 // HandleListBranches returns branch names for a repo.

@@ -147,6 +147,8 @@ const (
 	FrameworkNuxtJS   = "nuxtjs"
 	FrameworkSvelteKit = "svelte"
 	FrameworkAstro    = "astro"
+	FrameworkReactSPA = "react-spa"
+	FrameworkVite     = "vite"
 
 	// Go
 	FrameworkGo = "go"
@@ -190,6 +192,19 @@ const (
 	IntentDiagnose = "diagnose"
 	IntentUnknown  = "unknown"
 )
+
+// EnvVar is a key/value environment variable scoped to a specific environment. It is
+// injected into the ECS task definition at deploy time. Secret values (is_secret=true)
+// are redacted in API responses but stored in full so the deployer can inject them.
+type EnvVar struct {
+	ID            uuid.UUID `json:"id"`
+	EnvironmentID uuid.UUID `json:"environment_id"`
+	Key           string    `json:"key"`
+	Value         string    `json:"value,omitempty"` // omitted in list responses for secrets
+	IsSecret      bool      `json:"is_secret"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
 
 // OperationalEvent is a structured record of a meaningful platform state transition.
 // AI reasons over these events rather than raw log text.

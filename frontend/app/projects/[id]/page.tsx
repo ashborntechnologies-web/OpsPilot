@@ -19,14 +19,15 @@ import {
   getProject, listEnvironments, listDeployments,
   createEnvironment, triggerDeploy, rollback, retryProvision, getEnvironmentLogs,
   getDeploymentEvents, wsURL, redeployDeployment, deleteDeployment,
+  listEnvVars, upsertEnvVar, deleteEnvVar,
 } from "@/lib/api";
-import type { Project, Environment, Deployment, OperationalEvent, WsMessage } from "@/types/api";
+import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar } from "@/types/api";
 import { toast } from "sonner";
 import {
   MessageSquare, Plus, Rocket, RotateCcw,
   CheckCircle2, XCircle, Clock, Loader2, Cloud,
   RefreshCw, Terminal, AlertTriangle, ChevronDown, ChevronRight,
-  Trash2,
+  Trash2, Eye, EyeOff, KeyRound,
 } from "lucide-react";
 
 const AWS_REGIONS = [
@@ -122,6 +123,16 @@ export default function ProjectPage() {
   const [loadingLogs, setLoadingLogs] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
+  // env vars tab
+  const [envVarEnvId, setEnvVarEnvId] = useState<string>("");
+  const [envVars, setEnvVars] = useState<EnvVar[]>([]);
+  const [loadingEnvVars, setLoadingEnvVars] = useState(false);
+  const [newKey, setNewKey] = useState("");
+  const [newValue, setNewValue] = useState("");
+  const [newIsSecret, setNewIsSecret] = useState(false);
+  const [savingEnvVar, setSavingEnvVar] = useState(false);
+  const [showSecretValues, setShowSecretValues] = useState<Record<string, boolean>>({});
+
   const refresh = useCallback(async () => {
     const token = await getToken();
     if (!token) return;
@@ -146,6 +157,13 @@ export default function ProjectPage() {
       if (ready) setLogsEnvId(ready.id);
     }
   }, [environments, logsEnvId]);
+
+  // Auto-select first environment for env vars tab (any status — you can set vars before deploying)
+  useEffect(() => {
+    if (!envVarEnvId && environments.length > 0) {
+      setEnvVarEnvId(environments[0].id);
+    }
+  }, [environments, envVarEnvId]);
 
   // WebSocket — open while the page is mounted so we receive provision_progress in real time.
   useEffect(() => {
@@ -314,6 +332,56 @@ export default function ProjectPage() {
     }
   }
 
+  async function fetchEnvVars(envId = envVarEnvId) {
+    if (!envId) return;
+    const token = await getToken();
+    if (!token) return;
+    setLoadingEnvVars(true);
+    try {
+      const vars = await listEnvVars(token, id, envId);
+      setEnvVars(vars ?? []);
+    } catch (e: unknown) {
+      toast.error((e as Error).message ?? "Failed to fetch env vars");
+    } finally {
+      setLoadingEnvVars(false);
+    }
+  }
+
+  async function handleSaveEnvVar() {
+    if (!newKey.trim() || !newValue.trim() || !envVarEnvId) return;
+    const token = await getToken();
+    if (!token) return;
+    setSavingEnvVar(true);
+    try {
+      await upsertEnvVar(token, id, envVarEnvId, {
+        key: newKey.trim(),
+        value: newValue.trim(),
+        is_secret: newIsSecret,
+      });
+      setNewKey("");
+      setNewValue("");
+      setNewIsSecret(false);
+      await fetchEnvVars();
+      toast.success("Env var saved — redeploy to apply.");
+    } catch (e: unknown) {
+      toast.error((e as Error).message ?? "Failed to save env var");
+    } finally {
+      setSavingEnvVar(false);
+    }
+  }
+
+  async function handleDeleteEnvVar(v: EnvVar) {
+    const token = await getToken();
+    if (!token) return;
+    try {
+      await deleteEnvVar(token, id, envVarEnvId, v.id);
+      setEnvVars((prev) => prev.filter((e) => e.id !== v.id));
+      toast.success("Env var deleted — redeploy to apply.");
+    } catch (e: unknown) {
+      toast.error((e as Error).message ?? "Failed to delete env var");
+    }
+  }
+
   const readyEnvs = environments.filter((e) => e.stack_status === "ready");
   const selectedLogEnv = environments.find((e) => e.id === logsEnvId);
 
@@ -442,6 +510,7 @@ export default function ProjectPage() {
             <TabsTrigger value="overview">Overview</TabsTrigger>
             <TabsTrigger value="logs">Live Logs</TabsTrigger>
             <TabsTrigger value="deployments">Deployments</TabsTrigger>
+            <TabsTrigger value="env-vars" onClick={() => fetchEnvVars()}>Env Vars</TabsTrigger>
             <TabsTrigger value="terminal">Terminal</TabsTrigger>
           </TabsList>
 
@@ -819,6 +888,117 @@ export default function ProjectPage() {
                     </div>
                   );
                 })}
+              </div>
+            )}
+          </TabsContent>
+
+          {/* ── Env Vars ── */}
+          <TabsContent value="env-vars">
+            {environments.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-16 text-center">
+                <KeyRound className="h-10 w-10 text-zinc-300 mb-3" />
+                <p className="font-medium text-sm">No environments yet</p>
+                <p className="text-muted-foreground text-xs mt-1">Create an environment first.</p>
+              </div>
+            ) : (
+              <div className="space-y-5">
+                <div className="flex items-center gap-3">
+                  <select
+                    value={envVarEnvId}
+                    onChange={(e) => { setEnvVarEnvId(e.target.value); setEnvVars([]); fetchEnvVars(e.target.value); }}
+                    className="h-9 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+                  >
+                    {environments.map((e) => (
+                      <option key={e.id} value={e.id}>{e.name} ({e.aws_region})</option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-muted-foreground">
+                    Env vars are injected into your container at deploy time. <strong>Redeploy</strong> after any change.
+                  </p>
+                </div>
+
+                {/* Add new var */}
+                <div className="rounded-lg border bg-white p-4 space-y-3">
+                  <p className="text-sm font-medium">Add / update variable</p>
+                  <div className="flex gap-2 flex-wrap">
+                    <Input
+                      placeholder="KEY"
+                      value={newKey}
+                      onChange={(e) => setNewKey(e.target.value)}
+                      className="font-mono text-sm flex-1 min-w-32"
+                    />
+                    <Input
+                      placeholder="value"
+                      value={newValue}
+                      onChange={(e) => setNewValue(e.target.value)}
+                      type={newIsSecret ? "password" : "text"}
+                      className="font-mono text-sm flex-1 min-w-48"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setNewIsSecret((v) => !v)}
+                      className={`flex items-center gap-1.5 px-3 rounded-md border text-xs transition-colors ${newIsSecret ? "bg-amber-50 border-amber-300 text-amber-800" : "border-input text-muted-foreground hover:bg-zinc-50"}`}
+                      title="Toggle secret"
+                    >
+                      {newIsSecret ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                      {newIsSecret ? "Secret" : "Plain"}
+                    </button>
+                    <Button
+                      size="sm"
+                      disabled={!newKey.trim() || !newValue.trim() || savingEnvVar}
+                      onClick={handleSaveEnvVar}
+                    >
+                      {savingEnvVar ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : <Plus className="h-3.5 w-3.5 mr-1" />}
+                      Save
+                    </Button>
+                  </div>
+                </div>
+
+                {/* Existing vars */}
+                <div className="rounded-lg border bg-white overflow-hidden">
+                  {loadingEnvVars ? (
+                    <div className="flex items-center gap-2 px-4 py-6 text-sm text-muted-foreground">
+                      <Loader2 className="h-4 w-4 animate-spin" /> Loading…
+                    </div>
+                  ) : envVars.length === 0 ? (
+                    <p className="px-4 py-6 text-sm text-muted-foreground text-center">No env vars set for this environment.</p>
+                  ) : (
+                    envVars.map((v, i) => (
+                      <div key={v.id}>
+                        {i > 0 && <Separator />}
+                        <div className="flex items-center gap-3 px-4 py-2.5">
+                          <span className="font-mono text-sm font-medium flex-1 truncate">{v.key}</span>
+                          <span className="font-mono text-sm text-muted-foreground flex-1 truncate">
+                            {v.is_secret
+                              ? (showSecretValues[v.id] ? v.value : "•••••••••")
+                              : v.value}
+                          </span>
+                          <div className="flex items-center gap-1 shrink-0">
+                            {v.is_secret && (
+                              <Badge variant="outline" className="text-xs px-1.5 py-0">secret</Badge>
+                            )}
+                            {v.is_secret && (
+                              <button
+                                onClick={() => setShowSecretValues((p) => ({ ...p, [v.id]: !p[v.id] }))}
+                                className="p-1 text-muted-foreground hover:text-foreground"
+                                title={showSecretValues[v.id] ? "Hide value" : "Show value"}
+                              >
+                                {showSecretValues[v.id] ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                              </button>
+                            )}
+                            <button
+                              onClick={() => handleDeleteEnvVar(v)}
+                              className="p-1 text-red-400 hover:text-red-600"
+                              title="Delete"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
             )}
           </TabsContent>

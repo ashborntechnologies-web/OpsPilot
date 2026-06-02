@@ -70,6 +70,8 @@ func RunMigrations(db *DB) error {
 		createOperationalEventsTable,
 		addExternalIDToAWSAccounts,
 		addAccountScopeToOperationalEvents,
+		relaxOperationalEventsAccountFK,
+		createEnvVarsTable,
 	}
 
 	for _, m := range migrations {
@@ -235,6 +237,33 @@ ALTER TABLE aws_accounts ADD COLUMN IF NOT EXISTS external_id TEXT NOT NULL DEFA
 const addAccountScopeToOperationalEvents = `
 ALTER TABLE operational_events ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE operational_events ADD COLUMN IF NOT EXISTS account_id UUID REFERENCES aws_accounts(id);`
+
+// relaxOperationalEventsAccountFK makes the account_id reference ON DELETE SET NULL.
+// Without this, the external_id.generated audit row written at connection time pins every
+// AWS account in place and blocks its deletion (FK RESTRICT). SET NULL preserves the audit
+// record while letting the account be disconnected.
+// createEnvVarsTable stores per-environment key/value pairs injected into the ECS task
+// definition at deploy time. is_secret=true rows are redacted in API responses so secret
+// values never appear in JSON (they are stored plaintext in Postgres, which is encrypted
+// at rest; a SSM migration can be added later if per-secret audit is needed).
+const createEnvVarsTable = `
+CREATE TABLE IF NOT EXISTS env_vars (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    environment_id UUID NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+    key            TEXT NOT NULL,
+    value          TEXT NOT NULL,
+    is_secret      BOOLEAN NOT NULL DEFAULT false,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(environment_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_env_vars_environment ON env_vars(environment_id);`
+
+const relaxOperationalEventsAccountFK = `
+ALTER TABLE operational_events DROP CONSTRAINT IF EXISTS operational_events_account_id_fkey;
+ALTER TABLE operational_events
+    ADD CONSTRAINT operational_events_account_id_fkey
+    FOREIGN KEY (account_id) REFERENCES aws_accounts(id) ON DELETE SET NULL;`
 
 // createOperationalEventsTable stores structured state-transition events for every
 // deploy and provision operation. AI reasons over these events rather than raw log text.
