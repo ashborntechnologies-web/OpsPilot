@@ -807,6 +807,49 @@ func (s *Service) populateEnvironmentFromProjectOutputs(
 	return nil
 }
 
+// DeleteProjectStack initiates deletion of a project CloudFormation stack and blocks until
+// the stack is deleted or returns an error. It is idempotent: if the stack does not exist
+// it returns nil immediately.
+func (s *Service) DeleteProjectStack(ctx context.Context, clients *ClientBundle, stackID string) error {
+	// Initiate deletion.
+	_, err := clients.CloudFormation.DeleteStack(ctx, &cloudformation.DeleteStackInput{
+		StackName: aws.String(stackID),
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "does not exist") {
+			return nil
+		}
+		return fmt.Errorf("failed to initiate stack deletion: %w", err)
+	}
+
+	// Poll until the stack is gone.
+	for {
+		out, err := clients.CloudFormation.DescribeStacks(ctx, &cloudformation.DescribeStacksInput{
+			StackName: aws.String(stackID),
+		})
+		if err != nil {
+			if strings.Contains(err.Error(), "does not exist") {
+				return nil
+			}
+			return fmt.Errorf("failed to describe stack during deletion: %w", err)
+		}
+		if len(out.Stacks) == 0 {
+			return nil
+		}
+		switch out.Stacks[0].StackStatus {
+		case cftypes.StackStatusDeleteComplete:
+			return nil
+		case cftypes.StackStatusDeleteFailed:
+			return fmt.Errorf("stack deletion failed: %s", aws.ToString(out.Stacks[0].StackStatusReason))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(15 * time.Second):
+		}
+	}
+}
+
 // ---- Naming conventions -----------------------------------------------------
 
 // PlatformStackName returns the CloudFormation stack name for the shared platform stack.

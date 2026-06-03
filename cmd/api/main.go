@@ -215,6 +215,7 @@ func main() {
 	proj.Use(middleware.RequireProjectOwnership(db))
 	{
 		proj.GET("", deploySvc.HandleGetProject)
+		proj.DELETE("", deploySvc.HandleDeleteProject)
 
 		// Environments
 		proj.POST("/environments", awsSvc.HandleCreateEnvironment)

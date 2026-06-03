@@ -1145,6 +1145,95 @@ func (s *Service) WaitForECSServiceStable(ctx context.Context, clients *ClientBu
 	}
 }
 
+// ---- Project cleanup (deletion) ----
+
+// DeleteECSService deletes an ECS service (scaling to 0 first so tasks are drained).
+// Idempotent — returns nil if the service is already missing.
+func (s *Service) DeleteECSService(ctx context.Context, clients *ClientBundle, clusterName, serviceName string) error {
+	// Scale to 0 so tasks stop cleanly before deletion.
+	_, _ = clients.ECS.UpdateService(ctx, &ecs.UpdateServiceInput{
+		Cluster:      aws.String(clusterName),
+		Service:      aws.String(serviceName),
+		DesiredCount: aws.Int32(0),
+	})
+
+	_, err := clients.ECS.DeleteService(ctx, &ecs.DeleteServiceInput{
+		Cluster: aws.String(clusterName),
+		Service: aws.String(serviceName),
+		Force:   aws.Bool(true), // force-delete even if tasks are still running
+	})
+	if err != nil && !strings.Contains(err.Error(), "ServiceNotFoundException") &&
+		!strings.Contains(err.Error(), "ClusterNotFoundException") {
+		return fmt.Errorf("failed to delete ECS service: %w", err)
+	}
+	return nil
+}
+
+// DeleteListenerRule deletes an ALB listener rule. Idempotent.
+func (s *Service) DeleteListenerRule(ctx context.Context, clients *ClientBundle, ruleARN string) error {
+	if ruleARN == "" {
+		return nil
+	}
+	_, err := clients.ELB.DeleteRule(ctx, &elasticloadbalancingv2.DeleteRuleInput{
+		RuleArn: aws.String(ruleARN),
+	})
+	if err != nil && !strings.Contains(err.Error(), "RuleNotFoundException") {
+		return fmt.Errorf("failed to delete ALB listener rule: %w", err)
+	}
+	return nil
+}
+
+// DeleteTargetGroup deletes an ALB target group. Idempotent.
+func (s *Service) DeleteTargetGroup(ctx context.Context, clients *ClientBundle, tgARN string) error {
+	if tgARN == "" {
+		return nil
+	}
+	_, err := clients.ELB.DeleteTargetGroup(ctx, &elasticloadbalancingv2.DeleteTargetGroupInput{
+		TargetGroupArn: aws.String(tgARN),
+	})
+	if err != nil && !strings.Contains(err.Error(), "TargetGroupNotFoundException") {
+		return fmt.Errorf("failed to delete target group: %w", err)
+	}
+	return nil
+}
+
+// PurgeECRRepository deletes every image in an ECR repository so CloudFormation can
+// subsequently delete the empty repo. Idempotent — returns nil if the repo is missing.
+func (s *Service) PurgeECRRepository(ctx context.Context, clients *ClientBundle, repoName string) error {
+	if repoName == "" {
+		return nil
+	}
+	out, err := clients.ECR.ListImages(ctx, &ecr.ListImagesInput{
+		RepositoryName: aws.String(repoName),
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "RepositoryNotFoundException") {
+			return nil
+		}
+		return fmt.Errorf("failed to list ECR images: %w", err)
+	}
+	if len(out.ImageIds) == 0 {
+		return nil
+	}
+	_, err = clients.ECR.BatchDeleteImage(ctx, &ecr.BatchDeleteImageInput{
+		RepositoryName: aws.String(repoName),
+		ImageIds:       out.ImageIds,
+	})
+	if err != nil && !strings.Contains(err.Error(), "RepositoryNotFoundException") {
+		return fmt.Errorf("failed to batch-delete ECR images: %w", err)
+	}
+	return nil
+}
+
+// AssumeRoleForAccount creates scoped AWS SDK clients by assuming the IAM role for the
+// given account record. Used by cleanup workflows that operate without an environment.
+func (s *Service) AssumeRoleForAccount(ctx context.Context, iamRoleARN, externalID, region string) (*ClientBundle, error) {
+	if externalID == "" {
+		externalID = LegacyExternalID
+	}
+	return s.assumeRole(ctx, iamRoleARN, region, "cleanup", externalID)
+}
+
 // ServiceHealth is a point-in-time snapshot of an ECS service's runtime state.
 type ServiceHealth struct {
 	RunningCount int32
