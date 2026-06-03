@@ -34,6 +34,10 @@ export function getProject(token: string, id: string) {
   return request<Project>(`/projects/${id}`, token);
 }
 
+export function deleteProject(token: string, id: string) {
+  return request<{ message: string }>(`/projects/${id}`, token, { method: "DELETE" });
+}
+
 export function createProject(
   token: string,
   body: {

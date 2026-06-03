@@ -20,12 +20,34 @@ import (
 	"github.com/google/uuid"
 )
 
+// DeleteEnvCleanupInfo carries the AWS resource references needed to tear down one
+// environment. Snapshot before the DB record is deleted so the job can run afterwards.
+type DeleteEnvCleanupInfo struct {
+	Region             string `json:"region"`
+	IAMRoleARN         string `json:"iam_role_arn"`
+	ExternalID         string `json:"external_id"`
+	ProjectStackID     string `json:"project_stack_id"`
+	ECRRepoName        string `json:"ecr_repo_name"`
+	ECSClusterName     string `json:"ecs_cluster_name"`
+	ECSServiceName     string `json:"ecs_service_name"`
+	ALBListenerRuleARN string `json:"alb_listener_rule_arn"`
+	ALBTargetGroupARN  string `json:"alb_target_group_arn"`
+}
+
+// DeleteProjectPayload is the queue-job payload for background AWS cleanup after a project
+// is deleted from the database.
+type DeleteProjectPayload struct {
+	ProjectName  string                 `json:"project_name"`
+	Environments []DeleteEnvCleanupInfo `json:"environments"`
+}
+
 // Enqueuer is implemented by queue.Client. Defined here to avoid a circular import
 // (the queue package imports this package for the worker).
 type Enqueuer interface {
 	EnqueueDeploy(projectID, environmentID, deploymentID, commitSHA string) error
 	EnqueueProvision(projectID, environmentID string) error
 	EnqueueRollback(projectID, environmentID, deploymentID, previousDeploymentID string) error
+	EnqueueDeleteProject(p DeleteProjectPayload) error
 }
 
 type Service struct {
@@ -1114,6 +1136,190 @@ func (s *Service) RunRollbackWorkflow(ctx context.Context, projectID, environmen
 		liveMsg = fmt.Sprintf("Rolled back! Commit `%s` is live again at http://%s", deployment.CommitSHA[:8], *env.ALBDNS)
 	}
 	s.broadcast(projectID, ws.Message{Type: "deploy_done", Payload: liveMsg})
+	return nil
+}
+
+// HandleDeleteProject removes a project and enqueues background AWS cleanup.
+// Flow: snapshot all AWS resource refs from DB → delete DB record (cascade) → enqueue cleanup.
+// The project disappears from the API immediately; AWS teardown is best-effort.
+func (s *Service) HandleDeleteProject(c *gin.Context) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+		return
+	}
+
+	project, err := s.getProject(c.Request.Context(), projectID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
+		return
+	}
+
+	// Snapshot every environment's AWS resource references BEFORE deleting the DB record.
+	envCleanupInfos, err := s.collectEnvCleanupInfos(c.Request.Context(), projectID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to collect environment info: " + err.Error()})
+		return
+	}
+
+	// Delete the DB record — cascade removes environments, deployments, conversations,
+	// operational_events, env_vars, incidents.
+	if _, err = s.db.Pool.Exec(c.Request.Context(),
+		`DELETE FROM projects WHERE id = $1`, projectID,
+	); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete project"})
+		return
+	}
+
+	// Enqueue background AWS cleanup (best-effort; DB record is already gone).
+	if len(envCleanupInfos) > 0 {
+		payload := DeleteProjectPayload{
+			ProjectName:  project.Name,
+			Environments: envCleanupInfos,
+		}
+		if err := s.enqueuer.EnqueueDeleteProject(payload); err != nil {
+			// Log but don't fail the HTTP response — the DB record is already deleted.
+			log.Printf("[delete-project] failed to enqueue AWS cleanup for %s: %v", project.Name, err)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Project deleted"})
+}
+
+// collectEnvCleanupInfos snapshots all AWS resource references for every environment of a
+// project so the background cleanup job has everything it needs after the DB record is gone.
+func (s *Service) collectEnvCleanupInfos(ctx context.Context, projectID uuid.UUID) ([]DeleteEnvCleanupInfo, error) {
+	rows, err := s.db.Pool.Query(ctx,
+		`SELECT e.id, e.aws_region,
+		        a.iam_role_arn, a.external_id,
+		        e.cloudformation_stack_id,
+		        e.ecr_repo_uri,
+		        e.ecs_service_name,
+		        e.alb_listener_rule_arn,
+		        e.alb_target_group_arn,
+		        -- cluster name: prefer platform stack, fall back to env field
+		        COALESCE(ps.ecs_cluster_name, e.ecs_cluster_name) AS cluster_name
+		 FROM environments e
+		 LEFT JOIN aws_accounts a ON a.id = e.account_id
+		 LEFT JOIN platform_stacks ps ON ps.id = e.platform_stack_id
+		 WHERE e.project_id = $1`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var infos []DeleteEnvCleanupInfo
+	for rows.Next() {
+		var (
+			envID                              string
+			region                             string
+			iamRole, extID                     *string
+			cfStackID                          *string
+			ecrURI, ecsService                 *string
+			albRule, albTG                     *string
+			clusterName                        *string
+		)
+		if err := rows.Scan(&envID, &region, &iamRole, &extID, &cfStackID,
+			&ecrURI, &ecsService, &albRule, &albTG, &clusterName); err != nil {
+			continue
+		}
+		if iamRole == nil {
+			continue // no AWS account linked — nothing to clean up
+		}
+
+		info := DeleteEnvCleanupInfo{
+			Region:     region,
+			IAMRoleARN: deref(iamRole),
+			ExternalID: deref(extID),
+		}
+		if cfStackID != nil {
+			info.ProjectStackID = *cfStackID
+		}
+		if ecrURI != nil {
+			// Extract the short repo name from the full URI (account.dkr.ecr.region.amazonaws.com/name)
+			parts := strings.SplitN(*ecrURI, "/", 2)
+			if len(parts) == 2 {
+				info.ECRRepoName = parts[1]
+			}
+		}
+		if clusterName != nil {
+			info.ECSClusterName = *clusterName
+		}
+		if ecsService != nil {
+			info.ECSServiceName = *ecsService
+		}
+		if albRule != nil {
+			info.ALBListenerRuleARN = *albRule
+		}
+		if albTG != nil {
+			info.ALBTargetGroupARN = *albTG
+		}
+		infos = append(infos, info)
+	}
+	return infos, nil
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// RunDeleteProjectCleanup runs the best-effort AWS teardown for a deleted project.
+// Each step is idempotent and independent — one failure does not abort the others.
+func (s *Service) RunDeleteProjectCleanup(ctx context.Context, payload DeleteProjectPayload) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+
+	for _, env := range payload.Environments {
+		log.Printf("[delete-project] cleaning up env region=%s stack=%s", env.Region, env.ProjectStackID)
+		if err := s.cleanupEnv(ctx, env); err != nil {
+			// Log and continue — other environments should still be cleaned up.
+			log.Printf("[delete-project] cleanup error for env region=%s: %v", env.Region, err)
+		}
+	}
+	log.Printf("[delete-project] cleanup complete for %q", payload.ProjectName)
+	return nil
+}
+
+func (s *Service) cleanupEnv(ctx context.Context, env DeleteEnvCleanupInfo) error {
+	clients, err := s.awsSvc.AssumeRoleForAccount(ctx, env.IAMRoleARN, env.ExternalID, env.Region)
+	if err != nil {
+		return fmt.Errorf("assume role: %w", err)
+	}
+
+	// 1. Delete ECS service (scale to 0 first, then force-delete).
+	if env.ECSClusterName != "" && env.ECSServiceName != "" {
+		if err := s.awsSvc.DeleteECSService(ctx, clients, env.ECSClusterName, env.ECSServiceName); err != nil {
+			log.Printf("[delete-project] DeleteECSService: %v", err)
+		}
+	}
+
+	// 2. Delete ALB listener rule.
+	if err := s.awsSvc.DeleteListenerRule(ctx, clients, env.ALBListenerRuleARN); err != nil {
+		log.Printf("[delete-project] DeleteListenerRule: %v", err)
+	}
+
+	// 3. Delete ALB target group.
+	if err := s.awsSvc.DeleteTargetGroup(ctx, clients, env.ALBTargetGroupARN); err != nil {
+		log.Printf("[delete-project] DeleteTargetGroup: %v", err)
+	}
+
+	// 4. Purge ECR images so CloudFormation can delete the repository.
+	if env.ECRRepoName != "" {
+		if err := s.awsSvc.PurgeECRRepository(ctx, clients, env.ECRRepoName); err != nil {
+			log.Printf("[delete-project] PurgeECRRepository: %v", err)
+		}
+	}
+
+	// 5. Delete the CloudFormation project stack (ECR repo, IAM roles, CodeBuild, log group).
+	if env.ProjectStackID != "" {
+		if err := s.awsSvc.DeleteProjectStack(ctx, clients, env.ProjectStackID); err != nil {
+			log.Printf("[delete-project] DeleteProjectStack: %v", err)
+		}
+	}
+
 	return nil
 }
 

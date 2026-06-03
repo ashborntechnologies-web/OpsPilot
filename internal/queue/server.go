@@ -13,11 +13,12 @@ import (
 )
 
 const (
-	TaskDeploy    = "deploy:run"
-	TaskDiagnose  = "diagnosis:run"
-	TaskProvision = "provision:run"
-	TaskRollback  = "rollback:run"
-	TaskWatchdog  = "watchdog:run"
+	TaskDeploy         = "deploy:run"
+	TaskDiagnose       = "diagnosis:run"
+	TaskProvision      = "provision:run"
+	TaskRollback       = "rollback:run"
+	TaskWatchdog       = "watchdog:run"
+	TaskDeleteProject  = "project:delete"
 )
 
 type DeployPayload struct {
@@ -26,6 +27,13 @@ type DeployPayload struct {
 	DeploymentID  string `json:"deployment_id"`
 	CommitSHA     string `json:"commit_sha"`
 }
+
+// DeleteProjectPayload and DeleteEnvCleanupInfo live in the deploy package to avoid a
+// circular import (queue imports deploy). They are aliased here for readability.
+type (
+	DeleteProjectPayload = deploy.DeleteProjectPayload
+	DeleteEnvCleanupInfo = deploy.DeleteEnvCleanupInfo
+)
 
 type RollbackPayload struct {
 	ProjectID            string `json:"project_id"`
@@ -76,6 +84,7 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 	s.mux.HandleFunc(TaskProvision, s.handleProvision)
 	s.mux.HandleFunc(TaskRollback, s.handleRollback)
 	s.mux.HandleFunc(TaskWatchdog, s.handleWatchdog)
+	s.mux.HandleFunc(TaskDeleteProject, s.handleDeleteProject)
 
 	return s
 }
@@ -186,6 +195,18 @@ func (s *Server) handleRollback(ctx context.Context, t *asynq.Task) error {
 	return nil
 }
 
+// handleDeleteProject cleans up all AWS resources for a deleted project. The DB record is
+// already gone by the time this runs; all info needed is in the payload. Each step is
+// best-effort — a failure in one environment does not block the others.
+func (s *Server) handleDeleteProject(ctx context.Context, t *asynq.Task) error {
+	var p deploy.DeleteProjectPayload
+	if err := json.Unmarshal(t.Payload(), &p); err != nil {
+		return fmt.Errorf("%w: unmarshal delete-project payload: %w", asynq.SkipRetry, err)
+	}
+	log.Printf("[delete-project] starting cleanup for %q (%d environment(s))", p.ProjectName, len(p.Environments))
+	return s.deploySvc.RunDeleteProjectCleanup(ctx, p)
+}
+
 // handleWatchdog runs the stuck-resource reconciler. Enqueued periodically by the Scheduler.
 func (s *Server) handleWatchdog(ctx context.Context, _ *asynq.Task) error {
 	return s.deploySvc.ReconcileStuckResources(ctx)
@@ -245,6 +266,16 @@ func NewRollbackTask(projectID, environmentID, deploymentID, previousDeploymentI
 	// Rollbacks must not auto-retry — they re-deploy an existing image and any
 	// failure (e.g. infra drift) needs human attention, not a silent retry loop.
 	return asynq.NewTask(TaskRollback, payload, asynq.Queue("critical"), asynq.MaxRetry(0)), nil
+}
+
+func NewDeleteProjectTask(p deploy.DeleteProjectPayload) (*asynq.Task, error) {
+	payload, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	// No retry — cleanup is best-effort and idempotent per step; a second attempt after a
+	// partial failure is unlikely to help without operator intervention.
+	return asynq.NewTask(TaskDeleteProject, payload, asynq.Queue("default"), asynq.MaxRetry(0)), nil
 }
 
 func NewWatchdogTask() *asynq.Task {
@@ -317,6 +348,16 @@ func (c *Client) EnqueueDeploy(projectID, environmentID, deploymentID, commitSHA
 // EnqueueProvision implements deploy.Enqueuer.
 func (c *Client) EnqueueProvision(projectID, environmentID string) error {
 	task, err := NewProvisionTask(projectID, environmentID)
+	if err != nil {
+		return err
+	}
+	_, err = c.c.Enqueue(task)
+	return err
+}
+
+// EnqueueDeleteProject implements deploy.Enqueuer.
+func (c *Client) EnqueueDeleteProject(p deploy.DeleteProjectPayload) error {
+	task, err := NewDeleteProjectTask(p)
 	if err != nil {
 		return err
 	}
