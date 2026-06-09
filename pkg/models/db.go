@@ -72,6 +72,9 @@ func RunMigrations(db *DB) error {
 		addAccountScopeToOperationalEvents,
 		relaxOperationalEventsAccountFK,
 		createEnvVarsTable,
+		createWebhooksTable,
+		addPreviewColumnsToEnvironments,
+		addWebhookColumnsToProjects,
 	}
 
 	for _, m := range migrations {
@@ -282,3 +285,40 @@ CREATE TABLE IF NOT EXISTS operational_events (
 );
 CREATE INDEX IF NOT EXISTS idx_op_events_deployment ON operational_events(deployment_id);
 CREATE INDEX IF NOT EXISTS idx_op_events_project    ON operational_events(project_id, occurred_at DESC);`
+
+// addPreviewColumnsToEnvironments extends environments to support ephemeral PR preview
+// environments. The CHECK and UNIQUE constraints from the original CREATE TABLE are relaxed
+// so preview envs can have names like 'pr-42' and multiple previews can coexist per project.
+const addPreviewColumnsToEnvironments = `
+ALTER TABLE environments DROP CONSTRAINT IF EXISTS environments_name_check;
+ALTER TABLE environments DROP CONSTRAINT IF EXISTS environments_project_id_name_key;
+CREATE UNIQUE INDEX IF NOT EXISTS environments_non_preview_name_uniq
+    ON environments(project_id, name) WHERE is_preview = false;
+CREATE UNIQUE INDEX IF NOT EXISTS environments_preview_pr_uniq
+    ON environments(project_id, pr_number) WHERE is_preview = true;
+ALTER TABLE environments
+    ADD COLUMN IF NOT EXISTS is_preview         BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS pr_number          INTEGER,
+    ADD COLUMN IF NOT EXISTS pr_branch          TEXT,
+    ADD COLUMN IF NOT EXISTS pr_head_sha        TEXT,
+    ADD COLUMN IF NOT EXISTS github_pr_comment_id BIGINT;`
+
+// addWebhookColumnsToProjects stores the GitHub repo webhook installed when PR previews
+// are enabled, so events can be verified (HMAC) and the hook can be removed on deletion.
+const addWebhookColumnsToProjects = `
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS github_webhook_id     BIGINT,
+    ADD COLUMN IF NOT EXISTS github_webhook_secret TEXT NOT NULL DEFAULT '';`
+
+const createWebhooksTable = `
+CREATE TABLE IF NOT EXISTS webhooks (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    url        TEXT NOT NULL,
+    secret     TEXT NOT NULL DEFAULT '',
+    events     TEXT[] NOT NULL DEFAULT '{}',
+    active     BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_webhooks_project ON webhooks(project_id);`

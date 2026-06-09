@@ -36,6 +36,8 @@ export interface Project {
   branch: string | null;
   start_command: string | null;
   account_id: string | null;
+  github_webhook_id?: number | null;
+  previews_enabled: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -60,7 +62,7 @@ export interface PlatformStack {
 export interface Environment {
   id: string;
   project_id: string;
-  name: "staging" | "production";
+  name: string; // "staging" | "production" | "pr-N" for previews
   aws_region: string;
   account_id: string | null;
   platform_stack_id: string | null;
@@ -77,8 +79,21 @@ export interface Environment {
   alb_listener_rule_arn: string | null;
   ecs_security_group_id: string | null;
   vpc_subnets: string | null;
+  // PR preview fields
+  is_preview: boolean;
+  pr_number: number | null;
+  pr_branch: string | null;
+  pr_head_sha: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface CostSummary {
+  total_monthly_cost: number;
+  by_service: Record<string, number>;
+  currency: string;
+  period_start: string;
+  period_end: string;
 }
 
 export interface Deployment {
@@ -131,6 +146,16 @@ export interface EnvVar {
   key: string;
   value: string; // "***" for secrets in list responses
   is_secret: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Webhook {
+  id: string;
+  project_id: string;
+  url: string;
+  events: string[];
+  active: boolean;
   created_at: string;
   updated_at: string;
 }

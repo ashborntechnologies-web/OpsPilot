@@ -1,4 +1,4 @@
-import type { Project, Environment, Deployment, GithubRepo, ConversationMessage, AWSAccount, OperationalEvent } from "@/types/api";
+import type { Project, Environment, Deployment, GithubRepo, ConversationMessage, AWSAccount, OperationalEvent, CostSummary } from "@/types/api";
 
 // HTTP requests use relative paths — Next.js rewrites /api/v1/* → backend, so no CORS needed.
 async function request<T>(
@@ -114,7 +114,7 @@ export function triggerDeploy(
   token: string,
   projectId: string,
   envId: string,
-  env: "staging" | "production" = "production"
+  env: string = "production"
 ) {
   return request<{ message: string }>(
     `/projects/${projectId}/environments/${envId}/deploy?env=${env}`,
@@ -151,6 +151,28 @@ export function getDeploymentEvents(token: string, projectId: string, deployment
   return request<OperationalEvent[]>(
     `/projects/${projectId}/deployments/${deploymentId}/events`,
     token
+  );
+}
+
+export function diagnoseDeployment(token: string, projectId: string, deploymentId: string) {
+  return request<{ diagnosis: string }>(
+    `/projects/${projectId}/deployments/${deploymentId}/diagnose`,
+    token
+  );
+}
+
+export function checkHealth(token: string, projectId: string, envId: string) {
+  return request<{ status: string; running: number; desired: number; pending: number; url?: string }>(
+    `/projects/${projectId}/environments/${envId}/health`,
+    token
+  );
+}
+
+export function scaleService(token: string, projectId: string, envId: string, replicas: number) {
+  return request<{ message: string }>(
+    `/projects/${projectId}/environments/${envId}/scale`,
+    token,
+    { method: "POST", body: JSON.stringify({ replicas }) }
   );
 }
 
@@ -231,6 +253,68 @@ export function getBootstrapTemplate(region: string) {
     .then((r) => r.json()) as Promise<{ template: string; script: string; external_id?: string; error?: string }>;
 }
 
+// ---- Webhooks ----------------------------------------------------------------
+
+export function listWebhooks(token: string, projectId: string) {
+  return request<import("@/types/api").Webhook[]>(`/projects/${projectId}/webhooks`, token);
+}
+
+export function createWebhook(
+  token: string,
+  projectId: string,
+  body: { url: string; secret?: string; events: string[] }
+) {
+  return request<import("@/types/api").Webhook>(`/projects/${projectId}/webhooks`, token, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function updateWebhook(
+  token: string,
+  projectId: string,
+  webhookId: string,
+  body: { url?: string; secret?: string; events?: string[]; active?: boolean }
+) {
+  return request<import("@/types/api").Webhook>(
+    `/projects/${projectId}/webhooks/${webhookId}`,
+    token,
+    { method: "PATCH", body: JSON.stringify(body) }
+  );
+}
+
+export function deleteWebhook(token: string, projectId: string, webhookId: string) {
+  return request<{ message: string }>(
+    `/projects/${projectId}/webhooks/${webhookId}`,
+    token,
+    { method: "DELETE" }
+  );
+}
+
+// ---- Cost Intelligence -------------------------------------------------------
+
+export function getProjectCosts(token: string, projectId: string) {
+  return request<CostSummary>(`/projects/${projectId}/costs`, token);
+}
+
+// ---- PR Preview Environments -------------------------------------------------
+
+export function enablePreviews(token: string, projectId: string) {
+  return request<{ message: string; webhook_id: number }>(
+    `/projects/${projectId}/previews/enable`,
+    token,
+    { method: "POST" }
+  );
+}
+
+export function disablePreviews(token: string, projectId: string) {
+  return request<{ message: string }>(
+    `/projects/${projectId}/previews/disable`,
+    token,
+    { method: "POST" }
+  );
+}
+
 // ---- WebSocket URL -----------------------------------------------------------
 // WebSocket can't go through the Next.js proxy, so it uses the backend URL directly.
 // The bearer token is NOT included in the URL — it is sent as the first WebSocket
@@ -240,4 +324,10 @@ export function wsURL(projectId: string) {
   const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
   const base = apiUrl.replace(/^http/, "ws");
   return `${base}/api/v1/ws/${projectId}`;
+}
+
+export function terminalWsURL(projectId: string, envId: string) {
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
+  const base = apiUrl.replace(/^http/, "ws");
+  return `${base}/api/v1/ws/${projectId}/terminal/${envId}`;
 }

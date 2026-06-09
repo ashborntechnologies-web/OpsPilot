@@ -854,3 +854,158 @@ func verifyState(state, encKey string) (uuid.UUID, error) {
 
 	return userID, nil
 }
+
+// ---- Webhook management ----
+
+// PREvent is the subset of a GitHub pull_request webhook payload we care about.
+type PREvent struct {
+	Action string `json:"action"` // opened | synchronize | closed | reopened
+	Number int    `json:"number"`
+	PullRequest struct {
+		Head struct {
+			Ref string `json:"ref"` // branch name
+			SHA string `json:"sha"`
+		} `json:"head"`
+		State  string `json:"state"`
+		Merged bool   `json:"merged"`
+	} `json:"pull_request"`
+	Repository struct {
+		FullName string `json:"full_name"`
+		Name     string `json:"name"`
+		Owner    struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	} `json:"repository"`
+}
+
+// RegisterRepoWebhook installs a pull_request webhook on the given repo.
+// Returns the GitHub webhook ID so it can be stored and later deleted.
+func (s *Service) RegisterRepoWebhook(ctx context.Context, token, owner, repo, webhookURL, secret string) (int64, error) {
+	body, _ := json.Marshal(map[string]any{
+		"name":   "web",
+		"active": true,
+		"events": []string{"pull_request"},
+		"config": map[string]string{
+			"url":          webhookURL,
+			"content_type": "json",
+			"secret":       secret,
+			"insecure_ssl": "0",
+		},
+	})
+
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/repos/%s/%s/hooks", githubAPIBase, owner, repo),
+		strings.NewReader(string(body)))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 400 {
+		return 0, fmt.Errorf("github webhook registration failed (%s): %s", resp.Status, string(raw))
+	}
+
+	var hook struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &hook); err != nil {
+		return 0, fmt.Errorf("failed to parse webhook response: %w", err)
+	}
+	return hook.ID, nil
+}
+
+// DeleteRepoWebhook removes a previously registered webhook from GitHub.
+func (s *Service) DeleteRepoWebhook(ctx context.Context, token, owner, repo string, webhookID int64) error {
+	req, err := http.NewRequestWithContext(ctx, "DELETE",
+		fmt.Sprintf("%s/repos/%s/%s/hooks/%d", githubAPIBase, owner, repo, webhookID),
+		nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 && resp.StatusCode != 404 {
+		return fmt.Errorf("github webhook deletion failed: %s", resp.Status)
+	}
+	return nil
+}
+
+// CreatePRComment posts a comment on the given PR and returns the comment ID.
+func (s *Service) CreatePRComment(ctx context.Context, token, owner, repo string, prNumber int, body string) (int64, error) {
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments", githubAPIBase, owner, repo, prNumber),
+		strings.NewReader(string(payload)))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return 0, fmt.Errorf("create comment failed (%s): %s", resp.Status, string(raw))
+	}
+
+	var comment struct {
+		ID int64 `json:"id"`
+	}
+	json.Unmarshal(raw, &comment)
+	return comment.ID, nil
+}
+
+// UpdatePRComment replaces the body of an existing PR comment.
+func (s *Service) UpdatePRComment(ctx context.Context, token, owner, repo string, commentID int64, body string) error {
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	req, err := http.NewRequestWithContext(ctx, "PATCH",
+		fmt.Sprintf("%s/repos/%s/%s/issues/comments/%d", githubAPIBase, owner, repo, commentID),
+		strings.NewReader(string(payload)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("update comment failed: %s", resp.Status)
+	}
+	return nil
+}
+
+// VerifyWebhookSignature checks the X-Hub-Signature-256 header using the stored secret.
+func VerifyWebhookSignature(payload []byte, signature, secret string) bool {
+	if secret == "" {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(payload)
+	expected := "sha256=" + fmt.Sprintf("%x", mac.Sum(nil))
+	return hmac.Equal([]byte(expected), []byte(signature))
+}

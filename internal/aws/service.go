@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/codebuild"
 	cbtypes "github.com/aws/aws-sdk-go-v2/service/codebuild/types"
+	"github.com/aws/aws-sdk-go-v2/service/costexplorer"
+	cetypes "github.com/aws/aws-sdk-go-v2/service/costexplorer/types"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
@@ -80,6 +83,7 @@ type ClientBundle struct {
 	CloudWatch     *cloudwatchlogs.Client
 	CodeBuild      *codebuild.Client
 	SSM            *ssm.Client
+	CostExplorer   *costexplorer.Client // always us-east-1 (global service)
 	Region         string
 }
 
@@ -135,6 +139,12 @@ func (s *Service) assumeRole(ctx context.Context, iamRoleARN, region, sessionSuf
 		return nil, fmt.Errorf("failed to create assumed-role config: %w", err)
 	}
 
+	// Cost Explorer is a global service — must always use us-east-1 regardless of env region.
+	ceCfg, _ := config.LoadDefaultConfig(ctx,
+		config.WithRegion("us-east-1"),
+		config.WithCredentialsProvider(aws.NewCredentialsCache(provider)),
+	)
+
 	return &ClientBundle{
 		ECS:            ecs.NewFromConfig(assumedCfg),
 		ECR:            ecr.NewFromConfig(assumedCfg),
@@ -143,6 +153,7 @@ func (s *Service) assumeRole(ctx context.Context, iamRoleARN, region, sessionSuf
 		CloudWatch:     cloudwatchlogs.NewFromConfig(assumedCfg),
 		CodeBuild:      codebuild.NewFromConfig(assumedCfg),
 		SSM:            ssm.NewFromConfig(assumedCfg),
+		CostExplorer:   costexplorer.NewFromConfig(ceCfg),
 		Region:         region,
 	}, nil
 }
@@ -1287,6 +1298,42 @@ func (s *Service) UpdateServiceDesiredCount(ctx context.Context, clients *Client
 	return nil
 }
 
+// GetRunningTask returns the ARN of the first running task for a given ECS service.
+// Used by the terminal proxy to find a container to exec into.
+func (s *Service) GetRunningTask(ctx context.Context, clients *ClientBundle, clusterName, serviceName string) (string, error) {
+	out, err := clients.ECS.ListTasks(ctx, &ecs.ListTasksInput{
+		Cluster:       aws.String(clusterName),
+		ServiceName:   aws.String(serviceName),
+		DesiredStatus: ecstypes.DesiredStatusRunning,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to list tasks: %w", err)
+	}
+	if len(out.TaskArns) == 0 {
+		return "", fmt.Errorf("no running tasks found for service %q — is the service deployed?", serviceName)
+	}
+	return out.TaskArns[0], nil
+}
+
+// StartExecSession starts an ECS Exec session for interactive shell access.
+// Returns the SSM StreamUrl and TokenValue needed to open the datachannel.
+func (s *Service) StartExecSession(ctx context.Context, clients *ClientBundle, clusterName, taskARN, command string) (streamURL, tokenValue string, err error) {
+	out, err := clients.ECS.ExecuteCommand(ctx, &ecs.ExecuteCommandInput{
+		Cluster:     aws.String(clusterName),
+		Task:        aws.String(taskARN),
+		Container:   aws.String("app"),
+		Command:     aws.String(command),
+		Interactive: true,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("failed to start ECS exec session: %w", err)
+	}
+	if out.Session == nil {
+		return "", "", fmt.Errorf("ECS exec returned empty session")
+	}
+	return aws.ToString(out.Session.StreamUrl), aws.ToString(out.Session.TokenValue), nil
+}
+
 // tgName returns the Target Group name for a project-environment. Max 32 chars (ALB limit).
 func tgName(projectID, envName string) string {
 	short := projectID
@@ -1624,4 +1671,445 @@ func taskResources(envName string) (cpu, memory string) {
 		return "1024", "2048"
 	}
 	return "512", "1024"
+}
+
+// ---- CloudWatch helpers ----
+
+// CreateLogGroupIfNotExists creates a CloudWatch Logs log group.
+// Ignores ResourceAlreadyExistsException so it can be called idempotently.
+func (s *Service) CreateLogGroupIfNotExists(ctx context.Context, clients *ClientBundle, logGroupName string) {
+	_, err := clients.CloudWatch.CreateLogGroup(ctx, &cloudwatchlogs.CreateLogGroupInput{
+		LogGroupName: aws.String(logGroupName),
+	})
+	if err != nil {
+		// ResourceAlreadyExistsException is expected — ignore it.
+		if !strings.Contains(err.Error(), "ResourceAlreadyExistsException") {
+			log.Printf("[aws] failed to create log group %s: %v", logGroupName, err)
+		}
+	}
+}
+
+// ---- Cost Intelligence ----
+
+// GetAccountCostSummary fetches the last 30 days of AWS costs for the account linked to the
+// given project. Only the services ConvDeploy provisions are included in the query.
+func (s *Service) GetAccountCostSummary(ctx context.Context, projectID string) (*models.CostSummary, error) {
+	var iamRoleARN, externalID string
+	err := s.db.Pool.QueryRow(ctx, `
+		SELECT a.iam_role_arn, a.external_id
+		FROM aws_accounts a
+		JOIN projects p ON p.account_id = a.id
+		WHERE p.id = $1
+	`, projectID).Scan(&iamRoleARN, &externalID)
+	if err != nil {
+		return nil, fmt.Errorf("no AWS account linked: %w", err)
+	}
+	if externalID == "" {
+		externalID = LegacyExternalID
+	}
+
+	clients, err := s.assumeRole(ctx, iamRoleARN, "us-east-1", projectID, externalID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to assume role: %w", err)
+	}
+
+	end := time.Now().UTC()
+	start := end.AddDate(0, 0, -30)
+	startStr := start.Format("2006-01-02")
+	endStr := end.Format("2006-01-02")
+
+	out, err := clients.CostExplorer.GetCostAndUsage(ctx, &costexplorer.GetCostAndUsageInput{
+		TimePeriod:  &cetypes.DateInterval{Start: aws.String(startStr), End: aws.String(endStr)},
+		Granularity: cetypes.GranularityMonthly,
+		Filter: &cetypes.Expression{
+			Dimensions: &cetypes.DimensionValues{
+				Key: cetypes.DimensionService,
+				Values: []string{
+					"Amazon Elastic Container Service",
+					"Amazon EC2 Container Registry (ECR)",
+					"AWS CodeBuild",
+					"Amazon Elastic Load Balancing",
+					"Amazon Virtual Private Cloud",
+				},
+			},
+		},
+		GroupBy: []cetypes.GroupDefinition{
+			{Type: cetypes.GroupDefinitionTypeDimension, Key: aws.String("SERVICE")},
+		},
+		Metrics: []string{"UnblendedCost"},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cost explorer query failed: %w", err)
+	}
+
+	summary := &models.CostSummary{
+		ByService:   make(map[string]float64),
+		Currency:    "USD",
+		PeriodStart: startStr,
+		PeriodEnd:   endStr,
+	}
+
+	for _, result := range out.ResultsByTime {
+		for _, group := range result.Groups {
+			if len(group.Keys) == 0 {
+				continue
+			}
+			name := group.Keys[0]
+			if metric, ok := group.Metrics["UnblendedCost"]; ok {
+				val, _ := strconv.ParseFloat(aws.ToString(metric.Amount), 64)
+				summary.ByService[name] += val
+				summary.TotalMonthlyCost += val
+				if metric.Unit != nil {
+					summary.Currency = *metric.Unit
+				}
+			}
+		}
+	}
+
+	return summary, nil
+}
+
+// ---- Conversational Infrastructure Mutations ----
+
+// GetCurrentTaskResources returns the CPU and memory of the currently running task definition
+// for the given ECS service.
+func (s *Service) GetCurrentTaskResources(ctx context.Context, clients *ClientBundle, clusterName, serviceName string) (cpu, memory string, err error) {
+	out, err := clients.ECS.DescribeServices(ctx, &ecs.DescribeServicesInput{
+		Cluster:  aws.String(clusterName),
+		Services: []string{serviceName},
+	})
+	if err != nil || len(out.Services) == 0 {
+		return "", "", fmt.Errorf("service not found")
+	}
+	taskDefARN := aws.ToString(out.Services[0].TaskDefinition)
+
+	td, err := clients.ECS.DescribeTaskDefinition(ctx, &ecs.DescribeTaskDefinitionInput{
+		TaskDefinition: aws.String(taskDefARN),
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("failed to describe task definition: %w", err)
+	}
+	return aws.ToString(td.TaskDefinition.Cpu), aws.ToString(td.TaskDefinition.Memory), nil
+}
+
+// UpdateServiceResources registers a new task definition revision with the given CPU/memory
+// and forces a service update. The new tasks will roll out gradually.
+func (s *Service) UpdateServiceResources(ctx context.Context, clients *ClientBundle, env *models.Environment, project *models.Project, imageURI, cpu, memory string) error {
+	if env.TaskExecutionRoleARN == nil || env.LogGroupName == nil {
+		return fmt.Errorf("environment not fully provisioned")
+	}
+
+	port := frameworkPort(project.Framework)
+	family := fmt.Sprintf("convdeploy-%s", project.ID.String())
+
+	var envVars []ecstypes.KeyValuePair
+	rows, _ := s.db.Pool.Query(ctx,
+		`SELECT key, value FROM env_vars WHERE environment_id = $1`, env.ID)
+	if rows != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var k, v string
+			if rows.Scan(&k, &v) == nil {
+				envVars = append(envVars, ecstypes.KeyValuePair{Name: aws.String(k), Value: aws.String(v)})
+			}
+		}
+	}
+
+	reg, err := clients.ECS.RegisterTaskDefinition(ctx, &ecs.RegisterTaskDefinitionInput{
+		Family:                  aws.String(family),
+		NetworkMode:             ecstypes.NetworkModeAwsvpc,
+		RequiresCompatibilities: []ecstypes.Compatibility{ecstypes.CompatibilityFargate},
+		Cpu:                     aws.String(cpu),
+		Memory:                  aws.String(memory),
+		ExecutionRoleArn:        env.TaskExecutionRoleARN,
+		TaskRoleArn:             env.TaskExecutionRoleARN,
+		ContainerDefinitions: []ecstypes.ContainerDefinition{
+			{
+				Name:        aws.String("app"),
+				Image:       aws.String(imageURI),
+				Essential:   aws.Bool(true),
+				Environment: envVars,
+				PortMappings: []ecstypes.PortMapping{
+					{ContainerPort: aws.Int32(port), Protocol: ecstypes.TransportProtocolTcp},
+				},
+				LogConfiguration: &ecstypes.LogConfiguration{
+					LogDriver: ecstypes.LogDriverAwslogs,
+					Options: map[string]string{
+						"awslogs-group":         *env.LogGroupName,
+						"awslogs-region":        clients.Region,
+						"awslogs-stream-prefix": "ecs",
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to register task definition: %w", err)
+	}
+
+	clusterName, _, _, _, err := s.resolveNetworkingForEnv(ctx, env)
+	if err != nil {
+		return err
+	}
+
+	_, err = clients.ECS.UpdateService(ctx, &ecs.UpdateServiceInput{
+		Cluster:        aws.String(clusterName),
+		Service:        env.ECSServiceName,
+		TaskDefinition: reg.TaskDefinition.TaskDefinitionArn,
+		ForceNewDeployment: true,
+	})
+	return err
+}
+
+// resolveNetworkingForEnv is a helper to get the cluster name from platform stack or legacy fields.
+func (s *Service) resolveNetworkingForEnv(ctx context.Context, env *models.Environment) (clusterName string, subnets []string, sgID string, listenerARN string, err error) {
+	if env.PlatformStackID != nil {
+		ps, psErr := s.GetPlatformStack(ctx, *env.PlatformStackID)
+		if psErr != nil {
+			return "", nil, "", "", psErr
+		}
+		if ps.ECSClusterName == nil {
+			return "", nil, "", "", fmt.Errorf("platform stack not fully provisioned")
+		}
+		la := ""
+		if ps.ALBListenerArn != nil {
+			la = *ps.ALBListenerArn
+		}
+		var subs []string
+		if ps.SubnetIDs != nil {
+			subs = strings.Split(*ps.SubnetIDs, ",")
+		}
+		sg := ""
+		if ps.ECSSecurityGroupID != nil {
+			sg = *ps.ECSSecurityGroupID
+		}
+		return *ps.ECSClusterName, subs, sg, la, nil
+	}
+	if env.ECSClusterName == nil {
+		return "", nil, "", "", fmt.Errorf("cluster name not set")
+	}
+	subs := []string{}
+	if env.VPCSubnets != nil {
+		subs = strings.Split(*env.VPCSubnets, ",")
+	}
+	sg := ""
+	if env.ECSSecurityGroupID != nil {
+		sg = *env.ECSSecurityGroupID
+	}
+	return *env.ECSClusterName, subs, sg, "", nil
+}
+
+// ---- PR Preview Environments ----
+
+// CreatePreviewService provisions a target group, listener rule (path /pr-N/*), and ECS
+// service for a PR preview. All infra is shared from the staging platform stack.
+func (s *Service) CreatePreviewService(
+	ctx context.Context,
+	clients *ClientBundle,
+	stagingEnv *models.Environment,
+	ps *models.PlatformStack,
+	previewEnv *models.Environment,
+	imageURI string,
+	project *models.Project,
+) (listenerRuleARN, targetGroupARN string, err error) {
+	if ps.ALBListenerArn == nil || ps.ECSClusterName == nil || ps.ECSSecurityGroupID == nil || ps.SubnetIDs == nil {
+		return "", "", fmt.Errorf("platform stack not fully provisioned")
+	}
+	if previewEnv.PRNumber == nil {
+		return "", "", fmt.Errorf("preview env missing pr_number")
+	}
+	if previewEnv.TaskExecutionRoleARN == nil || previewEnv.LogGroupName == nil {
+		return "", "", fmt.Errorf("preview env missing execution role or log group")
+	}
+
+	prNum := *previewEnv.PRNumber
+	port := frameworkPort(project.Framework)
+	shortID := project.ID.String()[:8]
+
+	// Create target group.
+	tgName := fmt.Sprintf("pr-%d-%s", prNum, shortID)
+	if len(tgName) > 32 {
+		tgName = tgName[:32]
+	}
+
+	// Derive VPC ID from the staging ALB.
+	albOut, err := clients.ELB.DescribeLoadBalancers(ctx, &elasticloadbalancingv2.DescribeLoadBalancersInput{
+		LoadBalancerArns: []string{aws.ToString(ps.ALBArn)},
+	})
+	if err != nil || len(albOut.LoadBalancers) == 0 {
+		return "", "", fmt.Errorf("failed to describe ALB: %w", err)
+	}
+	vpcID := aws.ToString(albOut.LoadBalancers[0].VpcId)
+
+	tg, err := clients.ELB.CreateTargetGroup(ctx, &elasticloadbalancingv2.CreateTargetGroupInput{
+		Name:                      aws.String(tgName),
+		Protocol:                  elbtypes.ProtocolEnumHttp,
+		Port:                      aws.Int32(port),
+		VpcId:                     aws.String(vpcID),
+		TargetType:                elbtypes.TargetTypeEnumIp,
+		HealthCheckPath:           aws.String("/"),
+		HealthCheckIntervalSeconds: aws.Int32(30),
+		HealthyThresholdCount:     aws.Int32(2),
+		UnhealthyThresholdCount:   aws.Int32(3),
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create target group: %w", err)
+	}
+	tgARN := aws.ToString(tg.TargetGroups[0].TargetGroupArn)
+
+	// Create listener rule at priority 10000 + prNum with path /pr-N/*.
+	priority := int32(10000 + prNum)
+	rule, err := clients.ELB.CreateRule(ctx, &elasticloadbalancingv2.CreateRuleInput{
+		ListenerArn: ps.ALBListenerArn,
+		Priority:    aws.Int32(priority),
+		Conditions: []elbtypes.RuleCondition{
+			{
+				Field:  aws.String("path-pattern"),
+				Values: []string{fmt.Sprintf("/pr-%d/*", prNum)},
+			},
+		},
+		Actions: []elbtypes.Action{
+			{
+				Type:           elbtypes.ActionTypeEnumForward,
+				TargetGroupArn: aws.String(tgARN),
+			},
+		},
+	})
+	if err != nil {
+		// Clean up TG on failure.
+		clients.ELB.DeleteTargetGroup(ctx, &elasticloadbalancingv2.DeleteTargetGroupInput{TargetGroupArn: aws.String(tgARN)})
+		return "", "", fmt.Errorf("failed to create listener rule: %w", err)
+	}
+	ruleARN := aws.ToString(rule.Rules[0].RuleArn)
+
+	// Create ECS service.
+	subnets := strings.Split(*ps.SubnetIDs, ",")
+	serviceName := fmt.Sprintf("%s-pr-%d", project.ID.String()[:8], prNum)
+
+	envVars := []ecstypes.KeyValuePair{
+		{Name: aws.String("PREVIEW_PATH_PREFIX"), Value: aws.String(fmt.Sprintf("/pr-%d", prNum))},
+	}
+	rows, _ := s.db.Pool.Query(ctx, `SELECT key, value FROM env_vars WHERE environment_id = $1`, stagingEnv.ID)
+	if rows != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var k, v string
+			if rows.Scan(&k, &v) == nil {
+				envVars = append(envVars, ecstypes.KeyValuePair{Name: aws.String(k), Value: aws.String(v)})
+			}
+		}
+	}
+
+	family := fmt.Sprintf("convdeploy-pr-%d-%s", prNum, project.ID.String()[:8])
+	reg, err := clients.ECS.RegisterTaskDefinition(ctx, &ecs.RegisterTaskDefinitionInput{
+		Family:                  aws.String(family),
+		NetworkMode:             ecstypes.NetworkModeAwsvpc,
+		RequiresCompatibilities: []ecstypes.Compatibility{ecstypes.CompatibilityFargate},
+		Cpu:                     aws.String("512"),
+		Memory:                  aws.String("1024"),
+		ExecutionRoleArn:        previewEnv.TaskExecutionRoleARN,
+		TaskRoleArn:             previewEnv.TaskExecutionRoleARN,
+		ContainerDefinitions: []ecstypes.ContainerDefinition{
+			{
+				Name:        aws.String("app"),
+				Image:       aws.String(imageURI),
+				Essential:   aws.Bool(true),
+				Environment: envVars,
+				PortMappings: []ecstypes.PortMapping{
+					{ContainerPort: aws.Int32(port), Protocol: ecstypes.TransportProtocolTcp},
+				},
+				LogConfiguration: &ecstypes.LogConfiguration{
+					LogDriver: ecstypes.LogDriverAwslogs,
+					Options: map[string]string{
+						"awslogs-group":         *previewEnv.LogGroupName,
+						"awslogs-region":        clients.Region,
+						"awslogs-stream-prefix": "ecs-pr",
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		clients.ELB.DeleteRule(ctx, &elasticloadbalancingv2.DeleteRuleInput{RuleArn: aws.String(ruleARN)})
+		clients.ELB.DeleteTargetGroup(ctx, &elasticloadbalancingv2.DeleteTargetGroupInput{TargetGroupArn: aws.String(tgARN)})
+		return "", "", fmt.Errorf("failed to register preview task definition: %w", err)
+	}
+
+	_, err = clients.ECS.CreateService(ctx, &ecs.CreateServiceInput{
+		Cluster:        aws.String(*ps.ECSClusterName),
+		ServiceName:    aws.String(serviceName),
+		TaskDefinition: reg.TaskDefinition.TaskDefinitionArn,
+		DesiredCount:   aws.Int32(1),
+		LaunchType:     ecstypes.LaunchTypeFargate,
+		NetworkConfiguration: &ecstypes.NetworkConfiguration{
+			AwsvpcConfiguration: &ecstypes.AwsVpcConfiguration{
+				Subnets:        subnets,
+				SecurityGroups: []string{*ps.ECSSecurityGroupID},
+				AssignPublicIp: ecstypes.AssignPublicIpEnabled,
+			},
+		},
+		LoadBalancers: []ecstypes.LoadBalancer{
+			{
+				TargetGroupArn: aws.String(tgARN),
+				ContainerName:  aws.String("app"),
+				ContainerPort:  aws.Int32(port),
+			},
+		},
+		EnableExecuteCommand: true,
+	})
+	if err != nil {
+		clients.ELB.DeleteRule(ctx, &elasticloadbalancingv2.DeleteRuleInput{RuleArn: aws.String(ruleARN)})
+		clients.ELB.DeleteTargetGroup(ctx, &elasticloadbalancingv2.DeleteTargetGroupInput{TargetGroupArn: aws.String(tgARN)})
+		return "", "", fmt.Errorf("failed to create preview ECS service: %w", err)
+	}
+
+	// Store service name on the preview env record.
+	s.db.Pool.Exec(ctx,
+		`UPDATE environments SET ecs_service_name = $1, updated_at = NOW() WHERE id = $2`,
+		serviceName, previewEnv.ID,
+	)
+
+	return ruleARN, tgARN, nil
+}
+
+// TeardownPreviewService removes the ECS service, listener rule, and target group for a PR.
+func (s *Service) TeardownPreviewService(ctx context.Context, clients *ClientBundle, previewEnv *models.Environment) error {
+	clusterName, _, _, _, _ := s.resolveNetworkingForEnv(ctx, previewEnv)
+
+	// Scale down to 0 first so tasks drain, then delete.
+	if previewEnv.ECSServiceName != nil && clusterName != "" {
+		clients.ECS.UpdateService(ctx, &ecs.UpdateServiceInput{
+			Cluster:      aws.String(clusterName),
+			Service:      previewEnv.ECSServiceName,
+			DesiredCount: aws.Int32(0),
+		})
+		// Brief wait for drain.
+		time.Sleep(5 * time.Second)
+		clients.ECS.DeleteService(ctx, &ecs.DeleteServiceInput{
+			Cluster: aws.String(clusterName),
+			Service: previewEnv.ECSServiceName,
+			Force:   aws.Bool(true),
+		})
+	}
+
+	if previewEnv.ALBListenerRuleARN != nil {
+		clients.ELB.DeleteRule(ctx, &elasticloadbalancingv2.DeleteRuleInput{
+			RuleArn: previewEnv.ALBListenerRuleARN,
+		})
+	}
+
+	if previewEnv.ALBTargetGroupARN != nil {
+		// Retry a couple of times — the TG may still have registered targets draining.
+		for i := 0; i < 3; i++ {
+			_, err := clients.ELB.DeleteTargetGroup(ctx, &elasticloadbalancingv2.DeleteTargetGroupInput{
+				TargetGroupArn: previewEnv.ALBTargetGroupARN,
+			})
+			if err == nil {
+				break
+			}
+			time.Sleep(5 * time.Second)
+		}
+	}
+
+	return nil
 }

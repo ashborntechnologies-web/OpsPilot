@@ -20,15 +20,20 @@ import {
   createEnvironment, triggerDeploy, rollback, retryProvision, getEnvironmentLogs,
   getDeploymentEvents, wsURL, redeployDeployment, deleteDeployment,
   listEnvVars, upsertEnvVar, deleteEnvVar,
+  diagnoseDeployment, checkHealth, scaleService,
+  listWebhooks, createWebhook, updateWebhook, deleteWebhook,
+  terminalWsURL, getProjectCosts, enablePreviews, disablePreviews,
 } from "@/lib/api";
-import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar } from "@/types/api";
+import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar, Webhook, CostSummary } from "@/types/api";
 import { toast } from "sonner";
 import {
   MessageSquare, Plus, Rocket, RotateCcw,
   CheckCircle2, XCircle, Clock, Loader2, Cloud,
   RefreshCw, Terminal, AlertTriangle, ChevronDown, ChevronRight,
-  Trash2, Eye, EyeOff, KeyRound,
+  Trash2, Eye, EyeOff, KeyRound, Activity, Scaling, Webhook as WebhookIcon, ZapOff,
+  DollarSign, GitPullRequest, Zap,
 } from "lucide-react";
+import "@xterm/xterm/css/xterm.css";
 
 const AWS_REGIONS = [
   "us-east-1", "us-east-2", "us-west-1", "us-west-2",
@@ -133,6 +138,39 @@ export default function ProjectPage() {
   const [savingEnvVar, setSavingEnvVar] = useState(false);
   const [showSecretValues, setShowSecretValues] = useState<Record<string, boolean>>({});
 
+  // diagnose
+  const [diagnosing, setDiagnosing] = useState<string | null>(null);
+  const [diagnosisResult, setDiagnosisResult] = useState<string | null>(null);
+
+  // health
+  const [healthData, setHealthData] = useState<Record<string, { status: string; running: number; desired: number; pending: number; url?: string }>>({});
+  const [checkingHealth, setCheckingHealth] = useState<string | null>(null);
+
+  // scale
+  const [scaleTarget, setScaleTarget] = useState<Environment | null>(null);
+  const [scaleReplicas, setScaleReplicas] = useState(1);
+  const [scaling, setScaling] = useState(false);
+
+  // terminal
+  const [terminalEnvId, setTerminalEnvId] = useState<string>("");
+  const terminalRef = useRef<HTMLDivElement>(null);
+
+  // webhooks
+  const [hooksList, setHooksList] = useState<Webhook[]>([]);
+  const [loadingHooks, setLoadingHooks] = useState(false);
+  const [hookDialog, setHookDialog] = useState(false);
+  const [newHookUrl, setNewHookUrl] = useState("");
+  const [newHookSecret, setNewHookSecret] = useState("");
+  const [newHookEvents, setNewHookEvents] = useState<string[]>([]);
+  const [savingHook, setSavingHook] = useState(false);
+
+  // cost intelligence
+  const [costs, setCosts] = useState<CostSummary | null>(null);
+  const [loadingCosts, setLoadingCosts] = useState(false);
+
+  // PR previews
+  const [togglingPreviews, setTogglingPreviews] = useState(false);
+
   const refresh = useCallback(async () => {
     const token = await getToken();
     if (!token) return;
@@ -192,6 +230,69 @@ export default function ProjectPage() {
       ws?.close();
     };
   }, [id, getToken, refresh]);
+
+  // Terminal — mount xterm.js and open SSM datachannel proxy when an env is selected.
+  useEffect(() => {
+    if (!terminalEnvId || !terminalRef.current) return;
+
+    let term: import("@xterm/xterm").Terminal | null = null;
+    let ws: WebSocket | null = null;
+    let closed = false;
+
+    (async () => {
+      const { Terminal: XTerm } = await import("@xterm/xterm");
+      const { FitAddon } = await import("@xterm/addon-fit");
+
+      if (closed || !terminalRef.current) return;
+
+      term = new XTerm({ cursorBlink: true, convertEol: true, fontSize: 13, fontFamily: "monospace" });
+      const fitAddon = new FitAddon();
+      term.loadAddon(fitAddon);
+      term.open(terminalRef.current);
+      fitAddon.fit();
+
+      const token = await getToken();
+      if (!token || closed) { term.dispose(); return; }
+
+      ws = new WebSocket(terminalWsURL(id, terminalEnvId));
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = () => ws?.send(JSON.stringify({ type: "auth", token }));
+
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === "string") {
+          try {
+            const msg = JSON.parse(ev.data) as { type: string; payload?: string };
+            if (msg.type === "error") term?.write(`\r\n\x1b[31m${msg.payload}\x1b[0m\r\n`);
+            if (msg.type === "closed") term?.write("\r\n\x1b[33m[session closed]\x1b[0m\r\n");
+          } catch {}
+        } else {
+          term?.write(new Uint8Array(ev.data as ArrayBuffer));
+        }
+      };
+
+      ws.onclose = () => term?.write("\r\n\x1b[33m[disconnected]\x1b[0m\r\n");
+
+      term.onData((data) => ws?.readyState === WebSocket.OPEN && ws.send(data));
+      term.onResize(({ cols, rows }) =>
+        ws?.readyState === WebSocket.OPEN &&
+        ws.send(JSON.stringify({ type: "resize", cols, rows }))
+      );
+
+      const ro = new ResizeObserver(() => fitAddon.fit());
+      if (terminalRef.current) ro.observe(terminalRef.current);
+
+      // Store ro cleanup in a closure var so the return below can access it.
+      (ws as WebSocket & { _ro?: ResizeObserver })._ro = ro;
+    })();
+
+    return () => {
+      closed = true;
+      (ws as (WebSocket & { _ro?: ResizeObserver }) | null)?._ro?.disconnect();
+      ws?.close();
+      term?.dispose();
+    };
+  }, [terminalEnvId, id, getToken]);
 
   // Polling — re-fetch environments every 5 s while any are still provisioning.
   useEffect(() => {
@@ -382,7 +483,148 @@ export default function ProjectPage() {
     }
   }
 
-  const readyEnvs = environments.filter((e) => e.stack_status === "ready");
+  // ── Diagnose ────────────────────────────────────────────────────────────────
+  async function handleDiagnose(dep: Deployment) {
+    const token = await getToken();
+    if (!token) return;
+    setDiagnosing(dep.id);
+    try {
+      const { diagnosis } = await diagnoseDeployment(token, id, dep.id);
+      setDiagnosisResult(diagnosis);
+    } catch (e: unknown) {
+      toast.error((e as Error).message ?? "Diagnosis failed");
+    } finally {
+      setDiagnosing(null);
+    }
+  }
+
+  // ── Health check ────────────────────────────────────────────────────────────
+  async function handleCheckHealth(env: Environment) {
+    const token = await getToken();
+    if (!token) return;
+    setCheckingHealth(env.id);
+    try {
+      const result = await checkHealth(token, id, env.id);
+      setHealthData((prev) => ({ ...prev, [env.id]: result }));
+    } catch (e: unknown) {
+      toast.error((e as Error).message ?? "Health check failed");
+    } finally {
+      setCheckingHealth(null);
+    }
+  }
+
+  // ── Scale ────────────────────────────────────────────────────────────────────
+  async function handleScale() {
+    if (!scaleTarget) return;
+    const token = await getToken();
+    if (!token) return;
+    setScaling(true);
+    try {
+      const { message } = await scaleService(token, id, scaleTarget.id, scaleReplicas);
+      toast.success(message);
+      setScaleTarget(null);
+    } catch (e: unknown) {
+      toast.error((e as Error).message ?? "Scale failed");
+    } finally {
+      setScaling(false);
+    }
+  }
+
+  // ── Webhooks ─────────────────────────────────────────────────────────────────
+  async function loadHooks() {
+    const token = await getToken();
+    if (!token) return;
+    setLoadingHooks(true);
+    try {
+      const data = await listWebhooks(token, id);
+      setHooksList(data ?? []);
+    } catch {
+      toast.error("Failed to load webhooks");
+    } finally {
+      setLoadingHooks(false);
+    }
+  }
+
+  async function handleCreateHook() {
+    if (!newHookUrl || newHookEvents.length === 0) return;
+    const token = await getToken();
+    if (!token) return;
+    setSavingHook(true);
+    try {
+      const hook = await createWebhook(token, id, {
+        url: newHookUrl,
+        secret: newHookSecret || undefined,
+        events: newHookEvents,
+      });
+      setHooksList((prev) => [hook, ...prev]);
+      setHookDialog(false);
+      setNewHookUrl(""); setNewHookSecret(""); setNewHookEvents([]);
+      toast.success("Webhook created");
+    } catch (e: unknown) {
+      toast.error((e as Error).message ?? "Failed to create webhook");
+    } finally {
+      setSavingHook(false);
+    }
+  }
+
+  async function handleDeleteHook(hookId: string) {
+    const token = await getToken();
+    if (!token) return;
+    try {
+      await deleteWebhook(token, id, hookId);
+      setHooksList((prev) => prev.filter((w) => w.id !== hookId));
+      toast.success("Webhook deleted");
+    } catch (e: unknown) {
+      toast.error((e as Error).message ?? "Failed to delete webhook");
+    }
+  }
+
+  async function handleToggleHook(hook: Webhook) {
+    const token = await getToken();
+    if (!token) return;
+    try {
+      const updated = await updateWebhook(token, id, hook.id, { active: !hook.active });
+      setHooksList((prev) => prev.map((w) => (w.id === hook.id ? updated : w)));
+    } catch (e: unknown) {
+      toast.error((e as Error).message ?? "Failed to update webhook");
+    }
+  }
+
+  async function loadCosts() {
+    const token = await getToken();
+    if (!token) return;
+    setLoadingCosts(true);
+    try {
+      const data = await getProjectCosts(token, id);
+      setCosts(data);
+    } catch {
+      toast.error("Failed to load cost data");
+    } finally {
+      setLoadingCosts(false);
+    }
+  }
+
+  async function handleTogglePreviews() {
+    const token = await getToken();
+    if (!token) return;
+    setTogglingPreviews(true);
+    try {
+      if (project?.previews_enabled) {
+        await disablePreviews(token, id);
+        toast.success("PR preview environments disabled");
+      } else {
+        await enablePreviews(token, id);
+        toast.success("PR preview environments enabled — push a PR to test it!");
+      }
+      await refresh();
+    } catch (e: unknown) {
+      toast.error((e as Error).message ?? "Failed to toggle previews");
+    } finally {
+      setTogglingPreviews(false);
+    }
+  }
+
+  const readyEnvs = environments.filter((e) => e.stack_status === "ready" && !e.is_preview);
   const selectedLogEnv = environments.find((e) => e.id === logsEnvId);
 
   if (loading) {
@@ -398,7 +640,7 @@ export default function ProjectPage() {
 
   if (!project) return null;
 
-  const existingEnvNames = environments.map((e) => e.name);
+  const existingEnvNames = environments.filter((e) => !e.is_preview).map((e) => e.name);
 
   return (
     <div className="min-h-screen bg-zinc-50">
@@ -444,6 +686,90 @@ export default function ProjectPage() {
             >
               {deleting ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
               Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Diagnosis result dialog */}
+      <Dialog open={!!diagnosisResult} onOpenChange={(v) => !v && setDiagnosisResult(null)}>
+        <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>AI Diagnosis</DialogTitle>
+            <DialogDescription>Analysis of the last failed deployment</DialogDescription>
+          </DialogHeader>
+          <pre className="text-xs bg-zinc-950 text-zinc-100 rounded-lg p-4 whitespace-pre-wrap font-mono overflow-x-auto">
+            {diagnosisResult}
+          </pre>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDiagnosisResult(null)}>Close</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Scale dialog */}
+      <Dialog open={!!scaleTarget} onOpenChange={(v) => !v && setScaleTarget(null)}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="capitalize">Scale {scaleTarget?.name}</DialogTitle>
+            <DialogDescription>Set the number of ECS task replicas.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 pt-1">
+            <div className="space-y-1.5">
+              <Label className="text-xs">Replicas (0 – 10)</Label>
+              <Input
+                type="number" min={0} max={10}
+                value={scaleReplicas}
+                onChange={(e) => setScaleReplicas(Number(e.target.value))}
+              />
+            </div>
+          </div>
+          <DialogFooter className="pt-2">
+            <Button variant="outline" onClick={() => setScaleTarget(null)} disabled={scaling}>Cancel</Button>
+            <Button onClick={handleScale} disabled={scaling}>
+              {scaling ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : null}
+              {scaling ? "Scaling..." : "Apply"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Add webhook dialog */}
+      <Dialog open={hookDialog} onOpenChange={(v) => { if (!v) { setHookDialog(false); setNewHookUrl(""); setNewHookSecret(""); setNewHookEvents([]); } }}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Add Webhook</DialogTitle>
+            <DialogDescription>ConvDeploy will POST to this URL on deploy events.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 pt-1">
+            <div className="space-y-1.5">
+              <Label className="text-xs">URL *</Label>
+              <Input placeholder="https://hooks.example.com/..." value={newHookUrl} onChange={(e) => setNewHookUrl(e.target.value)} />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Secret (optional — used for HMAC-SHA256 signature)</Label>
+              <Input placeholder="••••••••" type="password" value={newHookSecret} onChange={(e) => setNewHookSecret(e.target.value)} />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Events *</Label>
+              {(["deploy.started", "deploy.succeeded", "deploy.failed"] as const).map((ev) => (
+                <label key={ev} className="flex items-center gap-2 text-sm cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={newHookEvents.includes(ev)}
+                    onChange={(e) => setNewHookEvents(e.target.checked ? [...newHookEvents, ev] : newHookEvents.filter((x) => x !== ev))}
+                    className="h-3.5 w-3.5"
+                  />
+                  <span className="font-mono text-xs">{ev}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+          <DialogFooter className="pt-2">
+            <Button variant="outline" onClick={() => setHookDialog(false)} disabled={savingHook}>Cancel</Button>
+            <Button onClick={handleCreateHook} disabled={savingHook || !newHookUrl || newHookEvents.length === 0}>
+              {savingHook ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : null}
+              {savingHook ? "Saving..." : "Create"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -512,6 +838,8 @@ export default function ProjectPage() {
             <TabsTrigger value="deployments">Deployments</TabsTrigger>
             <TabsTrigger value="env-vars" onClick={() => fetchEnvVars()}>Env Vars</TabsTrigger>
             <TabsTrigger value="terminal">Terminal</TabsTrigger>
+            <TabsTrigger value="webhooks" onClick={() => loadHooks()}>Webhooks</TabsTrigger>
+            <TabsTrigger value="costs" onClick={() => loadCosts()}>Costs</TabsTrigger>
           </TabsList>
 
           {/* ── Overview (environments) ── */}
@@ -541,7 +869,7 @@ export default function ProjectPage() {
                 </Card>
               )}
 
-              {environments.map((env) => {
+              {environments.filter((env) => !env.is_preview).map((env) => {
                 const badge = STACK_BADGE[env.stack_status];
                 return (
                   <Card key={env.id}>
@@ -556,17 +884,41 @@ export default function ProjectPage() {
                         </div>
                         <div className="flex gap-2">
                           {env.stack_status === "ready" && (
-                            <Button
-                              size="sm"
-                              onClick={() => handleDeploy(env)}
-                              disabled={deploying === env.id}
-                            >
-                              {deploying === env.id
-                                ? <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-                                : <Rocket className="h-3 w-3 mr-1" />
-                              }
-                              Deploy
-                            </Button>
+                            <>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                disabled={checkingHealth === env.id}
+                                onClick={() => handleCheckHealth(env)}
+                                title="Check ECS service health"
+                              >
+                                {checkingHealth === env.id
+                                  ? <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                                  : <Activity className="h-3 w-3 mr-1" />
+                                }
+                                Health
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => { setScaleTarget(env); setScaleReplicas(1); }}
+                                title="Scale ECS service"
+                              >
+                                <Scaling className="h-3 w-3 mr-1" />
+                                Scale
+                              </Button>
+                              <Button
+                                size="sm"
+                                onClick={() => handleDeploy(env)}
+                                disabled={deploying === env.id}
+                              >
+                                {deploying === env.id
+                                  ? <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                                  : <Rocket className="h-3 w-3 mr-1" />
+                                }
+                                Deploy
+                              </Button>
+                            </>
                           )}
                           {env.stack_status === "failed" && (
                             <Button
@@ -668,6 +1020,24 @@ export default function ProjectPage() {
                             )
                           ))}
                         </div>
+                        {healthData[env.id] && (
+                          <div className="mt-3 pt-3 border-t flex items-center gap-4 text-xs">
+                            <span className={`font-medium ${healthData[env.id].status === "running" ? "text-green-600" : "text-amber-600"}`}>
+                              {healthData[env.id].status}
+                            </span>
+                            <span className="text-muted-foreground">
+                              Running <strong>{healthData[env.id].running}</strong>
+                              {" / "}Desired <strong>{healthData[env.id].desired}</strong>
+                              {healthData[env.id].pending > 0 && <> · Pending <strong>{healthData[env.id].pending}</strong></>}
+                            </span>
+                            {healthData[env.id].url && (
+                              <a href={healthData[env.id].url} target="_blank" rel="noopener noreferrer"
+                                className="text-indigo-600 hover:underline font-mono truncate">
+                                {healthData[env.id].url}
+                              </a>
+                            )}
+                          </div>
+                        )}
                       </CardContent>
                     )}
                   </Card>
@@ -675,7 +1045,7 @@ export default function ProjectPage() {
               })}
 
               {environments.length > 0 && (
-                <div className="flex gap-2">
+                <div className="flex gap-2 flex-wrap">
                   {!existingEnvNames.includes("staging") && (
                     <Button size="sm" variant="outline" onClick={() => setEnvDialog("staging")}>
                       <Plus className="h-3 w-3 mr-1" /> Add Staging
@@ -687,6 +1057,70 @@ export default function ProjectPage() {
                     </Button>
                   )}
                 </div>
+              )}
+
+              {/* PR Preview Environments section */}
+              {environments.some((e) => e.is_preview) && (
+                <div className="space-y-2">
+                  <p className="text-sm font-medium text-muted-foreground flex items-center gap-1.5">
+                    <GitPullRequest className="h-3.5 w-3.5" /> PR Preview Environments
+                  </p>
+                  {environments.filter((e) => e.is_preview).map((env) => (
+                    <Card key={env.id} className="border-dashed">
+                      <CardHeader className="py-3">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <Badge variant="outline" className="text-xs font-mono">PR #{env.pr_number}</Badge>
+                            <span className="text-sm font-mono text-muted-foreground">{env.pr_branch}</span>
+                            <Badge variant={env.stack_status === "ready" ? "default" : "secondary"} className="text-xs">
+                              {env.stack_status}
+                            </Badge>
+                          </div>
+                          {env.stack_status === "ready" && env.alb_dns && env.pr_number && (
+                            <a
+                              href={`http://${env.alb_dns}/pr-${env.pr_number}/`}
+                              target="_blank" rel="noopener noreferrer"
+                              className="text-xs text-indigo-600 hover:underline font-mono"
+                            >
+                              Open preview →
+                            </a>
+                          )}
+                        </div>
+                        {env.pr_head_sha && (
+                          <CardDescription className="text-xs font-mono">{env.pr_head_sha.slice(0, 8)}</CardDescription>
+                        )}
+                      </CardHeader>
+                    </Card>
+                  ))}
+                </div>
+              )}
+
+              {/* PR Previews toggle */}
+              {project.account_id && (
+                <Card className="border-dashed bg-zinc-50/50">
+                  <CardContent className="flex items-center justify-between py-4">
+                    <div className="flex items-center gap-3">
+                      <Zap className={`h-5 w-5 ${project.previews_enabled ? "text-green-500" : "text-zinc-400"}`} />
+                      <div>
+                        <p className="text-sm font-medium">PR Preview Environments</p>
+                        <p className="text-xs text-muted-foreground mt-0.5">
+                          {project.previews_enabled
+                            ? "Enabled — a preview deploys on every PR push."
+                            : "Auto-deploy a live preview for every pull request on your own AWS."}
+                        </p>
+                      </div>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant={project.previews_enabled ? "destructive" : "default"}
+                      disabled={togglingPreviews || !environments.some((e) => e.stack_status === "ready" && !e.is_preview)}
+                      onClick={handleTogglePreviews}
+                    >
+                      {togglingPreviews ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
+                      {project.previews_enabled ? "Disable" : "Enable"}
+                    </Button>
+                  </CardContent>
+                </Card>
               )}
             </div>
           </TabsContent>
@@ -796,6 +1230,20 @@ export default function ProjectPage() {
                             <Button size="sm" variant="outline" onClick={() => handleRollback(dep)}>
                               <RotateCcw className="h-3 w-3 mr-1" />
                               Rollback
+                            </Button>
+                          )}
+                          {dep.status === "failed" && (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={diagnosing === dep.id}
+                              onClick={() => handleDiagnose(dep)}
+                            >
+                              {diagnosing === dep.id
+                                ? <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                                : <Activity className="h-3 w-3 mr-1" />
+                              }
+                              Diagnose
                             </Button>
                           )}
                           {(dep.status === "live" || dep.status === "failed" || dep.status === "rolled_back") && (
@@ -1014,55 +1462,190 @@ export default function ProjectPage() {
                 </div>
               ) : (
                 <>
-                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 flex items-start gap-2 text-sm text-amber-800">
-                    <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
-                    <div>
-                      <p className="font-medium">Browser-based terminal coming soon</p>
-                      <p className="text-xs mt-1">
-                        Use ECS Exec from your local machine to get a shell inside a running container. ECS Exec is enabled on all services — just install the prerequisites below.
-                      </p>
+                  <div className="flex items-center gap-3">
+                    <select
+                      value={terminalEnvId}
+                      onChange={(e) => setTerminalEnvId(e.target.value)}
+                      className="h-9 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+                    >
+                      <option value="">— select environment —</option>
+                      {readyEnvs.map((e) => (
+                        <option key={e.id} value={e.id}>{e.name} ({e.aws_region})</option>
+                      ))}
+                    </select>
+                    {terminalEnvId && (
+                      <span className="text-xs text-muted-foreground">
+                        Connecting to running ECS task via SSM…
+                      </span>
+                    )}
+                  </div>
+                  <div
+                    ref={terminalRef}
+                    className="rounded-lg overflow-hidden border border-zinc-800"
+                    style={{ height: 420, background: "#0f0f0f" }}
+                  />
+                  {!terminalEnvId && (
+                    <p className="text-xs text-muted-foreground text-center pt-2">
+                      Select an environment to open an interactive shell in the running container.
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+          </TabsContent>
+          {/* ── Webhooks ── */}
+          <TabsContent value="webhooks">
+            <div className="space-y-5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-medium">Webhooks</p>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    ConvDeploy POSTs to these URLs on deploy events. Requests are signed with HMAC-SHA256 when a secret is set.
+                  </p>
+                </div>
+                <Button size="sm" onClick={() => setHookDialog(true)}>
+                  <Plus className="h-3 w-3 mr-1" /> Add Webhook
+                </Button>
+              </div>
+
+              {loadingHooks ? (
+                <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" /> Loading…
+                </div>
+              ) : hooksList.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-16 text-center rounded-lg border border-dashed">
+                  <WebhookIcon className="h-10 w-10 text-zinc-300 mb-3" />
+                  <p className="font-medium text-sm">No webhooks configured</p>
+                  <p className="text-muted-foreground text-xs mt-1">Add a webhook to get notified on deploy events.</p>
+                </div>
+              ) : (
+                <div className="rounded-lg border bg-white overflow-hidden">
+                  {hooksList.map((hook, i) => (
+                    <div key={hook.id}>
+                      {i > 0 && <Separator />}
+                      <div className="flex items-start justify-between px-4 py-3 gap-3">
+                        <div className="min-w-0 flex-1">
+                          <p className="text-sm font-mono truncate">{hook.url}</p>
+                          <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                            {hook.events.map((ev) => (
+                              <Badge key={ev} variant="outline" className="text-xs px-1.5 py-0 font-mono">{ev}</Badge>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            onClick={() => handleToggleHook(hook)}
+                            className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border transition-colors ${
+                              hook.active
+                                ? "bg-green-50 border-green-300 text-green-700"
+                                : "bg-zinc-100 border-zinc-300 text-zinc-500"
+                            }`}
+                            title={hook.active ? "Disable webhook" : "Enable webhook"}
+                          >
+                            {hook.active
+                              ? <><CheckCircle2 className="h-3 w-3" /> Active</>
+                              : <><ZapOff className="h-3 w-3" /> Inactive</>
+                            }
+                          </button>
+                          <button
+                            onClick={() => handleDeleteHook(hook.id)}
+                            className="p-1 text-red-400 hover:text-red-600"
+                            title="Delete webhook"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      </div>
                     </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </TabsContent>
+          {/* ── Costs ── */}
+          <TabsContent value="costs">
+            <div className="space-y-5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-medium">AWS Cost Intelligence</p>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Last 30 days · ConvDeploy-managed services only · 24h data lag
+                  </p>
+                </div>
+                <Button size="sm" variant="outline" onClick={loadCosts} disabled={loadingCosts}>
+                  {loadingCosts ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5 mr-1.5" />}
+                  {costs ? "Refresh" : "Load Costs"}
+                </Button>
+              </div>
+
+              {!project.account_id ? (
+                <div className="flex flex-col items-center justify-center py-16 text-center rounded-lg border border-dashed">
+                  <Cloud className="h-10 w-10 text-zinc-300 mb-3" />
+                  <p className="font-medium text-sm">No AWS account linked</p>
+                  <p className="text-muted-foreground text-xs mt-1">Connect an AWS account to see cost data.</p>
+                </div>
+              ) : !costs ? (
+                <div className="flex flex-col items-center justify-center py-16 text-center rounded-lg border border-dashed">
+                  <DollarSign className="h-10 w-10 text-zinc-300 mb-3" />
+                  <p className="font-medium text-sm">{loadingCosts ? "Loading costs..." : "Click Load Costs to fetch data"}</p>
+                  <p className="text-muted-foreground text-xs mt-1">Requires Cost Explorer to be enabled in your AWS account.</p>
+                </div>
+              ) : (
+                <>
+                  {/* Total */}
+                  <Card>
+                    <CardContent className="flex items-center justify-between py-5">
+                      <div className="flex items-center gap-3">
+                        <div className="h-10 w-10 rounded-full bg-green-100 flex items-center justify-center">
+                          <DollarSign className="h-5 w-5 text-green-600" />
+                        </div>
+                        <div>
+                          <p className="text-xs text-muted-foreground">Total (last 30 days)</p>
+                          <p className="text-2xl font-bold">${costs.total_monthly_cost.toFixed(2)}</p>
+                        </div>
+                      </div>
+                      <div className="text-xs text-muted-foreground text-right">
+                        <p>{costs.period_start}</p>
+                        <p>→ {costs.period_end}</p>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* Per-service breakdown */}
+                  <div className="rounded-lg border bg-white overflow-hidden">
+                    {Object.entries(costs.by_service)
+                      .filter(([, v]) => v > 0.001)
+                      .sort(([, a], [, b]) => b - a)
+                      .map(([svc, amount], i, arr) => (
+                        <div key={svc}>
+                          {i > 0 && <Separator />}
+                          <div className="flex items-center justify-between px-4 py-3">
+                            <div className="min-w-0 flex-1">
+                              <p className="text-sm">{svc}</p>
+                              <div className="mt-1.5 h-1.5 bg-zinc-100 rounded-full overflow-hidden">
+                                <div
+                                  className="h-full bg-indigo-400 rounded-full"
+                                  style={{ width: `${Math.min(100, (amount / costs.total_monthly_cost) * 100)}%` }}
+                                />
+                              </div>
+                            </div>
+                            <span className="text-sm font-mono font-medium ml-4 shrink-0">
+                              ${amount.toFixed(2)}
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    {Object.values(costs.by_service).every((v) => v < 0.001) && (
+                      <p className="px-4 py-6 text-sm text-muted-foreground text-center">No costs recorded in this period.</p>
+                    )}
                   </div>
 
-                  {readyEnvs.map((env) => (
-                    <Card key={env.id}>
-                      <CardHeader>
-                        <CardTitle className="text-sm capitalize">{env.name}</CardTitle>
-                        <CardDescription className="text-xs">
-                          ECS cluster: <span className="font-mono">{env.ecs_cluster_name}</span> &nbsp;·&nbsp; Region: <span className="font-mono">{env.aws_region}</span>
-                        </CardDescription>
-                      </CardHeader>
-                      <CardContent className="space-y-3">
-                        <div>
-                          <p className="text-xs font-medium text-muted-foreground mb-1">Prerequisites (one-time setup)</p>
-                          <pre className="text-xs bg-zinc-950 text-zinc-300 rounded-lg p-3 font-mono whitespace-pre-wrap overflow-x-auto">{`# Install AWS CLI v2 and the Session Manager plugin
-# macOS:
-brew install awscli
-brew install --cask session-manager-plugin
-
-# Or download from:
-# https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html`}</pre>
-                        </div>
-                        <div>
-                          <p className="text-xs font-medium text-muted-foreground mb-1">Open a shell in your container</p>
-                          <pre className="text-xs bg-zinc-950 text-zinc-300 rounded-lg p-3 font-mono whitespace-pre-wrap overflow-x-auto">{`# Step 1: get the running task ID
-TASK=$(aws ecs list-tasks \\
-  --cluster ${env.ecs_cluster_name ?? "<cluster>"} \\
-  --region ${env.aws_region} \\
-  --query 'taskArns[0]' --output text)
-
-# Step 2: open an interactive shell
-aws ecs execute-command \\
-  --cluster ${env.ecs_cluster_name ?? "<cluster>"} \\
-  --region ${env.aws_region} \\
-  --task $TASK \\
-  --container app \\
-  --interactive \\
-  --command "/bin/sh"`}</pre>
-                        </div>
-                      </CardContent>
-                    </Card>
-                  ))}
+                  {costs.total_monthly_cost > 50 && (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 flex items-start gap-2 text-sm text-amber-800">
+                      <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                      <span>Tip: scale idle environments to 0 replicas to eliminate compute costs while keeping infrastructure in place.</span>
+                    </div>
+                  )}
                 </>
               )}
             </div>

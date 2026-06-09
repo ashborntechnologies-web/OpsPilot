@@ -21,6 +21,8 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
 	githubsvc "github.com/ashborntechnologies-web/OpsPilot/internal/github"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/queue"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/terminal"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/webhooks"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	pkgws "github.com/ashborntechnologies-web/OpsPilot/pkg/ws"
@@ -129,7 +131,9 @@ func main() {
 	eventSvc := events.NewService(db)
 	awsSvc.SetEvents(eventSvc) // enable account-level audit events (e.g. external_id.generated)
 	envVarSvc := envvars.NewService(db)
-	deploySvc := deploy.NewService(db, awsSvc, githubSvc, hub, queueClient, eventSvc, envVarSvc)
+	webhookSvc := webhooks.NewService(db)
+	terminalSvc := terminal.NewService(db, awsSvc, authSvc)
+	deploySvc := deploy.NewService(db, awsSvc, githubSvc, hub, queueClient, eventSvc, envVarSvc, webhookSvc)
 
 	// After an environment is created with a linked AWS account, auto-trigger provisioning.
 	awsSvc.SetOnEnvCreated(func(projectID, environmentID uuid.UUID) {
@@ -228,6 +232,16 @@ func main() {
 		proj.PUT("/environments/:envId/env-vars", envVarSvc.HandleUpsert)
 		proj.DELETE("/environments/:envId/env-vars/:varId", envVarSvc.HandleDelete)
 
+		// Health check + scaling
+		proj.GET("/environments/:envId/health", deploySvc.HandleCheckHealth)
+		proj.POST("/environments/:envId/scale", deploySvc.HandleScaleService)
+
+		// Webhooks
+		proj.GET("/webhooks", webhookSvc.HandleList)
+		proj.POST("/webhooks", webhookSvc.HandleCreate)
+		proj.PATCH("/webhooks/:webhookId", webhookSvc.HandleUpdate)
+		proj.DELETE("/webhooks/:webhookId", webhookSvc.HandleDelete)
+
 		// Deployments
 		proj.POST("/environments/:envId/deploy", deployRL.Middleware(), deploySvc.HandleDeploy)
 		proj.GET("/deployments", deploySvc.HandleListDeployments)
@@ -241,16 +255,29 @@ func main() {
 		// Diagnosis
 		proj.GET("/deployments/:deployId/diagnose", diagnosisSvc.HandleDiagnose)
 
+		// Cost intelligence
+		proj.GET("/costs", deploySvc.HandleGetCosts)
+
+		// PR Preview Environments
+		proj.POST("/previews/enable", deploySvc.HandleEnablePreviews)
+		proj.POST("/previews/disable", deploySvc.HandleDisablePreviews)
+
 		// Conversation (REST fallback — primary is WebSocket)
 		proj.POST("/conversation", conversationRL.Middleware(), conversationSvc.HandleMessage)
 		proj.GET("/conversation/history", conversationSvc.HandleHistory)
 	}
+
+	// GitHub webhook — public; authentication via HMAC-SHA256 signature.
+	v1.POST("/github/webhook", deploySvc.HandleGithubWebhook)
 
 	// WebSocket — outside the auth middleware; auth + project-ownership are verified
 	// via the first-message token (see wsAuthFn).
 	v1.GET("/ws/:projectId", func(c *gin.Context) {
 		hub.HandleUpgrade(c, wsAuthFn, conversationSvc)
 	})
+
+	// Terminal WebSocket — auth via first-message token (browsers cannot set custom headers).
+	v1.GET("/ws/:projectId/terminal/:envId", terminalSvc.HandleTerminal)
 
 	// Start server
 	port := os.Getenv("PORT")

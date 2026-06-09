@@ -27,18 +27,22 @@ type AWSAccount struct {
 }
 
 type Project struct {
-	ID           uuid.UUID  `json:"id" db:"id"`
-	UserID       uuid.UUID  `json:"user_id" db:"user_id"`
-	Name         string     `json:"name" db:"name"`
-	RepoURL      string     `json:"repo_url" db:"repo_url"`
-	RepoOwner    string     `json:"repo_owner" db:"repo_owner"`
-	RepoName     string     `json:"repo_name" db:"repo_name"`
-	Framework    string     `json:"framework" db:"framework"`
-	Branch       *string    `json:"branch" db:"branch"`               // nil = default branch
-	StartCommand *string    `json:"start_command" db:"start_command"` // user-specified entry command
-	AccountID    *uuid.UUID `json:"account_id" db:"account_id"`
-	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at" db:"updated_at"`
+	ID                   uuid.UUID  `json:"id" db:"id"`
+	UserID               uuid.UUID  `json:"user_id" db:"user_id"`
+	Name                 string     `json:"name" db:"name"`
+	RepoURL              string     `json:"repo_url" db:"repo_url"`
+	RepoOwner            string     `json:"repo_owner" db:"repo_owner"`
+	RepoName             string     `json:"repo_name" db:"repo_name"`
+	Framework            string     `json:"framework" db:"framework"`
+	Branch               *string    `json:"branch" db:"branch"`
+	StartCommand         *string    `json:"start_command" db:"start_command"`
+	AccountID            *uuid.UUID `json:"account_id" db:"account_id"`
+	GithubWebhookID      *int64     `json:"github_webhook_id,omitempty" db:"github_webhook_id"`
+	GithubWebhookSecret  string     `json:"-" db:"github_webhook_secret"` // never exposed
+	CreatedAt            time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at" db:"updated_at"`
+	// PreviewsEnabled is derived (true when GithubWebhookID is non-nil).
+	PreviewsEnabled bool `json:"previews_enabled" db:"-"`
 }
 
 // PlatformStack represents the shared infrastructure (VPC, ECS cluster, ALB) provisioned
@@ -89,6 +93,13 @@ type Environment struct {
 	ECSClusterName     *string `json:"ecs_cluster_name" db:"ecs_cluster_name"`
 	ECSSecurityGroupID *string `json:"ecs_security_group_id" db:"ecs_security_group_id"`
 	VPCSubnets         *string `json:"vpc_subnets" db:"vpc_subnets"`
+
+	// PR preview fields — only set when IsPreview = true.
+	IsPreview          bool    `json:"is_preview" db:"is_preview"`
+	PRNumber           *int    `json:"pr_number,omitempty" db:"pr_number"`
+	PRBranch           *string `json:"pr_branch,omitempty" db:"pr_branch"`
+	PRHeadSHA          *string `json:"pr_head_sha,omitempty" db:"pr_head_sha"`
+	GithubPRCommentID  *int64  `json:"github_pr_comment_id,omitempty" db:"github_pr_comment_id"`
 
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
@@ -183,15 +194,37 @@ const (
 
 // Intent constants (conversation engine)
 const (
-	IntentDeploy   = "deploy"
-	IntentRedeploy = "redeploy"
-	IntentRollback = "rollback"
-	IntentScale    = "scale"
-	IntentLogs     = "logs"
-	IntentHealth   = "health"
-	IntentDiagnose = "diagnose"
-	IntentUnknown  = "unknown"
+	IntentDeploy          = "deploy"
+	IntentRedeploy        = "redeploy"
+	IntentRollback        = "rollback"
+	IntentScale           = "scale"
+	IntentLogs            = "logs"
+	IntentHealth          = "health"
+	IntentDiagnose        = "diagnose"
+	IntentCost            = "cost"
+	IntentChangeResources = "change_resources"
+	IntentConfirm         = "confirm"
+	IntentUnknown         = "unknown"
 )
+
+// CostSummary holds a 30-day cost breakdown for a project's AWS account.
+type CostSummary struct {
+	TotalMonthlyCost float64            `json:"total_monthly_cost"`
+	ByService        map[string]float64 `json:"by_service"`
+	Currency         string             `json:"currency"`
+	PeriodStart      string             `json:"period_start"`
+	PeriodEnd        string             `json:"period_end"`
+}
+
+// MutationProposal holds a pending infra change waiting for user confirmation.
+type MutationProposal struct {
+	ProjectID uuid.UUID `json:"project_id"`
+	EnvName   string    `json:"env_name"`
+	CPU       string    `json:"cpu"`
+	Memory    string    `json:"memory"`
+	CurrentCPU    string `json:"current_cpu"`
+	CurrentMemory string `json:"current_memory"`
+}
 
 // EnvVar is a key/value environment variable scoped to a specific environment. It is
 // injected into the ECS task definition at deploy time. Secret values (is_secret=true)
@@ -205,6 +238,24 @@ type EnvVar struct {
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
+
+type Webhook struct {
+	ID        uuid.UUID `json:"id"`
+	ProjectID uuid.UUID `json:"project_id"`
+	URL       string    `json:"url"`
+	Secret    string    `json:"-"` // never returned in JSON; used only for HMAC signing
+	Events    []string  `json:"events"`
+	Active    bool      `json:"active"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// WebhookEvent constants
+const (
+	WebhookEventDeployStarted   = "deploy.started"
+	WebhookEventDeploySucceeded = "deploy.succeeded"
+	WebhookEventDeployFailed    = "deploy.failed"
+)
 
 // OperationalEvent is a structured record of a meaningful platform state transition.
 // AI reasons over these events rather than raw log text.

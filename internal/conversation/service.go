@@ -28,12 +28,20 @@ Classify the user's message into exactly one of these intents:
 - logs: user wants to view logs
 - health: user wants to check deployment health or status
 - diagnose: user wants to understand why something failed or what went wrong
+- cost: user wants to know about costs, AWS spending, or monthly bills
+- change_resources: user wants to change CPU, memory, or compute resources for their service
+- confirm: user is confirming a previously proposed action (yes, confirm, ok, apply, do it, go ahead, proceed)
 - unknown: anything else
 
 Respond with ONLY a JSON object in this exact format:
 {"intent": "<intent>", "confidence": "<high|medium|low>", "params": {}}
 
 For scale intent, extract replica count into params: {"replicas": 3}
+For change_resources intent, extract cpu and memory in Fargate units into params:
+  {"cpu": "1024", "memory": "2048"}
+  Valid CPU values: 256, 512, 1024, 2048, 4096
+  Valid memory values must be compatible with chosen CPU (e.g. 512 CPU → 1024 or 2048 MB)
+  If the user says "2 vCPU" that is cpu=2048; "4 GB" that is memory=4096
 For rollback, extract deployment reference if mentioned: {"deployment_id": "..."}
 Never include any other text.`
 
@@ -179,8 +187,25 @@ func (s *Service) ProcessMessage(ctx context.Context, projectID uuid.UUID, userI
 		response, err = s.deploySvc.ScaleService(ctx, projectID, replicas)
 	case models.IntentDiagnose:
 		response, err = s.diagnosisSvc.DiagnoseProject(ctx, projectID)
+	case models.IntentCost:
+		response, err = s.deploySvc.GetCostSummary(ctx, projectID)
+	case models.IntentChangeResources:
+		cpu, memory := "", ""
+		if v, ok := intent.Params["cpu"]; ok {
+			if s, ok := v.(string); ok {
+				cpu = s
+			}
+		}
+		if v, ok := intent.Params["memory"]; ok {
+			if s, ok := v.(string); ok {
+				memory = s
+			}
+		}
+		response, err = s.deploySvc.ProposeResourceChange(ctx, projectID, userID, cpu, memory)
+	case models.IntentConfirm:
+		response, err = s.deploySvc.ApplyPendingMutation(ctx, projectID, userID)
 	default:
-		response = "I can help you deploy, rollback, scale, check logs, or diagnose issues. What would you like to do?"
+		response = "I can help you deploy, rollback, scale, check logs, diagnose issues, view costs, or change compute resources. What would you like to do?"
 	}
 
 	if err != nil {

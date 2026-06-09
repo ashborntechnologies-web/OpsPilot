@@ -66,6 +66,8 @@ Resources:
                   - ecr:PutLifecyclePolicy
                   - ecr:TagResource
                   - ecr:ListTagsForResource
+                  - ecr:ListImages
+                  - ecr:BatchDeleteImage
                 Resource: '*'
               - Sid: ECS
                 Effect: Allow
@@ -83,6 +85,15 @@ Resources:
                   - ecs:ListTasks
                   - ecs:DescribeTasks
                   - ecs:TagResource
+                  - ecs:ExecuteCommand
+                Resource: '*'
+              - Sid: SSMMessages
+                Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
                 Resource: '*'
               - Sid: CodeBuild
                 Effect: Allow
@@ -198,6 +209,12 @@ Resources:
                   - ssm:GetParameter
                   - ssm:DeleteParameter
                 Resource: !Sub 'arn:aws:ssm:*:${AWS::AccountId}:parameter/convdeploy/*'
+              - Sid: CostExplorer
+                Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetCostForecast
+                Resource: '*'
 
 Outputs:
   RoleArn:

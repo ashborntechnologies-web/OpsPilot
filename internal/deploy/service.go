@@ -2,17 +2,22 @@ package deploy
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	awssvc "github.com/ashborntechnologies-web/OpsPilot/internal/aws"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/envvars"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
 	githubsvc "github.com/ashborntechnologies-web/OpsPilot/internal/github"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/webhooks"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/ws"
@@ -51,17 +56,38 @@ type Enqueuer interface {
 }
 
 type Service struct {
-	db        *models.DB
-	awsSvc    *awssvc.Service
-	githubSvc *githubsvc.Service
-	hub       *ws.Hub
-	enqueuer  Enqueuer
-	events    *events.Service
-	envVars   *envvars.Service
+	db          *models.DB
+	awsSvc      *awssvc.Service
+	githubSvc   *githubsvc.Service
+	hub         *ws.Hub
+	enqueuer    Enqueuer
+	events      *events.Service
+	envVars     *envvars.Service
+	webhooksSvc *webhooks.Service
+
+	// pendingMutations holds infra changes proposed via chat that are waiting for confirmation.
+	// Keyed by projectID; TTL of 10 minutes enforced at read time.
+	pendingMutations map[uuid.UUID]*pendingMutation
+	mutationMu       sync.Mutex
 }
 
-func NewService(db *models.DB, awsSvc *awssvc.Service, githubSvc *githubsvc.Service, hub *ws.Hub, enqueuer Enqueuer, eventSvc *events.Service, envVarSvc *envvars.Service) *Service {
-	return &Service{db: db, awsSvc: awsSvc, githubSvc: githubSvc, hub: hub, enqueuer: enqueuer, events: eventSvc, envVars: envVarSvc}
+type pendingMutation struct {
+	proposal  *models.MutationProposal
+	proposedAt time.Time
+}
+
+func NewService(db *models.DB, awsSvc *awssvc.Service, githubSvc *githubsvc.Service, hub *ws.Hub, enqueuer Enqueuer, eventSvc *events.Service, envVarSvc *envvars.Service, webhookSvc *webhooks.Service) *Service {
+	return &Service{
+		db:               db,
+		awsSvc:           awsSvc,
+		githubSvc:        githubSvc,
+		hub:              hub,
+		enqueuer:         enqueuer,
+		events:           eventSvc,
+		envVars:          envVarSvc,
+		webhooksSvc:      webhookSvc,
+		pendingMutations: make(map[uuid.UUID]*pendingMutation),
+	}
 }
 
 // ---- HTTP handlers ----
@@ -458,6 +484,14 @@ func (s *Service) RunDeployWorkflow(ctx context.Context, projectID, environmentI
 		Type:          models.EventDeployStarted,
 		Payload:       map[string]any{"commit_sha": deployment.CommitSHA, "image_uri": imageURI},
 	})
+	if s.webhooksSvc != nil {
+		commitMsg := ""
+		if deployment.CommitMessage != nil {
+			commitMsg = *deployment.CommitMessage
+		}
+		s.webhooksSvc.FireEvent(projectID, models.WebhookEventDeployStarted,
+			webhooks.BuildPayload(projectID.String(), project.Name, env.Name, deploymentID.String(), deployment.CommitSHA, commitMsg))
+	}
 
 	// Step 1 — build
 	s.updateDeploymentStatus(ctx, deploymentID, models.DeployStatusBuilding, nil, nil)
@@ -630,6 +664,15 @@ func (s *Service) RunDeployWorkflow(ctx context.Context, projectID, environmentI
 		liveMsg = fmt.Sprintf("Deployment live! Commit `%s` is running at http://%s", deployment.CommitSHA[:8], *env.ALBDNS)
 	}
 	s.broadcast(projectID, ws.Message{Type: "deploy_done", Payload: liveMsg})
+
+	if s.webhooksSvc != nil {
+		commitMsg := ""
+		if deployment.CommitMessage != nil {
+			commitMsg = *deployment.CommitMessage
+		}
+		s.webhooksSvc.FireEvent(projectID, models.WebhookEventDeploySucceeded,
+			webhooks.BuildPayload(projectID.String(), project.Name, env.Name, deploymentID.String(), deployment.CommitSHA, commitMsg))
+	}
 
 	return nil
 }
@@ -1368,6 +1411,122 @@ func (s *Service) HandleGetLogs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"lines": logs, "log_group": *env.LogGroupName})
 }
 
+// HandleCheckHealth returns ECS service health for a specific environment.
+func (s *Service) HandleCheckHealth(c *gin.Context) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+		return
+	}
+	envID, err := uuid.Parse(c.Param("envId"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid environment id"})
+		return
+	}
+
+	env, err := s.getEnvironmentByID(c.Request.Context(), envID)
+	if err != nil || env.ProjectID != projectID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "environment not found"})
+		return
+	}
+	if env.ECSServiceName == nil {
+		c.JSON(http.StatusOK, gin.H{"status": "not_deployed", "running": 0, "desired": 0, "pending": 0})
+		return
+	}
+
+	clusterName, _, _, _, err := s.resolveNetworking(c.Request.Context(), env)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve cluster: " + err.Error()})
+		return
+	}
+
+	clients, err := s.awsSvc.AssumeRoleForEnvironment(c.Request.Context(), env)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to AWS: " + err.Error()})
+		return
+	}
+
+	h, err := s.awsSvc.DescribeECSService(c.Request.Context(), clients, clusterName, *env.ECSServiceName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	status := "healthy"
+	if h.RunningCount < h.DesiredCount {
+		status = "degraded"
+	}
+	if h.RunningCount == 0 && h.DesiredCount > 0 {
+		status = "down"
+	}
+
+	resp := gin.H{
+		"status":  status,
+		"running": h.RunningCount,
+		"desired": h.DesiredCount,
+		"pending": h.PendingCount,
+	}
+	if env.ALBDNS != nil {
+		resp["url"] = "http://" + *env.ALBDNS
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// HandleScaleService updates the ECS desired count for a specific environment.
+func (s *Service) HandleScaleService(c *gin.Context) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+		return
+	}
+	envID, err := uuid.Parse(c.Param("envId"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid environment id"})
+		return
+	}
+
+	var body struct {
+		Replicas int `json:"replicas"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "replicas required"})
+		return
+	}
+	if body.Replicas < 0 || body.Replicas > 10 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "replicas must be between 0 and 10"})
+		return
+	}
+
+	env, err := s.getEnvironmentByID(c.Request.Context(), envID)
+	if err != nil || env.ProjectID != projectID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "environment not found"})
+		return
+	}
+	if env.ECSServiceName == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "environment not yet deployed"})
+		return
+	}
+
+	clusterName, _, _, _, err := s.resolveNetworking(c.Request.Context(), env)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve cluster: " + err.Error()})
+		return
+	}
+
+	clients, err := s.awsSvc.AssumeRoleForEnvironment(c.Request.Context(), env)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to AWS: " + err.Error()})
+		return
+	}
+
+	if err := s.awsSvc.UpdateServiceDesiredCount(c.Request.Context(), clients, clusterName, *env.ECSServiceName, int32(body.Replicas)); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("Scaling %s to %d replica(s)", env.Name, body.Replicas)})
+}
+
 // ---- private DB helpers ----
 
 func (s *Service) getProject(ctx context.Context, projectID uuid.UUID) (*models.Project, error) {
@@ -1551,6 +1710,10 @@ func (s *Service) updateDeploymentStatus(ctx context.Context, deploymentID uuid.
 func (s *Service) failDeployment(ctx context.Context, projectID, deploymentID uuid.UUID, reason string) error {
 	s.updateDeploymentStatus(ctx, deploymentID, models.DeployStatusFailed, &reason, nil)
 	s.broadcast(projectID, ws.Message{Type: "deploy_failed", Payload: reason})
+	if s.webhooksSvc != nil {
+		s.webhooksSvc.FireEvent(projectID, models.WebhookEventDeployFailed,
+			webhooks.BuildPayload(projectID.String(), "", "", deploymentID.String(), "", reason))
+	}
 	return fmt.Errorf("%s", reason)
 }
 
@@ -1579,3 +1742,557 @@ func (s *Service) resolveNetworking(ctx context.Context, env *models.Environment
 	}
 	return *env.ECSClusterName, strings.Split(*env.VPCSubnets, ","), *env.ECSSecurityGroupID, nil, nil
 }
+
+// ---- Cost Intelligence ----
+
+// HandleGetCosts returns the last-30-day AWS cost breakdown for the project's linked account.
+func (s *Service) HandleGetCosts(c *gin.Context) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+		return
+	}
+	summary, err := s.awsSvc.GetAccountCostSummary(c.Request.Context(), projectID.String())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, summary)
+}
+
+// GetCostSummary is called by the conversation service to produce a human-readable cost summary.
+func (s *Service) GetCostSummary(ctx context.Context, projectID uuid.UUID) (string, error) {
+	summary, err := s.awsSvc.GetAccountCostSummary(ctx, projectID.String())
+	if err != nil {
+		return "", fmt.Errorf("couldn't retrieve cost data: %w", err)
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Your ConvDeploy infrastructure has cost **$%.2f** over the last 30 days:\n\n", summary.TotalMonthlyCost))
+	for svc, cost := range summary.ByService {
+		if cost > 0.001 {
+			sb.WriteString(fmt.Sprintf("- **%s**: $%.2f\n", svc, cost))
+		}
+	}
+	if summary.TotalMonthlyCost < 1 {
+		sb.WriteString("\nLooks like costs are very low — everything is running lean.")
+	} else if summary.TotalMonthlyCost > 100 {
+		sb.WriteString("\nTip: if any environments are idle, scaling to 0 replicas will eliminate compute costs while keeping infrastructure in place.")
+	}
+	return sb.String(), nil
+}
+
+// ---- Conversational Infrastructure Mutations ----
+
+// ProposeResourceChange classifies the requested CPU/memory change, shows the diff, and stores
+// a pending mutation keyed by projectID. The user must confirm with "yes" to apply.
+func (s *Service) ProposeResourceChange(ctx context.Context, projectID, userID uuid.UUID, cpu, memory string) (string, error) {
+	if cpu == "" && memory == "" {
+		return "Please specify the CPU and/or memory you'd like — e.g. \"set to 2 vCPU and 4 GB memory\".", nil
+	}
+
+	env, err := s.getDeployableEnvironment(ctx, projectID)
+	if err != nil {
+		return "No ready environment found to update.", nil
+	}
+
+	clients, err := s.awsSvc.AssumeRoleForEnvironment(ctx, env)
+	if err != nil {
+		return "Failed to connect to AWS.", err
+	}
+
+	clusterName, _, _, _, err := s.resolveNetworking(ctx, env)
+	if err != nil {
+		return "Couldn't resolve environment networking.", err
+	}
+	if env.ECSServiceName == nil {
+		return "No ECS service found for this environment.", nil
+	}
+
+	currentCPU, currentMem, err := s.awsSvc.GetCurrentTaskResources(ctx, clients, clusterName, *env.ECSServiceName)
+	if err != nil {
+		currentCPU, currentMem = "unknown", "unknown"
+	}
+
+	// Fill defaults if only one dimension was specified.
+	if cpu == "" {
+		cpu = currentCPU
+	}
+	if memory == "" {
+		memory = currentMem
+	}
+
+	proposal := &models.MutationProposal{
+		ProjectID:     projectID,
+		EnvName:       env.Name,
+		CPU:           cpu,
+		Memory:        memory,
+		CurrentCPU:    currentCPU,
+		CurrentMemory: currentMem,
+	}
+
+	s.mutationMu.Lock()
+	s.pendingMutations[projectID] = &pendingMutation{proposal: proposal, proposedAt: time.Now()}
+	s.mutationMu.Unlock()
+
+	return fmt.Sprintf(
+		"I'll update **%s** from %s CPU / %s MB → **%s CPU / %s MB**. This triggers a rolling restart (~30s downtime window).\n\nReply **confirm** to apply, or anything else to cancel.",
+		env.Name, currentCPU, currentMem, cpu, memory,
+	), nil
+}
+
+// ApplyPendingMutation executes the most recently proposed infra change for the project.
+func (s *Service) ApplyPendingMutation(ctx context.Context, projectID, userID uuid.UUID) (string, error) {
+	s.mutationMu.Lock()
+	pm, ok := s.pendingMutations[projectID]
+	if ok {
+		delete(s.pendingMutations, projectID)
+	}
+	s.mutationMu.Unlock()
+
+	if !ok || time.Since(pm.proposedAt) > 10*time.Minute {
+		return "No pending change to confirm (it may have expired). Propose a new change first.", nil
+	}
+
+	p := pm.proposal
+	env, err := s.getEnvironment(ctx, projectID, p.EnvName)
+	if err != nil {
+		return "", fmt.Errorf("environment not found: %w", err)
+	}
+
+	project, err := s.getProject(ctx, projectID)
+	if err != nil {
+		return "", fmt.Errorf("project not found: %w", err)
+	}
+
+	clients, err := s.awsSvc.AssumeRoleForEnvironment(ctx, env)
+	if err != nil {
+		return "", fmt.Errorf("failed to assume role: %w", err)
+	}
+
+	// Use the latest live image.
+	var imageURI string
+	s.db.Pool.QueryRow(ctx,
+		`SELECT image_uri FROM deployments WHERE environment_id = $1 AND status = 'live' ORDER BY created_at DESC LIMIT 1`,
+		env.ID,
+	).Scan(&imageURI)
+	if imageURI == "" {
+		return "No live deployment found to base the update on — deploy first.", nil
+	}
+
+	if err := s.awsSvc.UpdateServiceResources(ctx, clients, env, project, imageURI, p.CPU, p.Memory); err != nil {
+		return "", fmt.Errorf("failed to apply resource change: %w", err)
+	}
+
+	return fmt.Sprintf("Done! **%s** is updating to %s CPU / %s MB. The rolling restart will complete in ~30–60 seconds.", p.EnvName, p.CPU, p.Memory), nil
+}
+
+// ---- PR Preview Environments ----
+
+// HandleEnablePreviews registers a GitHub webhook on the project repo and stores the
+// webhook ID + secret in the project record. Safe to call multiple times (idempotent via delete+re-register).
+func (s *Service) HandleEnablePreviews(c *gin.Context) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+		return
+	}
+
+	project, err := s.getProject(c.Request.Context(), projectID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
+		return
+	}
+
+	token, err := s.githubSvc.GetTokenForDeployment(c.Request.Context(), project.UserID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "GitHub not connected"})
+		return
+	}
+
+	// Generate a fresh webhook secret.
+	secretBytes := make([]byte, 20)
+	rand.Read(secretBytes)
+	secret := hex.EncodeToString(secretBytes)
+
+	webhookURL := c.GetHeader("X-Forwarded-Proto") + "://" + c.Request.Host + "/api/v1/github/webhook"
+	// Fallback for local dev.
+	if webhookURL == "://" + c.Request.Host + "/api/v1/github/webhook" {
+		webhookURL = "http://" + c.Request.Host + "/api/v1/github/webhook"
+	}
+
+	// Delete old hook if present.
+	if project.GithubWebhookID != nil {
+		s.githubSvc.DeleteRepoWebhook(c.Request.Context(), token, project.RepoOwner, project.RepoName, *project.GithubWebhookID)
+	}
+
+	hookID, err := s.githubSvc.RegisterRepoWebhook(c.Request.Context(), token, project.RepoOwner, project.RepoName, webhookURL, secret)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register webhook: " + err.Error()})
+		return
+	}
+
+	_, err = s.db.Pool.Exec(c.Request.Context(),
+		`UPDATE projects SET github_webhook_id = $1, github_webhook_secret = $2, updated_at = NOW() WHERE id = $3`,
+		hookID, secret, projectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save webhook"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "PR preview environments enabled", "webhook_id": hookID})
+}
+
+// HandleDisablePreviews removes the GitHub webhook and clears webhook fields on the project.
+func (s *Service) HandleDisablePreviews(c *gin.Context) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+		return
+	}
+
+	var webhookID *int64
+	var webhookSecret, repoOwner, repoName string
+	var userID uuid.UUID
+	s.db.Pool.QueryRow(c.Request.Context(),
+		`SELECT user_id, repo_owner, repo_name, github_webhook_id, github_webhook_secret FROM projects WHERE id = $1`,
+		projectID,
+	).Scan(&userID, &repoOwner, &repoName, &webhookID, &webhookSecret)
+
+	if webhookID != nil {
+		token, _ := s.githubSvc.GetTokenForDeployment(c.Request.Context(), userID)
+		if token != "" {
+			s.githubSvc.DeleteRepoWebhook(c.Request.Context(), token, repoOwner, repoName, *webhookID)
+		}
+	}
+
+	s.db.Pool.Exec(c.Request.Context(),
+		`UPDATE projects SET github_webhook_id = NULL, github_webhook_secret = '', updated_at = NOW() WHERE id = $1`,
+		projectID,
+	)
+
+	c.JSON(http.StatusOK, gin.H{"message": "PR preview environments disabled"})
+}
+
+// HandleGithubWebhook receives GitHub pull_request events, verifies the HMAC signature,
+// and dispatches to the preview lifecycle handler.
+func (s *Service) HandleGithubWebhook(c *gin.Context) {
+	event := c.GetHeader("X-GitHub-Event")
+	if event == "" {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+
+	body, err := c.GetRawData()
+	if err != nil {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+
+	if event != "pull_request" {
+		c.Status(http.StatusNoContent)
+		return
+	}
+
+	var payload githubsvc.PREvent
+	if err := json.Unmarshal(body, &payload); err != nil { //nolint:all
+		c.Status(http.StatusBadRequest)
+		return
+	}
+
+	// Find the project that owns this repo.
+	var projectID uuid.UUID
+	var webhookSecret string
+	var userID uuid.UUID
+	err = s.db.Pool.QueryRow(c.Request.Context(),
+		`SELECT id, user_id, github_webhook_secret FROM projects
+		 WHERE repo_owner = $1 AND repo_name = $2 AND github_webhook_id IS NOT NULL
+		 LIMIT 1`,
+		payload.Repository.Owner.Login, payload.Repository.Name,
+	).Scan(&projectID, &userID, &webhookSecret)
+	if err != nil {
+		// Unknown repo or previews not enabled — silently accept.
+		c.Status(http.StatusNoContent)
+		return
+	}
+
+	// Verify signature.
+	sig := c.GetHeader("X-Hub-Signature-256")
+	if !githubsvc.VerifyWebhookSignature(body, sig, webhookSecret) {
+		c.Status(http.StatusUnauthorized)
+		return
+	}
+
+	go s.handlePREvent(context.Background(), projectID, userID, &payload)
+	c.Status(http.StatusNoContent)
+}
+
+// handlePREvent dispatches PR lifecycle actions in a background goroutine.
+func (s *Service) handlePREvent(ctx context.Context, projectID, userID uuid.UUID, event *githubsvc.PREvent) {
+	switch event.Action {
+	case "opened", "reopened", "synchronize":
+		s.handlePROpenedOrSync(ctx, projectID, userID, event)
+	case "closed":
+		s.handlePRClosed(ctx, projectID, event)
+	}
+}
+
+// handlePROpenedOrSync creates or updates a preview environment and triggers a deploy.
+func (s *Service) handlePROpenedOrSync(ctx context.Context, projectID, userID uuid.UUID, event *githubsvc.PREvent) {
+	prNum := event.Number
+	prBranch := event.PullRequest.Head.Ref
+	prSHA := event.PullRequest.Head.SHA
+
+	project, err := s.getProject(ctx, projectID)
+	if err != nil {
+		log.Printf("[preview] project %s not found: %v", projectID, err)
+		return
+	}
+	if project.AccountID == nil {
+		return // no AWS account linked — skip
+	}
+
+	// Need a ready staging env to share infra with.
+	stagingEnv, err := s.getEnvironment(ctx, projectID, "staging")
+	if err != nil || stagingEnv.StackStatus != models.StackStatusReady {
+		log.Printf("[preview] no ready staging env for project %s", projectID)
+		return
+	}
+
+	// Upsert the preview environment record.
+	var previewEnvID uuid.UUID
+	err = s.db.Pool.QueryRow(ctx, `
+		INSERT INTO environments (project_id, name, aws_region, account_id, platform_stack_id,
+			cloudformation_stack_id, stack_status, alb_dns,
+			ecr_repo_uri, codebuild_project_name, task_execution_role_arn, log_group_name,
+			ecs_security_group_id, vpc_subnets,
+			is_preview, pr_number, pr_branch, pr_head_sha)
+		VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $10, $11, $12, $13, true, $14, $15, $16)
+		ON CONFLICT (project_id, pr_number) WHERE is_preview = true
+		DO UPDATE SET pr_head_sha = EXCLUDED.pr_head_sha, pr_branch = EXCLUDED.pr_branch,
+		              stack_status = 'pending', updated_at = NOW()
+		RETURNING id`,
+		projectID,
+		fmt.Sprintf("pr-%d", prNum),
+		stagingEnv.AWSRegion,
+		stagingEnv.AccountID,
+		stagingEnv.PlatformStackID,
+		stagingEnv.CloudFormationStackID,
+		stagingEnv.ALBDNS,
+		stagingEnv.ECRRepoURI,
+		stagingEnv.CodeBuildProjectName,
+		stagingEnv.TaskExecutionRoleARN,
+		stagingEnv.LogGroupName,
+		stagingEnv.ECSSecurityGroupID,
+		stagingEnv.VPCSubnets,
+		prNum, prBranch, prSHA,
+	).Scan(&previewEnvID)
+	if err != nil {
+		log.Printf("[preview] failed to upsert preview env: %v", err)
+		return
+	}
+
+	// Post initial PR comment.
+	token, _ := s.githubSvc.GetTokenForDeployment(ctx, userID)
+	commentBody := fmt.Sprintf("🚀 **ConvDeploy** is building a preview for this PR...\n\n*Commit: `%s`*", prSHA[:8])
+	var commentID int64
+	if token != "" {
+		commentID, _ = s.githubSvc.CreatePRComment(ctx, token, project.RepoOwner, project.RepoName, prNum, commentBody)
+		if commentID > 0 {
+			s.db.Pool.Exec(ctx, `UPDATE environments SET github_pr_comment_id = $1 WHERE id = $2`, commentID, previewEnvID)
+		}
+	}
+
+	// Create a deployment record for the PR SHA.
+	var depID uuid.UUID
+	s.db.Pool.QueryRow(ctx,
+		`INSERT INTO deployments (project_id, environment_id, commit_sha, commit_message, status)
+		 VALUES ($1, $2, $3, $4, 'pending') RETURNING id`,
+		projectID, previewEnvID,
+		prSHA,
+		fmt.Sprintf("PR #%d: %s", prNum, prBranch),
+	).Scan(&depID)
+	if depID == uuid.Nil {
+		return
+	}
+
+	// Run the preview deploy (blocking, called in goroutine already).
+	if err := s.runPreviewDeployWorkflow(ctx, projectID, previewEnvID, depID, prSHA); err != nil {
+		log.Printf("[preview] deploy failed for PR #%d: %v", prNum, err)
+		if token != "" && commentID > 0 {
+			s.githubSvc.UpdatePRComment(ctx, token, project.RepoOwner, project.RepoName, commentID,
+				fmt.Sprintf("❌ **ConvDeploy** preview build failed for PR #%d.\n\n```\n%s\n```", prNum, err.Error()))
+		}
+		return
+	}
+
+	// Reload preview env to get ALB DNS and listener rule ARN.
+	var albDNS *string
+	s.db.Pool.QueryRow(ctx, `SELECT alb_dns FROM environments WHERE id = $1`, previewEnvID).Scan(&albDNS)
+	previewURL := ""
+	if albDNS != nil {
+		previewURL = fmt.Sprintf("http://%s/pr-%d/", *albDNS, prNum)
+	}
+
+	if token != "" && commentID > 0 {
+		body := fmt.Sprintf("✅ **Preview environment ready!**\n\n🔗 [Open Preview](%s)\n\n`%s` · PR #%d",
+			previewURL, prSHA[:8], prNum)
+		s.githubSvc.UpdatePRComment(ctx, token, project.RepoOwner, project.RepoName, commentID, body)
+	}
+}
+
+// handlePRClosed tears down the preview environment and updates the PR comment.
+func (s *Service) handlePRClosed(ctx context.Context, projectID uuid.UUID, event *githubsvc.PREvent) {
+	prNum := event.Number
+
+	var previewEnv models.Environment
+	var commentID *int64
+	err := s.db.Pool.QueryRow(ctx, `
+		SELECT id, project_id, name, aws_region, account_id, platform_stack_id,
+		       cloudformation_stack_id, stack_status, alb_dns,
+		       ecr_repo_uri, ecs_cluster_name, ecs_service_name,
+		       codebuild_project_name, task_execution_role_arn, log_group_name,
+		       alb_target_group_arn, alb_listener_rule_arn, ecs_security_group_id, vpc_subnets,
+		       github_pr_comment_id, created_at, updated_at
+		FROM environments
+		WHERE project_id = $1 AND pr_number = $2 AND is_preview = true`,
+		projectID, prNum,
+	).Scan(
+		&previewEnv.ID, &previewEnv.ProjectID, &previewEnv.Name, &previewEnv.AWSRegion,
+		&previewEnv.AccountID, &previewEnv.PlatformStackID,
+		&previewEnv.CloudFormationStackID, &previewEnv.StackStatus, &previewEnv.ALBDNS,
+		&previewEnv.ECRRepoURI, &previewEnv.ECSClusterName, &previewEnv.ECSServiceName,
+		&previewEnv.CodeBuildProjectName, &previewEnv.TaskExecutionRoleARN, &previewEnv.LogGroupName,
+		&previewEnv.ALBTargetGroupARN, &previewEnv.ALBListenerRuleARN, &previewEnv.ECSSecurityGroupID, &previewEnv.VPCSubnets,
+		&commentID, &previewEnv.CreatedAt, &previewEnv.UpdatedAt,
+	)
+	if err != nil {
+		return // no preview env for this PR
+	}
+
+	clients, err := s.awsSvc.AssumeRoleForEnvironment(ctx, &previewEnv)
+	if err == nil {
+		s.awsSvc.TeardownPreviewService(ctx, clients, &previewEnv)
+	}
+
+	s.db.Pool.Exec(ctx, `DELETE FROM environments WHERE id = $1`, previewEnv.ID)
+
+	// Update PR comment.
+	var userID uuid.UUID
+	var repoOwner, repoName string
+	s.db.Pool.QueryRow(ctx,
+		`SELECT user_id, repo_owner, repo_name FROM projects WHERE id = $1`, projectID,
+	).Scan(&userID, &repoOwner, &repoName)
+
+	token, _ := s.githubSvc.GetTokenForDeployment(ctx, userID)
+	if token != "" && commentID != nil && *commentID > 0 {
+		s.githubSvc.UpdatePRComment(ctx, token, repoOwner, repoName, *commentID,
+			fmt.Sprintf("🗑️ Preview environment for PR #%d has been torn down.", prNum))
+	}
+}
+
+// runPreviewDeployWorkflow builds the PR image and creates the preview ECS service.
+// Reuses the staging environment's CodeBuild project and ECR repo.
+func (s *Service) runPreviewDeployWorkflow(ctx context.Context, projectID, envID, depID uuid.UUID, commitSHA string) error {
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Minute)
+	defer cancel()
+
+	project, err := s.getProject(ctx, projectID)
+	if err != nil {
+		return fmt.Errorf("project not found: %w", err)
+	}
+
+	previewEnv, err := s.getEnvironmentByID(ctx, envID)
+	if err != nil {
+		return fmt.Errorf("preview env not found: %w", err)
+	}
+
+	// Need a ready staging env for the platform stack.
+	stagingEnv, err := s.getEnvironment(ctx, projectID, "staging")
+	if err != nil {
+		return fmt.Errorf("no staging env: %w", err)
+	}
+
+	_, _, _, ps, err := s.resolveNetworking(ctx, stagingEnv)
+	if err != nil {
+		return fmt.Errorf("failed to resolve staging networking: %w", err)
+	}
+	if ps == nil {
+		return fmt.Errorf("staging has no platform stack")
+	}
+
+	clients, err := s.awsSvc.AssumeRoleForEnvironment(ctx, stagingEnv)
+	if err != nil {
+		return fmt.Errorf("failed to assume role: %w", err)
+	}
+
+	token, err := s.githubSvc.GetTokenForDeployment(ctx, project.UserID)
+	if err != nil {
+		return fmt.Errorf("GitHub not connected: %w", err)
+	}
+
+	if previewEnv.ECRRepoURI == nil || previewEnv.CodeBuildProjectName == nil {
+		return fmt.Errorf("preview env missing ECR or CodeBuild reference")
+	}
+
+	imageURI := fmt.Sprintf("%s:%s", *previewEnv.ECRRepoURI, commitSHA[:8])
+	ecrRegistry := strings.SplitN(*previewEnv.ECRRepoURI, "/", 2)[0]
+
+	startCommand := ""
+	if project.StartCommand != nil {
+		startCommand = *project.StartCommand
+	}
+
+	s.updateDeploymentStatus(ctx, depID, models.DeployStatusBuilding, nil, nil)
+
+	buildRes, err := s.awsSvc.StartCodeBuildJob(
+		ctx, clients, projectID.String(), *previewEnv.CodeBuildProjectName,
+		token, project.RepoOwner, project.RepoName,
+		commitSHA, imageURI, ecrRegistry, project.Framework, startCommand,
+	)
+	if err != nil {
+		s.updateDeploymentStatus(ctx, depID, models.DeployStatusFailed, strPtr("build failed: "+err.Error()), nil)
+		return fmt.Errorf("build failed: %w", err)
+	}
+
+	if buildRes.TokenParamName != "" {
+		defer s.awsSvc.DeleteSSMParameter(ctx, clients, buildRes.TokenParamName)
+	}
+
+	if err := s.awsSvc.WaitForCodeBuild(ctx, clients, buildRes.BuildID, func(msg string) {
+		log.Printf("[preview] build %s: %s", buildRes.BuildID, msg)
+	}); err != nil {
+		s.updateDeploymentStatus(ctx, depID, models.DeployStatusFailed, strPtr("build failed: "+err.Error()), nil)
+		return fmt.Errorf("build failed: %w", err)
+	}
+
+	s.updateDeploymentStatus(ctx, depID, models.DeployStatusDeploying, nil, &imageURI)
+
+	// Copy task execution fields from staging to preview env for CreatePreviewService.
+	previewEnv.TaskExecutionRoleARN = stagingEnv.TaskExecutionRoleARN
+	logGroup := fmt.Sprintf("/convdeploy/pr-%d-%s", *previewEnv.PRNumber, projectID.String()[:8])
+	previewEnv.LogGroupName = &logGroup
+
+	// Ensure the CloudWatch log group exists for this preview.
+	s.awsSvc.CreateLogGroupIfNotExists(ctx, clients, logGroup)
+
+	ruleARN, tgARN, err := s.awsSvc.CreatePreviewService(ctx, clients, stagingEnv, ps, previewEnv, imageURI, project)
+	if err != nil {
+		s.updateDeploymentStatus(ctx, depID, models.DeployStatusFailed, strPtr("preview deploy failed: "+err.Error()), nil)
+		return fmt.Errorf("preview deploy failed: %w", err)
+	}
+
+	// Persist the new resource ARNs.
+	s.db.Pool.Exec(ctx, `
+		UPDATE environments
+		SET stack_status = 'ready', alb_listener_rule_arn = $1, alb_target_group_arn = $2,
+		    log_group_name = $3, task_execution_role_arn = $4, updated_at = NOW()
+		WHERE id = $5`,
+		ruleARN, tgARN, logGroup, stagingEnv.TaskExecutionRoleARN, envID,
+	)
+
+	s.updateDeploymentStatus(ctx, depID, models.DeployStatusLive, nil, &imageURI)
+	return nil
+}
+
+func strPtr(s string) *string { return &s }
