@@ -57,8 +57,8 @@ type Enqueuer interface {
 
 type Service struct {
 	db          *models.DB
-	awsSvc      *awssvc.Service
-	githubSvc   *githubsvc.Service
+	awsSvc      awssvc.AWSProvider
+	githubSvc   githubsvc.GitHubProvider
 	hub         *ws.Hub
 	enqueuer    Enqueuer
 	events      *events.Service
@@ -72,11 +72,11 @@ type Service struct {
 }
 
 type pendingMutation struct {
-	proposal  *models.MutationProposal
+	proposal   *models.MutationProposal
 	proposedAt time.Time
 }
 
-func NewService(db *models.DB, awsSvc *awssvc.Service, githubSvc *githubsvc.Service, hub *ws.Hub, enqueuer Enqueuer, eventSvc *events.Service, envVarSvc *envvars.Service, webhookSvc *webhooks.Service) *Service {
+func NewService(db *models.DB, awsSvc awssvc.AWSProvider, githubSvc githubsvc.GitHubProvider, hub *ws.Hub, enqueuer Enqueuer, eventSvc *events.Service, envVarSvc *envvars.Service, webhookSvc *webhooks.Service) *Service {
 	return &Service{
 		db:               db,
 		awsSvc:           awsSvc,

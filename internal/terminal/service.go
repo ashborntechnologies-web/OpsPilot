@@ -20,11 +20,11 @@ import (
 // the chat hub) then proxies stdin/stdout through the SSM datachannel.
 type Service struct {
 	db      *models.DB
-	awsSvc  *awssvc.Service
+	awsSvc  awssvc.AWSProvider
 	authSvc *auth.Service
 }
 
-func NewService(db *models.DB, awsSvc *awssvc.Service, authSvc *auth.Service) *Service {
+func NewService(db *models.DB, awsSvc awssvc.AWSProvider, authSvc *auth.Service) *Service {
 	return &Service{db: db, awsSvc: awsSvc, authSvc: authSvc}
 }
 
