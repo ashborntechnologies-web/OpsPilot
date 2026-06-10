@@ -32,6 +32,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/awstags"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -415,7 +416,9 @@ func (s *Service) RegisterECSTaskDefinition(
 	port := frameworkPort(project.Framework)
 	family := fmt.Sprintf("convdeploy-%s", project.ID.String())
 
+	tags := awstags.ToECS(awstags.BuildResourceTags(project.ID.String(), env.Name, s.platformAccountID))
 	input := &ecs.RegisterTaskDefinitionInput{
+		Tags: tags,
 		Family:                  aws.String(family),
 		NetworkMode:             ecstypes.NetworkModeAwsvpc,
 		RequiresCompatibilities: []ecstypes.Compatibility{ecstypes.CompatibilityFargate},
@@ -458,6 +461,7 @@ func (s *Service) RegisterECSTaskDefinition(
 var (
 	awsAccountIDRe = regexp.MustCompile(`^\d{12}$`)
 	iamRoleARNRe   = regexp.MustCompile(`^arn:aws:iam::(\d{12}):role/[\w+=,.@/-]+$`)
+	acmCertARNRe   = regexp.MustCompile(`^arn:aws:acm:[a-z0-9-]+:\d{12}:certificate/[\w-]+$`)
 )
 
 // validAWSRegions are the regions ConvDeploy supports for environment provisioning.
@@ -631,6 +635,9 @@ func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 		AWSAccountID string `json:"aws_account_id" binding:"required"`
 		IAMRoleARN   string `json:"iam_role_arn" binding:"required"`
 		ExternalID   string `json:"external_id"`
+		// Optional ACM certificate ARN — enables HTTPS on platform stacks
+		// provisioned in this account (set before the first environment).
+		CertificateARN string `json:"certificate_arn"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -655,6 +662,14 @@ func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "label too long (max 100 characters)"})
 		return
 	}
+	var certARN *string
+	if req.CertificateARN != "" {
+		if !acmCertARNRe.MatchString(req.CertificateARN) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "certificate_arn must be a valid ACM certificate ARN (arn:aws:acm:<region>:<account>:certificate/<id>)"})
+			return
+		}
+		certARN = &req.CertificateARN
+	}
 
 	// The external ID is the per-connection value embedded in the bootstrap template the
 	// user just deployed (returned by HandleGetBootstrapTemplate). Older clients that don't
@@ -672,18 +687,19 @@ func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 	}
 
 	account := &models.AWSAccount{
-		UserID:       userID,
-		Label:        req.Label,
-		AWSAccountID: req.AWSAccountID,
-		IAMRoleARN:   req.IAMRoleARN,
-		ExternalID:   externalID,
+		UserID:         userID,
+		Label:          req.Label,
+		AWSAccountID:   req.AWSAccountID,
+		IAMRoleARN:     req.IAMRoleARN,
+		ExternalID:     externalID,
+		CertificateARN: certARN,
 	}
 
 	err := s.db.Pool.QueryRow(c.Request.Context(),
-		`INSERT INTO aws_accounts (user_id, label, aws_account_id, iam_role_arn, external_id)
-		 VALUES ($1, $2, $3, $4, $5)
+		`INSERT INTO aws_accounts (user_id, label, aws_account_id, iam_role_arn, external_id, certificate_arn)
+		 VALUES ($1, $2, $3, $4, $5, $6)
 		 RETURNING id, created_at, updated_at`,
-		account.UserID, account.Label, account.AWSAccountID, account.IAMRoleARN, account.ExternalID,
+		account.UserID, account.Label, account.AWSAccountID, account.IAMRoleARN, account.ExternalID, account.CertificateARN,
 	).Scan(&account.ID, &account.CreatedAt, &account.UpdatedAt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save AWS account"})
@@ -912,13 +928,13 @@ func (s *Service) GetPlatformStack(ctx context.Context, id uuid.UUID) (*models.P
 		`SELECT id, account_id, aws_region, stack_id, stack_status,
 		        ecs_cluster_name, alb_arn, alb_dns, alb_listener_arn,
 		        alb_security_group_id, ecs_security_group_id, subnet_ids,
-		        created_at, updated_at
+		        https_enabled, created_at, updated_at
 		 FROM platform_stacks WHERE id = $1`, id,
 	).Scan(
 		&ps.ID, &ps.AccountID, &ps.AWSRegion, &ps.StackID, &ps.StackStatus,
 		&ps.ECSClusterName, &ps.ALBArn, &ps.ALBDNS, &ps.ALBListenerArn,
 		&ps.ALBSecurityGroupID, &ps.ECSSecurityGroupID, &ps.SubnetIDs,
-		&ps.CreatedAt, &ps.UpdatedAt,
+		&ps.HTTPSEnabled, &ps.CreatedAt, &ps.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -934,14 +950,14 @@ func (s *Service) GetOrCreatePlatformStack(ctx context.Context, accountID uuid.U
 		`SELECT id, account_id, aws_region, stack_id, stack_status,
 		        ecs_cluster_name, alb_arn, alb_dns, alb_listener_arn,
 		        alb_security_group_id, ecs_security_group_id, subnet_ids,
-		        created_at, updated_at
+		        https_enabled, created_at, updated_at
 		 FROM platform_stacks WHERE account_id = $1 AND aws_region = $2`,
 		accountID, region,
 	).Scan(
 		&ps.ID, &ps.AccountID, &ps.AWSRegion, &ps.StackID, &ps.StackStatus,
 		&ps.ECSClusterName, &ps.ALBArn, &ps.ALBDNS, &ps.ALBListenerArn,
 		&ps.ALBSecurityGroupID, &ps.ECSSecurityGroupID, &ps.SubnetIDs,
-		&ps.CreatedAt, &ps.UpdatedAt,
+		&ps.HTTPSEnabled, &ps.CreatedAt, &ps.UpdatedAt,
 	)
 	if err == nil {
 		return &ps, false, nil // already exists
@@ -1007,6 +1023,7 @@ func (s *Service) EnsureTargetGroup(
 	vpcID := aws.ToString(albDesc.LoadBalancers[0].VpcId)
 
 	out, err := clients.ELB.CreateTargetGroup(ctx, &elasticloadbalancingv2.CreateTargetGroupInput{
+		Tags:                       awstags.ToELB(awstags.BuildResourceTags(project.ID.String(), env.Name, s.platformAccountID)),
 		Name:                       aws.String(tgName),
 		Port:                       aws.Int32(port),
 		Protocol:                   elbtypes.ProtocolEnumHttp,
@@ -1064,7 +1081,9 @@ func (s *Service) EnsureListenerRule(
 		}
 	}
 
+	ruleTags := awstags.ToELB(awstags.BuildResourceTags(env.ProjectID.String(), env.Name, s.platformAccountID))
 	out, err := clients.ELB.CreateRule(ctx, &elasticloadbalancingv2.CreateRuleInput{
+		Tags:        ruleTags,
 		ListenerArn: ps.ALBListenerArn,
 		Priority:    aws.Int32(priority),
 		Conditions: []elbtypes.RuleCondition{
@@ -1085,6 +1104,7 @@ func (s *Service) EnsureListenerRule(
 		if strings.Contains(err.Error(), "PriorityInUse") {
 			priority += 500
 			out, err = clients.ELB.CreateRule(ctx, &elasticloadbalancingv2.CreateRuleInput{
+				Tags:        ruleTags,
 				ListenerArn: ps.ALBListenerArn,
 				Priority:    aws.Int32(priority),
 				Conditions:  []elbtypes.RuleCondition{{Field: aws.String("path-pattern"), Values: []string{"/*"}}},
@@ -1156,6 +1176,7 @@ func (s *Service) EnsureECSService(
 	}
 
 	_, err := clients.ECS.CreateService(ctx, &ecs.CreateServiceInput{
+		Tags:                 awstags.ToECS(awstags.BuildResourceTags(project.ID.String(), env.Name, s.platformAccountID)),
 		Cluster:              aws.String(clusterName),
 		ServiceName:          aws.String(*env.ECSServiceName),
 		TaskDefinition:       aws.String(taskDefARN),
@@ -1892,6 +1913,7 @@ func (s *Service) UpdateServiceResources(ctx context.Context, clients *ClientBun
 	}
 
 	reg, err := clients.ECS.RegisterTaskDefinition(ctx, &ecs.RegisterTaskDefinitionInput{
+		Tags:                    awstags.ToECS(awstags.BuildResourceTags(project.ID.String(), env.Name, s.platformAccountID)),
 		Family:                  aws.String(family),
 		NetworkMode:             ecstypes.NetworkModeAwsvpc,
 		RequiresCompatibilities: []ecstypes.Compatibility{ecstypes.CompatibilityFargate},
@@ -2017,7 +2039,9 @@ func (s *Service) CreatePreviewService(
 	}
 	vpcID := aws.ToString(albOut.LoadBalancers[0].VpcId)
 
+	previewTags := awstags.BuildResourceTags(project.ID.String(), previewEnv.Name, s.platformAccountID)
 	tg, err := clients.ELB.CreateTargetGroup(ctx, &elasticloadbalancingv2.CreateTargetGroupInput{
+		Tags:                      awstags.ToELB(previewTags),
 		Name:                      aws.String(tgName),
 		Protocol:                  elbtypes.ProtocolEnumHttp,
 		Port:                      aws.Int32(port),
@@ -2036,6 +2060,7 @@ func (s *Service) CreatePreviewService(
 	// Create listener rule at priority 10000 + prNum with path /pr-N/*.
 	priority := int32(10000 + prNum)
 	rule, err := clients.ELB.CreateRule(ctx, &elasticloadbalancingv2.CreateRuleInput{
+		Tags:        awstags.ToELB(previewTags),
 		ListenerArn: ps.ALBListenerArn,
 		Priority:    aws.Int32(priority),
 		Conditions: []elbtypes.RuleCondition{
@@ -2078,6 +2103,7 @@ func (s *Service) CreatePreviewService(
 
 	family := fmt.Sprintf("convdeploy-pr-%d-%s", prNum, project.ID.String()[:8])
 	reg, err := clients.ECS.RegisterTaskDefinition(ctx, &ecs.RegisterTaskDefinitionInput{
+		Tags:                    awstags.ToECS(previewTags),
 		Family:                  aws.String(family),
 		NetworkMode:             ecstypes.NetworkModeAwsvpc,
 		RequiresCompatibilities: []ecstypes.Compatibility{ecstypes.CompatibilityFargate},
@@ -2112,6 +2138,7 @@ func (s *Service) CreatePreviewService(
 	}
 
 	_, err = clients.ECS.CreateService(ctx, &ecs.CreateServiceInput{
+		Tags: awstags.ToECS(previewTags),
 		Cluster:        aws.String(*ps.ECSClusterName),
 		ServiceName:    aws.String(serviceName),
 		TaskDefinition: reg.TaskDefinition.TaskDefinitionArn,

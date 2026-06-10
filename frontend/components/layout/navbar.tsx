@@ -30,6 +30,18 @@ export function Navbar() {
           >
             AWS Accounts
           </Link>
+          <Link
+            href="/terms"
+            className={cn("hidden sm:inline", path.startsWith("/terms") ? "text-foreground font-medium" : "hover:text-foreground")}
+          >
+            Terms
+          </Link>
+          <Link
+            href="/privacy"
+            className={cn("hidden sm:inline", path.startsWith("/privacy") ? "text-foreground font-medium" : "hover:text-foreground")}
+          >
+            Privacy
+          </Link>
         </nav>
 
         <UserButton />

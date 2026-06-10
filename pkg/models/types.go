@@ -22,8 +22,11 @@ type AWSAccount struct {
 	AWSAccountID string    `json:"aws_account_id" db:"aws_account_id"`
 	IAMRoleARN   string    `json:"iam_role_arn" db:"iam_role_arn"`
 	ExternalID   string    `json:"-" db:"external_id"` // STS external ID; per-tenant, not exposed in JSON
-	CreatedAt    time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
+	// CertificateARN is an optional ACM cert that enables HTTPS on the shared ALB
+	// for platform stacks provisioned in this account.
+	CertificateARN *string   `json:"certificate_arn,omitempty" db:"certificate_arn"`
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
 }
 
 type Project struct {
@@ -57,6 +60,9 @@ type PlatformStack struct {
 	ALBArn             *string    `json:"alb_arn" db:"alb_arn"`
 	ALBDNS             *string    `json:"alb_dns" db:"alb_dns"`
 	ALBListenerArn     *string    `json:"alb_listener_arn" db:"alb_listener_arn"`
+	// HTTPSEnabled is true when the stack was provisioned with an ACM certificate —
+	// ALBListenerArn then refers to the 443 listener and app URLs use https://.
+	HTTPSEnabled       bool       `json:"https_enabled" db:"https_enabled"`
 	ALBSecurityGroupID *string    `json:"alb_security_group_id" db:"alb_security_group_id"`
 	ECSSecurityGroupID *string    `json:"ecs_security_group_id" db:"ecs_security_group_id"`
 	SubnetIDs          *string    `json:"subnet_ids" db:"subnet_ids"` // comma-separated
@@ -323,3 +329,40 @@ const (
 	ActorUser   = "user"
 	ActorAI     = "ai"
 )
+
+// Diagnosis feedback rating values
+const (
+	RatingHelpful          = "helpful"
+	RatingNotHelpful       = "not_helpful"
+	RatingPartiallyHelpful = "partially_helpful"
+)
+
+// DiagnosisFeedback is a user's rating of an AI-generated diagnosis. Rows rated
+// helpful with fixed_issue=true form the verified-fix training dataset.
+type DiagnosisFeedback struct {
+	ID         uuid.UUID `json:"id" db:"id"`
+	IncidentID uuid.UUID `json:"incident_id" db:"incident_id"`
+	ProjectID  uuid.UUID `json:"project_id" db:"project_id"`
+	UserID     uuid.UUID `json:"user_id" db:"user_id"`
+	Rating     string    `json:"rating" db:"rating"` // helpful | not_helpful | partially_helpful
+	FixedIssue bool      `json:"fixed_issue" db:"fixed_issue"`
+	Notes      string    `json:"notes" db:"notes"`
+	CreatedAt  time.Time `json:"created_at" db:"created_at"`
+}
+
+// RatingScore converts a feedback row to a numeric quality signal:
+// 1.0 for a helpful diagnosis that fixed the issue, 0.5 for partially helpful,
+// 0.0 for not helpful (and for "helpful" claims that didn't actually fix it).
+func (f *DiagnosisFeedback) RatingScore() float64 {
+	switch f.Rating {
+	case RatingHelpful:
+		if f.FixedIssue {
+			return 1.0
+		}
+		return 0.5
+	case RatingPartiallyHelpful:
+		return 0.5
+	default:
+		return 0.0
+	}
+}

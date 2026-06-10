@@ -41,19 +41,31 @@ func (s *Service) HandleGetHealthScore(c *gin.Context) {
 func (s *Service) ComputeHealthScore(ctx context.Context, projectID uuid.UUID) (*HealthScore, error) {
 	hs := &HealthScore{Components: map[string]int{}, Insights: []string{}}
 
-	// Success rate of last 10 finished deployments.
-	var total, succeeded int
+	// All four signals in one round-trip.
+	var total, succeeded, envTotal, envReady, errors24h, rollbacks7d int
 	err := s.db.Pool.QueryRow(ctx, `
-		SELECT COUNT(*), COUNT(*) FILTER (WHERE status IN ('live', 'rolled_back'))
-		FROM (
-			SELECT status FROM deployments
-			WHERE project_id = $1 AND status IN ('live', 'failed', 'rolled_back')
-			ORDER BY created_at DESC LIMIT 10
-		) recent`, projectID,
-	).Scan(&total, &succeeded)
+		SELECT
+			(SELECT COUNT(*) FROM (
+				SELECT status FROM deployments
+				WHERE project_id = $1 AND status IN ('live', 'failed', 'rolled_back')
+				ORDER BY created_at DESC LIMIT 10) r),
+			(SELECT COUNT(*) FROM (
+				SELECT status FROM deployments
+				WHERE project_id = $1 AND status IN ('live', 'failed', 'rolled_back')
+				ORDER BY created_at DESC LIMIT 10) r
+			 WHERE r.status IN ('live', 'rolled_back')),
+			(SELECT COUNT(*) FROM environments WHERE project_id = $1 AND is_preview = false),
+			(SELECT COUNT(*) FROM environments WHERE project_id = $1 AND is_preview = false AND stack_status = 'ready'),
+			(SELECT COUNT(*) FROM operational_events
+			  WHERE project_id = $1 AND severity = 'error' AND occurred_at > NOW() - INTERVAL '24 hours'),
+			(SELECT COUNT(*) FROM operational_events
+			  WHERE project_id = $1 AND event_type = 'rollback.triggered' AND occurred_at > NOW() - INTERVAL '7 days')`,
+		projectID,
+	).Scan(&total, &succeeded, &envTotal, &envReady, &errors24h, &rollbacks7d)
 	if err != nil {
 		return nil, err
 	}
+
 	if total == 0 {
 		hs.Components["deploy_success"] = 50 // no history — assume healthy
 		hs.Insights = append(hs.Insights, "No deployments yet — deploy to start tracking reliability.")
@@ -65,14 +77,6 @@ func (s *Service) ComputeHealthScore(ctx context.Context, projectID uuid.UUID) (
 	}
 
 	// Environment readiness.
-	var envTotal, envReady int
-	err = s.db.Pool.QueryRow(ctx, `
-		SELECT COUNT(*), COUNT(*) FILTER (WHERE stack_status = 'ready')
-		FROM environments WHERE project_id = $1 AND is_preview = false`, projectID,
-	).Scan(&envTotal, &envReady)
-	if err != nil {
-		return nil, err
-	}
 	if envTotal == 0 {
 		hs.Components["environments"] = 0
 		hs.Insights = append(hs.Insights, "No environments created — create a production environment to deploy.")
@@ -84,15 +88,6 @@ func (s *Service) ComputeHealthScore(ctx context.Context, projectID uuid.UUID) (
 	}
 
 	// Error events in the last 24h: full points at 0 errors, -3 per error.
-	var errors24h int
-	err = s.db.Pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM operational_events
-		WHERE project_id = $1 AND severity = 'error' AND occurred_at > NOW() - INTERVAL '24 hours'`,
-		projectID,
-	).Scan(&errors24h)
-	if err != nil {
-		return nil, err
-	}
 	stability := 15 - 3*errors24h
 	if stability < 0 {
 		stability = 0
@@ -103,15 +98,6 @@ func (s *Service) ComputeHealthScore(ctx context.Context, projectID uuid.UUID) (
 	}
 
 	// Rollbacks in the last 7 days: full points at 0, -5 per rollback.
-	var rollbacks7d int
-	err = s.db.Pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM operational_events
-		WHERE project_id = $1 AND event_type = 'rollback.triggered' AND occurred_at > NOW() - INTERVAL '7 days'`,
-		projectID,
-	).Scan(&rollbacks7d)
-	if err != nil {
-		return nil, err
-	}
 	rollbackScore := 10 - 5*rollbacks7d
 	if rollbackScore < 0 {
 		rollbackScore = 0

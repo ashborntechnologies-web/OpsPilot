@@ -54,6 +54,7 @@ export function ConnectAWSModal({ open, onClose, onConnected }: Props) {
   const [script, setScript] = useState("");
   const [externalId, setExternalId] = useState("");
   const [roleArn, setRoleArn] = useState("");
+  const [certificateArn, setCertificateArn] = useState("");
   const [copied, setCopied] = useState(false);
   const [loadingScript, setLoadingScript] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -66,6 +67,7 @@ export function ConnectAWSModal({ open, onClose, onConnected }: Props) {
     setScript("");
     setExternalId("");
     setRoleArn("");
+    setCertificateArn("");
     onClose();
   }
 
@@ -106,6 +108,7 @@ export function ConnectAWSModal({ open, onClose, onConnected }: Props) {
         aws_account_id: accountId.trim(),
         iam_role_arn: roleArn.trim(),
         external_id: externalId || undefined,
+        certificate_arn: certificateArn.trim() || undefined,
       });
       toast.success("AWS account connected!");
       onConnected(account);
@@ -282,6 +285,22 @@ export function ConnectAWSModal({ open, onClose, onConnected }: Props) {
                 onChange={(e) => setRoleArn(e.target.value)}
                 className="font-mono text-xs"
               />
+            </div>
+
+            <div className="space-y-1.5">
+              <Label className="text-xs">
+                ACM Certificate ARN <span className="text-muted-foreground font-normal">(optional — enables HTTPS)</span>
+              </Label>
+              <Input
+                placeholder="arn:aws:acm:us-east-1:123456789012:certificate/..."
+                value={certificateArn}
+                onChange={(e) => setCertificateArn(e.target.value)}
+                className="font-mono text-xs"
+              />
+              <p className="text-xs text-muted-foreground">
+                Provide an ACM certificate for your domain to serve apps over HTTPS.
+                Without one, apps are served over HTTP on the ALB&apos;s AWS hostname.
+              </p>
             </div>
 
             <div className="rounded-lg bg-zinc-50 border px-3 py-2 text-xs text-muted-foreground space-y-0.5">

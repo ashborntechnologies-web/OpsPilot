@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import useSWR from "swr";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@clerk/nextjs";
@@ -116,6 +116,51 @@ export default function NewProjectPage() {
   const [loadingRepos, setLoadingRepos] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
+  // ── Wizard state persistence ──────────────────────────────────────────────
+  // The GitHub OAuth redirect leaves and re-enters this page mid-flow; selections
+  // are kept in sessionStorage so the user resumes where they left off.
+  const WIZARD_KEY = "convdeploy:new-project";
+  const restored = useRef(false);
+  useEffect(() => {
+    if (restored.current) return;
+    restored.current = true;
+    // Deferred so restoration happens as an async update, not a synchronous
+    // setState cascade inside the effect body.
+    void Promise.resolve().then(() => {
+      try {
+        const raw = sessionStorage.getItem(WIZARD_KEY);
+        if (!raw) return;
+        const s = JSON.parse(raw) as Partial<{
+          step: Step; selected: GithubRepo | null; name: string; framework: string;
+          branch: string; branches: string[]; startCommand: string; accountId: string;
+        }>;
+        if (s.selected) setSelected(s.selected);
+        if (s.name) setName(s.name);
+        if (s.framework) setFramework(s.framework);
+        if (s.branch) setBranch(s.branch);
+        if (s.branches?.length) setBranches(s.branches);
+        if (s.startCommand) setStartCommand(s.startCommand);
+        if (s.accountId) setAccountId(s.accountId);
+        // Only restore to a later step if a repo was actually selected.
+        if (s.step && s.step !== "github" && (s.step === "repo" || s.selected)) setStep(s.step);
+      } catch {
+        // Corrupt state — start fresh.
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(
+        WIZARD_KEY,
+        JSON.stringify({ step, selected, name, framework, branch, branches, startCommand, accountId })
+      );
+    } catch {
+      // Storage full/unavailable — non-fatal.
+    }
+  }, [step, selected, name, framework, branch, branches, startCommand, accountId]);
+  // ──────────────────────────────────────────────────────────────────────────
+
   // Derived during render — no state/effect needed.
   const filtered = repos.filter((r) =>
     r.full_name.toLowerCase().includes(search.toLowerCase())
@@ -130,7 +175,8 @@ export default function NewProjectPage() {
       try {
         const data = await listGithubRepos(token);
         setRepos(data);
-        setStep("repo");
+        // Don't clobber a later step restored from sessionStorage (post-OAuth return).
+        setStep((prev) => (prev === "github" ? "repo" : prev));
       } catch {
         // Not connected yet — show the connect buttons
       }
@@ -219,6 +265,7 @@ export default function NewProjectPage() {
         account_id: accountId || null,
       });
       toast.success("Project created!");
+      try { sessionStorage.removeItem(WIZARD_KEY); } catch {}
       router.push(`/projects/${project.id}`);
     } catch (e: unknown) {
       toast.error((e as Error).message ?? "Failed to create project");

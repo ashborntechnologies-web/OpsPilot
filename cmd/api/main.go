@@ -20,7 +20,9 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/envvars"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/export"
 	githubsvc "github.com/ashborntechnologies-web/OpsPilot/internal/github"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/prompts"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/queue"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/terminal"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/webhooks"
@@ -93,6 +95,15 @@ func validateEnv() {
 		log.Fatalf("ENCRYPTION_KEY must be at least 16 characters (got %d) — GitHub tokens are encrypted with a key derived from it", len(key))
 	}
 
+	// AI prompts (trade secrets) — prompts.MustLoad panics if truly unconfigured;
+	// this warning fires first so the operator sees what's about to be required.
+	if os.Getenv("INTENT_CLASSIFIER_PROMPT") == "" && os.Getenv("INTENT_CLASSIFIER_PROMPT_FILE") == "" {
+		log.Println("WARNING: INTENT_CLASSIFIER_PROMPT(_FILE) not set — startup will fail; prompts are not embedded in the binary")
+	}
+	if os.Getenv("DIAGNOSIS_PROMPT") == "" && os.Getenv("DIAGNOSIS_PROMPT_FILE") == "" {
+		log.Println("WARNING: DIAGNOSIS_PROMPT(_FILE) not set — startup will fail; prompts are not embedded in the binary")
+	}
+
 	// Optional integrations — warn so operators know a feature is disabled, not broken.
 	if os.Getenv("ANTHROPIC_API_KEY") == "" {
 		log.Println("WARNING: ANTHROPIC_API_KEY not set — chat intent classification, AI diagnosis, and AI framework detection are disabled")
@@ -103,6 +114,9 @@ func validateEnv() {
 	if os.Getenv("FRONTEND_URL") == "" {
 		log.Println("WARNING: FRONTEND_URL not set — CORS and WebSocket origin checks allow all origins (dev mode)")
 	}
+	if os.Getenv("ADMIN_API_KEY") == "" {
+		log.Println("WARNING: ADMIN_API_KEY not set — admin training-data export endpoints are disabled")
+	}
 }
 
 func main() {
@@ -112,6 +126,10 @@ func main() {
 	}
 
 	validateEnv()
+
+	// AI prompts are trade secrets loaded from the environment, never embedded in
+	// source. Panics with setup instructions when unconfigured.
+	prompts.MustLoad()
 
 	// Run Gin in release mode outside development to avoid debug logging overhead.
 	if env := os.Getenv("ENV"); env != "" && env != "development" {
@@ -206,8 +224,12 @@ func main() {
 	}
 	defer scheduler.Stop()
 
-	// Setup router
-	r := gin.Default()
+	// Setup router — gin.New (not Default) so the platform controls every header;
+	// logging and panic recovery are attached explicitly.
+	r := gin.New()
+	r.Use(gin.Logger())
+	r.Use(gin.Recovery())
+	r.Use(middleware.Proprietary())
 	r.Use(middleware.CORS(os.Getenv("FRONTEND_URL")))
 
 	// Health check — verifies database connectivity so load balancers don't route to
@@ -224,6 +246,17 @@ func main() {
 
 	// API routes
 	v1 := r.Group("/api/v1")
+
+	// Product metadata — public, used by clients and license tooling.
+	v1.GET("/meta", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"product":   "OpsPilot",
+			"version":   middleware.Version(),
+			"license":   "BUSL-1.1",
+			"terms":     "https://opspilot.dev/terms",
+			"ip_notice": "OpsPilot's AI prompts, models, and training data are proprietary trade secrets. Competitive use is prohibited.",
+		})
+	})
 
 	// GitHub OAuth callback — public (GitHub redirects here after authorization)
 	v1.GET("/github/callback", githubSvc.HandleOAuthCallback)
@@ -277,6 +310,7 @@ func main() {
 		proj.GET("/environments/:envId/env-vars", envVarSvc.HandleList)
 		proj.PUT("/environments/:envId/env-vars", envVarSvc.HandleUpsert)
 		proj.DELETE("/environments/:envId/env-vars/:varId", envVarSvc.HandleDelete)
+		proj.GET("/environments/:envId/env-vars/:varId/reveal", envVarSvc.HandleReveal)
 
 		// Health check + scaling
 		proj.GET("/environments/:envId/health", deploySvc.HandleCheckHealth)
@@ -300,6 +334,8 @@ func main() {
 
 		// Diagnosis
 		proj.GET("/deployments/:deployId/diagnose", diagnosisSvc.HandleDiagnose)
+		proj.POST("/deployments/:deployId/diagnose/feedback", diagnosisSvc.HandleSubmitFeedback)
+		proj.GET("/diagnose/feedback-summary", diagnosisSvc.HandleFeedbackSummary)
 
 		// Cost intelligence
 		proj.GET("/costs", deploySvc.HandleGetCosts)
@@ -314,6 +350,15 @@ func main() {
 		// Conversation (REST fallback — primary is WebSocket)
 		proj.POST("/conversation", conversationRL.Middleware(), conversationSvc.HandleMessage)
 		proj.GET("/conversation/history", conversationSvc.HandleHistory)
+	}
+
+	// Admin — training data exports (trade secret datasets). Protected by a static
+	// bearer key (ADMIN_API_KEY), not Clerk; 404s when no key is configured.
+	exportSvc := export.NewService(db)
+	admin := v1.Group("/admin", middleware.ApiKeyAuth(os.Getenv("ADMIN_API_KEY")))
+	{
+		admin.GET("/export/intents", exportSvc.HandleExportIntents)
+		admin.GET("/export/diagnoses", exportSvc.HandleExportDiagnoses)
 	}
 
 	// GitHub webhook — public; authentication via HMAC-SHA256 signature.

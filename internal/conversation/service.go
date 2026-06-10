@@ -6,42 +6,19 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/prompts"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/ws"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
-
-const intentClassifierPrompt = `You are the intent classifier for a deployment platform.
-Classify the user's message into exactly one of these intents:
-- deploy: user wants to deploy or redeploy their application
-- rollback: user wants to roll back to a previous deployment
-- scale: user wants to scale replicas up or down
-- logs: user wants to view logs
-- health: user wants to check deployment health or status
-- diagnose: user wants to understand why something failed or what went wrong
-- cost: user wants to know about costs, AWS spending, or monthly bills
-- change_resources: user wants to change CPU, memory, or compute resources for their service
-- confirm: user is confirming a previously proposed action (yes, confirm, ok, apply, do it, go ahead, proceed)
-- unknown: anything else
-
-Respond with ONLY a JSON object in this exact format:
-{"intent": "<intent>", "confidence": "<high|medium|low>", "params": {}}
-
-For scale intent, extract replica count into params: {"replicas": 3}
-For change_resources intent, extract cpu and memory in Fargate units into params:
-  {"cpu": "1024", "memory": "2048"}
-  Valid CPU values: 256, 512, 1024, 2048, 4096
-  Valid memory values must be compatible with chosen CPU (e.g. 512 CPU → 1024 or 2048 MB)
-  If the user says "2 vCPU" that is cpu=2048; "4 GB" that is memory=4096
-For rollback, extract deployment reference if mentioned: {"deployment_id": "..."}
-Never include any other text.`
 
 type Service struct {
 	db           *models.DB
@@ -107,10 +84,24 @@ func (s *Service) HandleHistory(c *gin.Context) {
 		return
 	}
 
+	// Pagination: ?limit= (default 100, max 500) and ?offset= count back from the
+	// most recent turn; results are returned oldest-first for rendering.
+	limit := 100
+	if l, err := strconv.Atoi(c.Query("limit")); err == nil && l > 0 {
+		limit = min(l, 500)
+	}
+	offset := 0
+	if o, err := strconv.Atoi(c.Query("offset")); err == nil && o > 0 {
+		offset = o
+	}
+
 	rows, err := s.db.Pool.Query(c.Request.Context(),
-		`SELECT id, project_id, user_id, role, message, intent, created_at
-		 FROM conversations WHERE project_id = $1 ORDER BY created_at ASC LIMIT 100`,
-		projectID,
+		`SELECT id, project_id, user_id, role, message, intent, created_at FROM (
+			SELECT id, project_id, user_id, role, message, intent, created_at
+			FROM conversations WHERE project_id = $1
+			ORDER BY created_at DESC LIMIT $2 OFFSET $3
+		 ) page ORDER BY created_at ASC`,
+		projectID, limit, offset,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch history"})
@@ -163,37 +154,29 @@ func (s *Service) ProcessMessage(ctx context.Context, projectID uuid.UUID, userI
 	var response string
 	switch intent.Intent {
 	case models.IntentDeploy, models.IntentRedeploy:
-		response, err = s.deploySvc.TriggerDeploy(ctx, projectID, "production")
+		response, err = s.deploySvc.TriggerDeploy(ctx, projectID, targetEnv(intent.Params))
 	case models.IntentRollback:
-		response, err = s.deploySvc.TriggerRollback(ctx, projectID, "production")
+		response, err = s.deploySvc.TriggerRollback(ctx, projectID, targetEnv(intent.Params))
 	case models.IntentLogs:
 		response, err = s.deploySvc.FetchLogsForProject(ctx, projectID)
 	case models.IntentHealth:
 		response, err = s.deploySvc.CheckHealth(ctx, projectID)
 	case models.IntentScale:
-		replicas := 2
-		if r, ok := intent.Params["replicas"]; ok {
-			if rf, ok := r.(float64); ok {
-				replicas = int(rf)
-			}
+		// Never guess a replica count — "scale down" silently becoming 2 replicas
+		// (or 2 becoming a scale-UP) is a production safety problem.
+		replicas, ok := paramInt(intent.Params, "replicas")
+		if !ok {
+			response = "How many replicas would you like? For example: \"scale to 3\" or \"scale to 0\" to stop the service."
+		} else {
+			response, err = s.deploySvc.ScaleService(ctx, projectID, replicas)
 		}
-		response, err = s.deploySvc.ScaleService(ctx, projectID, replicas)
 	case models.IntentDiagnose:
 		response, err = s.diagnosisSvc.DiagnoseProject(ctx, projectID)
 	case models.IntentCost:
 		response, err = s.deploySvc.GetCostSummary(ctx, projectID)
 	case models.IntentChangeResources:
-		cpu, memory := "", ""
-		if v, ok := intent.Params["cpu"]; ok {
-			if s, ok := v.(string); ok {
-				cpu = s
-			}
-		}
-		if v, ok := intent.Params["memory"]; ok {
-			if s, ok := v.(string); ok {
-				memory = s
-			}
-		}
+		cpu := paramString(intent.Params, "cpu")
+		memory := paramString(intent.Params, "memory")
 		response, err = s.deploySvc.ProposeResourceChange(ctx, projectID, userID, cpu, memory)
 	case models.IntentConfirm:
 		response, err = s.deploySvc.ApplyPendingMutation(ctx, projectID, userID)
@@ -211,9 +194,45 @@ func (s *Service) ProcessMessage(ctx context.Context, projectID uuid.UUID, userI
 	return response, nil
 }
 
+// targetEnv returns the environment named in the intent params, defaulting to
+// production. Only known environment names are honored.
+func targetEnv(params map[string]interface{}) string {
+	env := strings.ToLower(paramString(params, "env"))
+	if env == "staging" || env == "production" {
+		return env
+	}
+	return "production"
+}
+
+// paramString reads a classifier param that should be a string but may arrive
+// as a JSON number (Claude occasionally returns 1024 instead of "1024").
+func paramString(params map[string]interface{}, key string) string {
+	switch v := params[key].(type) {
+	case string:
+		return v
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	default:
+		return ""
+	}
+}
+
+// paramInt reads an integer classifier param that may arrive as a number or string.
+func paramInt(params map[string]interface{}, key string) (int, bool) {
+	switch v := params[key].(type) {
+	case float64:
+		return int(v), true
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
 // classifyIntent sends the message to Claude and returns the parsed intent.
 func (s *Service) classifyIntent(ctx context.Context, message string) (*IntentResult, error) {
-	text, err := s.llm.Complete(ctx, intentClassifierPrompt, message, 200)
+	text, err := s.llm.Complete(ctx, prompts.IntentClassifier(), message, 200)
 	if err != nil {
 		return nil, err
 	}

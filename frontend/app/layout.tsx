@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { ClerkProvider } from "@clerk/nextjs";
 import { Toaster } from "@/components/ui/sonner";
+import { Footer } from "@/components/layout/footer";
 import "./globals.css";
 
 const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
@@ -19,8 +20,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         lang="en"
         className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
       >
-        <body className="min-h-full bg-background text-foreground">
-          {children}
+        <body className="min-h-screen flex flex-col bg-background text-foreground">
+          <div className="flex-1 flex flex-col">{children}</div>
+          <Footer />
           <Toaster position="bottom-right" />
         </body>
       </html>

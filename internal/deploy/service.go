@@ -73,6 +73,36 @@ type Service struct {
 	// Keyed by projectID; TTL of 10 minutes enforced at read time.
 	pendingMutations map[uuid.UUID]*pendingMutation
 	mutationMu       sync.Mutex
+
+	// seenDeliveries dedupes GitHub webhook deliveries by X-GitHub-Delivery GUID so a
+	// replayed request with a valid signature is not processed twice. Entries expire
+	// after webhookReplayWindow.
+	seenDeliveries map[string]time.Time
+	deliveryMu     sync.Mutex
+}
+
+// webhookReplayWindow is how long a GitHub delivery GUID is remembered. GitHub
+// retries use a new GUID, so duplicates within the window are replays.
+const webhookReplayWindow = 10 * time.Minute
+
+// isReplayedDelivery records the delivery GUID and reports whether it was already seen.
+func (s *Service) isReplayedDelivery(guid string) bool {
+	if guid == "" {
+		return false // header absent (e.g. local testing) — fall through to signature check
+	}
+	now := time.Now()
+	s.deliveryMu.Lock()
+	defer s.deliveryMu.Unlock()
+	for g, t := range s.seenDeliveries {
+		if now.Sub(t) > webhookReplayWindow {
+			delete(s.seenDeliveries, g)
+		}
+	}
+	if _, seen := s.seenDeliveries[guid]; seen {
+		return true
+	}
+	s.seenDeliveries[guid] = now
+	return false
 }
 
 type pendingMutation struct {
@@ -91,6 +121,7 @@ func NewService(db *models.DB, awsSvc awssvc.AWSProvider, githubSvc githubsvc.Gi
 		envVars:          envVarSvc,
 		webhooksSvc:      webhookSvc,
 		pendingMutations: make(map[uuid.UUID]*pendingMutation),
+		seenDeliveries:   make(map[string]time.Time),
 	}
 }
 
@@ -103,6 +134,18 @@ var (
 	// githubNameRe matches valid GitHub owner/repo segments.
 	githubNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$`)
 )
+
+// parsePagination reads ?limit= and ?offset= query params with sane bounds.
+func parsePagination(c *gin.Context, defaultLimit, maxLimit int) (limit, offset int) {
+	limit = defaultLimit
+	if l, err := strconv.Atoi(c.Query("limit")); err == nil && l > 0 {
+		limit = min(l, maxLimit)
+	}
+	if o, err := strconv.Atoi(c.Query("offset")); err == nil && o > 0 {
+		offset = o
+	}
+	return limit, offset
+}
 
 // isNonPublicURL reports whether the URL's host is loopback, private, or link-local —
 // i.e. somewhere GitHub's webhook delivery cannot reach.
@@ -293,9 +336,12 @@ func (s *Service) HandleListDeployments(c *gin.Context) {
 		return
 	}
 
+	// Pagination: ?limit= (default 20, max 100) and ?offset=.
+	limit, offset := parsePagination(c, 20, 100)
 	rows, err := s.db.Pool.Query(c.Request.Context(),
 		`SELECT id, project_id, environment_id, commit_sha, commit_message, image_uri, status, failure_reason, created_at, updated_at
-		 FROM deployments WHERE project_id = $1 ORDER BY created_at DESC LIMIT 20`, projectID,
+		 FROM deployments WHERE project_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+		projectID, limit, offset,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch deployments"})
@@ -741,7 +787,7 @@ func (s *Service) RunDeployWorkflow(ctx context.Context, projectID, environmentI
 
 	liveMsg := fmt.Sprintf("Deployment live! Commit `%s` is running.", deployment.CommitSHA[:8])
 	if env.ALBDNS != nil {
-		liveMsg = fmt.Sprintf("Deployment live! Commit `%s` is running at http://%s", deployment.CommitSHA[:8], *env.ALBDNS)
+		liveMsg = fmt.Sprintf("Deployment live! Commit `%s` is running at %s://%s", deployment.CommitSHA[:8], albScheme(ps), *env.ALBDNS)
 	}
 	s.broadcast(projectID, ws.Message{Type: "deploy_done", Payload: liveMsg})
 
@@ -1074,7 +1120,7 @@ func (s *Service) CheckHealth(ctx context.Context, projectID uuid.UUID) (string,
 		return fmt.Sprintf("The %s environment hasn't been deployed yet — nothing running to check.", env.Name), nil
 	}
 
-	clusterName, _, _, _, err := s.resolveNetworking(ctx, env)
+	clusterName, _, _, ps, err := s.resolveNetworking(ctx, env)
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve cluster: %w", err)
 	}
@@ -1108,7 +1154,7 @@ func (s *Service) CheckHealth(ctx context.Context, projectID uuid.UUID) (string,
 		}
 	}
 	if env.ALBDNS != nil {
-		msg += fmt.Sprintf("\nURL: http://%s", *env.ALBDNS)
+		msg += fmt.Sprintf("\nURL: %s://%s", albScheme(ps), *env.ALBDNS)
 	}
 	return msg, nil
 }
@@ -1262,7 +1308,7 @@ func (s *Service) RunRollbackWorkflow(ctx context.Context, projectID, environmen
 
 	liveMsg := fmt.Sprintf("Rolled back! Commit `%s` is live again.", deployment.CommitSHA[:8])
 	if env.ALBDNS != nil {
-		liveMsg = fmt.Sprintf("Rolled back! Commit `%s` is live again at http://%s", deployment.CommitSHA[:8], *env.ALBDNS)
+		liveMsg = fmt.Sprintf("Rolled back! Commit `%s` is live again at %s://%s", deployment.CommitSHA[:8], albScheme(ps), *env.ALBDNS)
 	}
 	s.broadcast(projectID, ws.Message{Type: "deploy_done", Payload: liveMsg})
 	return nil
@@ -1386,6 +1432,15 @@ func (s *Service) collectEnvCleanupInfos(ctx context.Context, projectID uuid.UUI
 		infos = append(infos, info)
 	}
 	return infos, nil
+}
+
+// albScheme returns the URL scheme for an environment's ALB: https when the
+// platform stack was provisioned with an ACM certificate, http otherwise.
+func albScheme(ps *models.PlatformStack) string {
+	if ps != nil && ps.HTTPSEnabled {
+		return "https"
+	}
+	return "http"
 }
 
 func deref(s *string) string {
@@ -1520,7 +1575,7 @@ func (s *Service) HandleCheckHealth(c *gin.Context) {
 		return
 	}
 
-	clusterName, _, _, _, err := s.resolveNetworking(c.Request.Context(), env)
+	clusterName, _, _, ps, err := s.resolveNetworking(c.Request.Context(), env)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve cluster: " + err.Error()})
 		return
@@ -1553,7 +1608,7 @@ func (s *Service) HandleCheckHealth(c *gin.Context) {
 		"pending": h.PendingCount,
 	}
 	if env.ALBDNS != nil {
-		resp["url"] = "http://" + *env.ALBDNS
+		resp["url"] = albScheme(ps) + "://" + *env.ALBDNS
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -2154,6 +2209,13 @@ func (s *Service) HandleGithubWebhook(c *gin.Context) {
 		return
 	}
 
+	// Reject replays — a captured request has a valid signature, so dedupe on the
+	// delivery GUID after signature verification.
+	if s.isReplayedDelivery(c.GetHeader("X-GitHub-Delivery")) {
+		c.Status(http.StatusNoContent)
+		return
+	}
+
 	go s.handlePREvent(context.Background(), projectID, userID, &payload)
 	c.Status(http.StatusNoContent)
 }
@@ -2262,7 +2324,8 @@ func (s *Service) handlePROpenedOrSync(ctx context.Context, projectID, userID uu
 	s.db.Pool.QueryRow(ctx, `SELECT alb_dns FROM environments WHERE id = $1`, previewEnvID).Scan(&albDNS)
 	previewURL := ""
 	if albDNS != nil {
-		previewURL = fmt.Sprintf("http://%s/pr-%d/", *albDNS, prNum)
+		_, _, _, ps, _ := s.resolveNetworking(ctx, stagingEnv)
+		previewURL = fmt.Sprintf("%s://%s/pr-%d/", albScheme(ps), *albDNS, prNum)
 	}
 
 	if token != "" && commentID > 0 {

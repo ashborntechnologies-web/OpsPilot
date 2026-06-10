@@ -20,7 +20,7 @@ import {
   getProject, listEnvironments, listDeployments,
   createEnvironment, triggerDeploy, rollback, retryProvision, getEnvironmentLogs,
   getDeploymentEvents, wsURL, redeployDeployment, deleteDeployment,
-  listEnvVars, upsertEnvVar, deleteEnvVar,
+  listEnvVars, upsertEnvVar, deleteEnvVar, revealEnvVar,
   diagnoseDeployment, checkHealth, scaleService,
   listWebhooks, createWebhook, updateWebhook, deleteWebhook,
   terminalWsURL, getProjectCosts, enablePreviews, disablePreviews,
@@ -165,6 +165,9 @@ export default function ProjectPage() {
   const [newIsSecret, setNewIsSecret] = useState(false);
   const [savingEnvVar, setSavingEnvVar] = useState(false);
   const [showSecretValues, setShowSecretValues] = useState<Record<string, boolean>>({});
+  // Plaintext secret values fetched on demand via the reveal endpoint — the list
+  // API intentionally redacts them.
+  const [revealedValues, setRevealedValues] = useState<Record<string, string>>({});
 
   // diagnose
   const [diagnosing, setDiagnosing] = useState<string | null>(null);
@@ -181,6 +184,9 @@ export default function ProjectPage() {
 
   // terminal
   const [terminalEnvId, setTerminalEnvId] = useState<string>("");
+  // Bumping the nonce re-runs the terminal effect → fresh SSM session (Reconnect button).
+  const [terminalNonce, setTerminalNonce] = useState(0);
+  const [terminalDisconnected, setTerminalDisconnected] = useState(false);
   const terminalRef = useRef<HTMLDivElement>(null);
 
   // webhooks
@@ -270,6 +276,7 @@ export default function ProjectPage() {
   // Terminal — mount xterm.js and open SSM datachannel proxy when an env is selected.
   useEffect(() => {
     if (!terminalEnvId || !terminalRef.current) return;
+    setTerminalDisconnected(false);
 
     let term: import("@xterm/xterm").Terminal | null = null;
     let ws: WebSocket | null = null;
@@ -307,7 +314,10 @@ export default function ProjectPage() {
         }
       };
 
-      ws.onclose = () => term?.write("\r\n\x1b[33m[disconnected]\x1b[0m\r\n");
+      ws.onclose = () => {
+        term?.write("\r\n\x1b[33m[disconnected]\x1b[0m\r\n");
+        if (!closed) setTerminalDisconnected(true);
+      };
 
       term.onData((data) => ws?.readyState === WebSocket.OPEN && ws.send(data));
       term.onResize(({ cols, rows }) =>
@@ -328,7 +338,7 @@ export default function ProjectPage() {
       ws?.close();
       term?.dispose();
     };
-  }, [terminalEnvId, id, getToken]);
+  }, [terminalEnvId, terminalNonce, id, getToken]);
 
   // Polling — re-fetch every 5 s while an environment is provisioning or a
   // deployment is in flight, so status flips even if WebSocket messages are missed.
@@ -364,13 +374,17 @@ export default function ProjectPage() {
   }
 
   async function handleDeploy(env: Environment) {
+    const branch = project?.branch || "default branch";
+    if (!window.confirm(`Deploy the latest commit on ${branch} to ${env.name}?`)) {
+      return;
+    }
     const token = await getToken();
     if (!token) return;
     setDeploying(env.id);
     try {
       const { message } = await triggerDeploy(token, id, env.id, env.name);
       toast.success(message);
-      setTimeout(refresh, 2000);
+      setTimeout(() => refresh().catch(() => {}), 2000);
     } catch (e: unknown) {
       toast.error((e as Error).message);
     } finally {
@@ -491,6 +505,37 @@ export default function ProjectPage() {
     } finally {
       setLoadingEnvVars(false);
     }
+  }
+
+  // Auto-load env vars as soon as an environment is selected, so the tab shows
+  // real data (not a misleading empty state) on first click.
+  const envVarsLoadedFor = useRef<string>("");
+  useEffect(() => {
+    if (!envVarEnvId || envVarsLoadedFor.current === envVarEnvId) return;
+    envVarsLoadedFor.current = envVarEnvId;
+    void fetchEnvVars(envVarEnvId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [envVarEnvId]);
+
+  // Show/hide a secret value. The list API redacts secrets, so the first reveal
+  // fetches the plaintext from the dedicated reveal endpoint; hiding is local.
+  async function toggleRevealSecret(v: EnvVar) {
+    if (showSecretValues[v.id]) {
+      setShowSecretValues((p) => ({ ...p, [v.id]: false }));
+      return;
+    }
+    if (revealedValues[v.id] === undefined) {
+      const token = await getToken();
+      if (!token) return;
+      try {
+        const { value } = await revealEnvVar(token, id, envVarEnvId, v.id);
+        setRevealedValues((p) => ({ ...p, [v.id]: value }));
+      } catch (e: unknown) {
+        toast.error((e as Error).message ?? "Failed to reveal value");
+        return;
+      }
+    }
+    setShowSecretValues((p) => ({ ...p, [v.id]: true }));
   }
 
   async function handleSaveEnvVar() {
@@ -1509,7 +1554,7 @@ export default function ProjectPage() {
                 <div className="flex items-center gap-3">
                   <select
                     value={envVarEnvId}
-                    onChange={(e) => { setEnvVarEnvId(e.target.value); setEnvVars([]); fetchEnvVars(e.target.value); }}
+                    onChange={(e) => { setEnvVarEnvId(e.target.value); setEnvVars([]); setShowSecretValues({}); setRevealedValues({}); fetchEnvVars(e.target.value); }}
                     className="h-9 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
                   >
                     {environments.map((e) => (
@@ -1574,7 +1619,7 @@ export default function ProjectPage() {
                           <span className="font-mono text-sm font-medium flex-1 truncate">{v.key}</span>
                           <span className="font-mono text-sm text-muted-foreground flex-1 truncate">
                             {v.is_secret
-                              ? (showSecretValues[v.id] ? v.value : "•••••••••")
+                              ? (showSecretValues[v.id] ? (revealedValues[v.id] ?? "•••••••••") : "•••••••••")
                               : v.value}
                           </span>
                           <div className="flex items-center gap-1 shrink-0">
@@ -1583,7 +1628,7 @@ export default function ProjectPage() {
                             )}
                             {v.is_secret && (
                               <button
-                                onClick={() => setShowSecretValues((p) => ({ ...p, [v.id]: !p[v.id] }))}
+                                onClick={() => toggleRevealSecret(v)}
                                 className="p-1 text-muted-foreground hover:text-foreground"
                                 title={showSecretValues[v.id] ? "Hide value" : "Show value"}
                               >
@@ -1629,10 +1674,20 @@ export default function ProjectPage() {
                         <option key={e.id} value={e.id}>{e.name} ({e.aws_region})</option>
                       ))}
                     </select>
-                    {terminalEnvId && (
+                    {terminalEnvId && !terminalDisconnected && (
                       <span className="text-xs text-muted-foreground">
                         Connecting to running ECS task via SSM…
                       </span>
+                    )}
+                    {terminalEnvId && terminalDisconnected && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => setTerminalNonce((n) => n + 1)}
+                      >
+                        <RotateCcw className="h-3 w-3 mr-1" />
+                        Reconnect
+                      </Button>
                     )}
                   </div>
                   <div

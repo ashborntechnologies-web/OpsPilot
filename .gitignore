@@ -12,3 +12,15 @@ vendor/
 *.xlsx
 *.pptx
 *.pdf
+
+# ── Trade secrets — AI prompts and training data exports ─────────────────────
+*.prompt
+prompts/*.txt
+prompts/*.md
+*.jsonl
+exports/
+
+# ── Keys and certificates ────────────────────────────────────────────────────
+*.pem
+*.key
+*.crt

@@ -99,7 +99,7 @@ export function listAWSAccounts(token: string) {
 
 export function connectAWSAccount(
   token: string,
-  body: { label: string; aws_account_id: string; iam_role_arn: string; external_id?: string }
+  body: { label: string; aws_account_id: string; iam_role_arn: string; external_id?: string; certificate_arn?: string }
 ) {
   return request<AWSAccount>("/aws-accounts", token, {
     method: "POST",
@@ -228,6 +228,12 @@ export function deleteEnvVar(token: string, projectId: string, envId: string, va
   return request<{ message: string }>(
     `/projects/${projectId}/environments/${envId}/env-vars/${varId}`, token,
     { method: "DELETE" }
+  );
+}
+
+export function revealEnvVar(token: string, projectId: string, envId: string, varId: string) {
+  return request<{ value: string }>(
+    `/projects/${projectId}/environments/${envId}/env-vars/${varId}/reveal`, token
   );
 }
 

@@ -9,32 +9,11 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/aws"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/prompts"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
-
-const diagnosisPrompt = `You are an expert DevOps engineer analyzing a deployment failure or production incident.
-You will be given:
-1. The recorded failure reason
-2. Recent application log output (from CloudWatch)
-3. The deployment's operational event timeline
-4. Deployment history (what changed)
-5. Past incidents for this project (memory layer)
-
-Your job:
-- Identify the root cause clearly and specifically
-- Reference the exact log line or change that caused it
-- Provide a concrete fix (specific env var to add, config to change, code to fix)
-- State how confident you are, based on how directly the evidence supports the cause
-- Be direct and concise — no filler
-
-Format your response EXACTLY as:
-**Root Cause:** <one sentence>
-**Evidence:** <specific log line or change>
-**Fix:** <specific actionable step>
-**Prevention:** <one line>
-**Confidence:** <High|Medium|Low>`
 
 // maxLogChars caps the application-log slice sent to Claude to control token usage.
 const maxLogChars = 6000
@@ -50,33 +29,53 @@ func NewService(db *models.DB, awsSvc *aws.Service, eventSvc *events.Service, ap
 	return &Service{db: db, awsSvc: awsSvc, events: eventSvc, llm: llm.New(apiKey)}
 }
 
-// HandleDiagnose is the HTTP handler for diagnosis requests
+// HandleDiagnose is the HTTP handler for diagnosis requests. It diagnoses the
+// specific deployment in the URL — not just the most recent failure — so the
+// result matches the row the user clicked "Diagnose" on.
 func (s *Service) HandleDiagnose(c *gin.Context) {
 	projectID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
 		return
 	}
+	deploymentID, err := uuid.Parse(c.Param("deployId"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid deployment id"})
+		return
+	}
 
-	result, err := s.DiagnoseProject(c.Request.Context(), projectID)
+	deployment, err := s.getDeployment(c.Request.Context(), projectID, deploymentID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "deployment not found"})
+		return
+	}
+
+	result, incidentID, err := s.diagnose(c.Request.Context(), projectID, deployment)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"diagnosis": result})
+	c.JSON(http.StatusOK, gin.H{"diagnosis": result, "incident_id": incidentID})
 }
 
-// DiagnoseProject collects real operational context (failure reason, live CloudWatch logs,
-// the deployment's event timeline, deployment history, and past incidents) and sends a
-// structured, size-bounded prompt to Claude. Missing logs are handled gracefully.
+// DiagnoseProject diagnoses the most recent failed deployment — the entrypoint
+// for conversational "why did it fail?" requests where no specific deployment
+// is referenced.
 func (s *Service) DiagnoseProject(ctx context.Context, projectID uuid.UUID) (string, error) {
-	// Step 1: fetch last failed deployment
 	deployment, err := s.getLastFailedDeployment(ctx, projectID)
 	if err != nil {
 		return "", fmt.Errorf("no failed deployment found: %w", err)
 	}
+	result, _, err := s.diagnose(ctx, projectID, deployment)
+	return result, err
+}
 
+// diagnose collects real operational context (failure reason, live CloudWatch logs,
+// the deployment's event timeline, deployment history, and past incidents) for one
+// deployment and sends a structured, size-bounded prompt to Claude. Missing logs are
+// handled gracefully.
+func (s *Service) diagnose(ctx context.Context, projectID uuid.UUID, deployment *models.Deployment) (string, uuid.UUID, error) {
 	if s.events != nil {
 		depID := deployment.ID
 		envID := deployment.EnvironmentID
@@ -119,7 +118,7 @@ func (s *Service) DiagnoseProject(ctx context.Context, projectID uuid.UUID) (str
 	userMessage := buildDiagnosisContext(failureReason, logLines, history, pastIncidents, eventTimeline)
 	diagnosis, err := s.analyzeWithClaude(ctx, userMessage)
 	if err != nil {
-		return "", fmt.Errorf("analysis failed: %w", err)
+		return "", uuid.Nil, fmt.Errorf("analysis failed: %w", err)
 	}
 
 	// Step 8: save incident to memory layer
@@ -127,7 +126,7 @@ func (s *Service) DiagnoseProject(ctx context.Context, projectID uuid.UUID) (str
 	if len(logLines) > 0 {
 		rawForMemory = strings.Join(logLines, "\n")
 	}
-	s.saveIncident(ctx, projectID, deployment.ID, "deploy_failure", rawForMemory, diagnosis)
+	incidentID := s.saveIncident(ctx, projectID, deployment.ID, "deploy_failure", rawForMemory, diagnosis)
 
 	if s.events != nil {
 		depID := deployment.ID
@@ -143,7 +142,7 @@ func (s *Service) DiagnoseProject(ctx context.Context, projectID uuid.UUID) (str
 		})
 	}
 
-	return diagnosis, nil
+	return diagnosis, incidentID, nil
 }
 
 // fetchDeploymentLogs loads the environment for a deployment, assumes its IAM role, and
@@ -223,7 +222,20 @@ func buildDiagnosisContext(failureReason string, logLines []string, history, pas
 }
 
 func (s *Service) analyzeWithClaude(ctx context.Context, userMessage string) (string, error) {
-	return s.llm.Complete(ctx, diagnosisPrompt, userMessage, 1000)
+	return s.llm.Complete(ctx, prompts.Diagnosis(), userMessage, 1000)
+}
+
+// getDeployment loads one deployment scoped to the project (tenant-isolation guard).
+func (s *Service) getDeployment(ctx context.Context, projectID, deploymentID uuid.UUID) (*models.Deployment, error) {
+	var d models.Deployment
+	err := s.db.Pool.QueryRow(ctx,
+		`SELECT id, project_id, environment_id, commit_sha, status, failure_reason, created_at
+		 FROM deployments WHERE id = $1 AND project_id = $2`, deploymentID, projectID,
+	).Scan(&d.ID, &d.ProjectID, &d.EnvironmentID, &d.CommitSHA, &d.Status, &d.FailureReason, &d.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
 }
 
 func (s *Service) getLastFailedDeployment(ctx context.Context, projectID uuid.UUID) (*models.Deployment, error) {
@@ -262,7 +274,7 @@ func (s *Service) getDeploymentHistory(ctx context.Context, projectID uuid.UUID,
 
 func (s *Service) getPastIncidents(ctx context.Context, projectID uuid.UUID, limit int) (string, error) {
 	rows, err := s.db.Pool.Query(ctx,
-		`SELECT root_cause, resolution, created_at FROM incidents
+		`SELECT root_cause, COALESCE(resolution, ''), created_at FROM incidents
 		 WHERE project_id = $1 ORDER BY created_at DESC LIMIT $2`,
 		projectID, limit,
 	)
@@ -287,10 +299,35 @@ func (s *Service) getPastIncidents(ctx context.Context, projectID uuid.UUID, lim
 	return strings.Join(lines, "\n"), nil
 }
 
-func (s *Service) saveIncident(ctx context.Context, projectID, deploymentID uuid.UUID, trigger, logs, diagnosis string) {
-	s.db.Pool.Exec(ctx,
-		`INSERT INTO incidents (project_id, deployment_id, trigger, root_cause, raw_logs)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		projectID, deploymentID, trigger, diagnosis, logs,
-	)
+// extractDiagnosisField pulls a single "**Label:** value" line out of the
+// structured diagnosis response (see diagnosisPrompt's response format).
+func extractDiagnosisField(diagnosis, label string) string {
+	marker := "**" + label + ":**"
+	idx := strings.Index(diagnosis, marker)
+	if idx == -1 {
+		return ""
+	}
+	rest := diagnosis[idx+len(marker):]
+	if nl := strings.Index(rest, "\n"); nl != -1 {
+		rest = rest[:nl]
+	}
+	return strings.TrimSpace(rest)
+}
+
+func (s *Service) saveIncident(ctx context.Context, projectID, deploymentID uuid.UUID, trigger, logs, diagnosis string) uuid.UUID {
+	// Store the structured pieces so the memory layer can show past causes AND
+	// their fixes; fall back to the full text when parsing fails.
+	rootCause := extractDiagnosisField(diagnosis, "Root Cause")
+	if rootCause == "" {
+		rootCause = diagnosis
+	}
+	resolution := extractDiagnosisField(diagnosis, "Fix")
+
+	var id uuid.UUID
+	s.db.Pool.QueryRow(ctx,
+		`INSERT INTO incidents (project_id, deployment_id, trigger, root_cause, resolution, raw_logs)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		projectID, deploymentID, trigger, rootCause, resolution, logs,
+	).Scan(&id)
+	return id
 }

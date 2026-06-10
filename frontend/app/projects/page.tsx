@@ -20,8 +20,22 @@ import { toast } from "sonner";
 const FRAMEWORK_LABELS: Record<string, string> = {
   fastapi: "FastAPI",
   flask: "Flask",
+  django: "Django",
+  python: "Python",
   nodejs: "Node.js",
+  express: "Express",
+  nestjs: "NestJS",
   nextjs: "Next.js",
+  remix: "Remix",
+  nuxtjs: "Nuxt",
+  svelte: "SvelteKit",
+  astro: "Astro",
+  "react-spa": "React (SPA)",
+  vite: "Vite",
+  go: "Go",
+  rails: "Rails",
+  spring: "Spring Boot",
+  static: "Static / HTML",
 };
 
 export default function ProjectsPage() {

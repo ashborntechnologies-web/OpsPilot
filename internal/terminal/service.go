@@ -101,6 +101,9 @@ func (s *Service) HandleTerminal(c *gin.Context) {
 		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","payload":"environment not deployed — deploy first"}`))
 		return
 	}
+	// Note: ECSClusterName is populated by loadEnv's COALESCE — it holds the platform
+	// stack's cluster for two-tier environments, or the legacy per-env field. Nil here
+	// means neither source has a cluster, i.e. broken provisioning state.
 	if env.ECSClusterName == nil {
 		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","payload":"could not resolve the ECS cluster for this environment — try re-provisioning"}`))
 		return

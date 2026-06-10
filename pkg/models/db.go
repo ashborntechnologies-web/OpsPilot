@@ -75,6 +75,8 @@ func RunMigrations(db *DB) error {
 		createWebhooksTable,
 		addPreviewColumnsToEnvironments,
 		addWebhookColumnsToProjects,
+		addHTTPSSupport,
+		createDiagnosisFeedbackTable,
 	}
 
 	for _, m := range migrations {
@@ -302,6 +304,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS environments_non_preview_name_uniq
     ON environments(project_id, name) WHERE is_preview = false;
 CREATE UNIQUE INDEX IF NOT EXISTS environments_preview_pr_uniq
     ON environments(project_id, pr_number) WHERE is_preview = true;`
+
+// createDiagnosisFeedbackTable records user ratings of AI diagnoses. helpful+fixed
+// rows are the gold-standard dataset for improving the diagnosis model.
+const createDiagnosisFeedbackTable = `
+CREATE TABLE IF NOT EXISTS diagnosis_feedback (
+	id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	incident_id UUID NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+	project_id  UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+	user_id     UUID NOT NULL REFERENCES users(id),
+	rating      TEXT NOT NULL CHECK (rating IN ('helpful', 'not_helpful', 'partially_helpful')),
+	fixed_issue BOOLEAN NOT NULL DEFAULT false,
+	notes       TEXT NOT NULL DEFAULT '',
+	created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	UNIQUE (incident_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_diag_feedback_project ON diagnosis_feedback(project_id);`
+
+// addHTTPSSupport: an optional per-account ACM certificate enables an HTTPS listener
+// on the shared ALB; platform stacks record whether they were provisioned with one
+// (alb_listener_arn then holds the 443 listener and app URLs use https).
+const addHTTPSSupport = `
+ALTER TABLE aws_accounts    ADD COLUMN IF NOT EXISTS certificate_arn TEXT;
+ALTER TABLE platform_stacks ADD COLUMN IF NOT EXISTS https_enabled BOOLEAN NOT NULL DEFAULT false;`
 
 // addWebhookColumnsToProjects stores the GitHub repo webhook installed when PR previews
 // are enabled, so events can be verified (HMAC) and the hook can be removed on deletion.

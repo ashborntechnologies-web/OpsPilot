@@ -9,7 +9,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudformation"
 	cftypes "github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/awstags"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
+	"github.com/google/uuid"
 )
 
 // BootstrapTemplate is the small stack users deploy once per AWS account.
@@ -121,6 +123,12 @@ Resources:
                   - logs:TagResource
                   - logs:ListTagsLogGroup
                 Resource: '*'
+              - Sid: ACMRead
+                Effect: Allow
+                Action:
+                  - acm:DescribeCertificate
+                  - acm:ListCertificates
+                Resource: '*'
               - Sid: ElasticLoadBalancing
                 Effect: Allow
                 Action:
@@ -230,6 +238,21 @@ Outputs:
 // ECS services, Target Groups, and listener rules are created by the deploy workflow via SDK.
 const PlatformTemplate = `AWSTemplateFormatVersion: '2010-09-09'
 Description: ConvDeploy shared platform stack - VPC, ECS cluster, and ALB shared across all projects.
+
+Parameters:
+
+  # Optional ACM certificate for HTTPS. When provided, the ALB serves HTTPS on 443
+  # (where all routing rules attach) and port 80 redirects to it. The certificate
+  # must cover the custom domain the user points at the ALB — ACM cannot issue
+  # certificates for *.amazonaws.com names.
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: Optional ACM certificate ARN to enable HTTPS on the shared ALB.
+
+Conditions:
+
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
 
 Resources:
 
@@ -372,6 +395,32 @@ Resources:
       Port: 80
       Protocol: HTTP
       DefaultActions:
+        - !If
+          - HasCertificate
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: '443'
+              StatusCode: HTTP_301
+          - Type: fixed-response
+            FixedResponseConfig:
+              StatusCode: '404'
+              ContentType: text/plain
+              MessageBody: 'no route matched'
+
+  # HTTPS listener — only created when a certificate is provided. Routing rules
+  # attach here (instead of the HTTP listener) so all app traffic is TLS.
+  ALBHttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
         - Type: fixed-response
           FixedResponseConfig:
             StatusCode: '404'
@@ -391,6 +440,10 @@ Outputs:
 
   ALBListenerArn:
     Value: !Ref ALBListener
+
+  ALBHttpsListenerArn:
+    Condition: HasCertificate
+    Value: !Ref ALBHttpsListener
 
   ALBSecurityGroupId:
     Value: !Ref ALBSecurityGroup
@@ -574,14 +627,28 @@ Outputs:
 func (s *Service) DeployPlatformStack(ctx context.Context, clients *ClientBundle, accountID, region string) (string, error) {
 	stackName := PlatformStackName()
 
+	// An ACM certificate on the AWS account record enables the HTTPS listener.
+	// Only applied at stack creation — existing stacks are not updated.
+	certARN := ""
+	if id, err := uuid.Parse(accountID); err == nil {
+		s.db.Pool.QueryRow(ctx,
+			`SELECT COALESCE(certificate_arn, '') FROM aws_accounts WHERE id = $1`, id,
+		).Scan(&certARN)
+	}
+
 	input := &cloudformation.CreateStackInput{
 		StackName:    aws.String(stackName),
 		TemplateBody: aws.String(PlatformTemplate),
 		Capabilities: []cftypes.Capability{cftypes.CapabilityCapabilityNamedIam},
-		Tags: []cftypes.Tag{
-			{Key: aws.String("convdeploy:managed"), Value: aws.String("true")},
-			{Key: aws.String("convdeploy:account-id"), Value: aws.String(accountID)},
+		Parameters: []cftypes.Parameter{
+			{ParameterKey: aws.String("CertificateArn"), ParameterValue: aws.String(certARN)},
 		},
+		// Stack-level tags propagate to every resource the stack creates.
+		Tags: append(
+			awstags.ToCloudFormation(awstags.BuildResourceTags("", "", s.platformAccountID)),
+			cftypes.Tag{Key: aws.String("convdeploy:managed"), Value: aws.String("true")},
+			cftypes.Tag{Key: aws.String("convdeploy:account-id"), Value: aws.String(accountID)},
+		),
 	}
 
 	out, err := clients.CloudFormation.CreateStack(ctx, input)
@@ -656,6 +723,16 @@ func (s *Service) populatePlatformStackFromOutputs(ctx context.Context, ps *mode
 
 	subnetIDs := vals["SubnetA"] + "," + vals["SubnetB"]
 
+	// With a certificate, the stack emits ALBHttpsListenerArn — all routing rules
+	// attach to the 443 listener (port 80 only redirects), so store IT as the
+	// listener every consumer (deploys, previews) targets.
+	listenerARN := vals["ALBListenerArn"]
+	httpsEnabled := false
+	if https, ok := vals["ALBHttpsListenerArn"]; ok && https != "" {
+		listenerARN = https
+		httpsEnabled = true
+	}
+
 	_, err := s.db.Pool.Exec(ctx, `
 		UPDATE platform_stacks SET
 			ecs_cluster_name      = $1,
@@ -666,16 +743,18 @@ func (s *Service) populatePlatformStackFromOutputs(ctx context.Context, ps *mode
 			ecs_security_group_id = $6,
 			subnet_ids            = $7,
 			stack_status          = $8,
+			https_enabled         = $9,
 			updated_at            = NOW()
-		WHERE id = $9`,
+		WHERE id = $10`,
 		vals["ECSClusterName"],
 		vals["ALBArn"],
 		vals["ALBDns"],
-		vals["ALBListenerArn"],
+		listenerARN,
 		vals["ALBSecurityGroupId"],
 		vals["ECSSecurityGroupId"],
 		subnetIDs,
 		models.StackStatusReady,
+		httpsEnabled,
 		ps.ID,
 	)
 	if err != nil {
@@ -686,11 +765,12 @@ func (s *Service) populatePlatformStackFromOutputs(ctx context.Context, ps *mode
 	ps.ECSClusterName = aws.String(vals["ECSClusterName"])
 	ps.ALBArn = aws.String(vals["ALBArn"])
 	ps.ALBDNS = aws.String(vals["ALBDns"])
-	ps.ALBListenerArn = aws.String(vals["ALBListenerArn"])
+	ps.ALBListenerArn = aws.String(listenerARN)
 	ps.ALBSecurityGroupID = aws.String(vals["ALBSecurityGroupId"])
 	ps.ECSSecurityGroupID = aws.String(vals["ECSSecurityGroupId"])
 	ps.SubnetIDs = aws.String(subnetIDs)
 	ps.StackStatus = models.StackStatusReady
+	ps.HTTPSEnabled = httpsEnabled
 
 	return nil
 }
@@ -709,10 +789,13 @@ func (s *Service) DeployProjectStack(ctx context.Context, clients *ClientBundle,
 			{ParameterKey: aws.String("EnvironmentName"), ParameterValue: aws.String(env.Name)},
 		},
 		Capabilities: []cftypes.Capability{cftypes.CapabilityCapabilityNamedIam},
-		Tags: []cftypes.Tag{
-			{Key: aws.String("convdeploy:project-id"), Value: aws.String(project.ID.String())},
-			{Key: aws.String("convdeploy:environment"), Value: aws.String(env.Name)},
-		},
+		// Stack-level tags propagate to every resource the stack creates (ECR repo,
+		// CodeBuild project, IAM roles, log group).
+		Tags: append(
+			awstags.ToCloudFormation(awstags.BuildResourceTags(project.ID.String(), env.Name, s.platformAccountID)),
+			cftypes.Tag{Key: aws.String("convdeploy:project-id"), Value: aws.String(project.ID.String())},
+			cftypes.Tag{Key: aws.String("convdeploy:environment"), Value: aws.String(env.Name)},
+		),
 	}
 
 	out, err := clients.CloudFormation.CreateStack(ctx, input)

@@ -187,8 +187,9 @@ export default function ChatPage() {
                 {SUGGESTED.map((s) => (
                   <button
                     key={s}
-                    onClick={() => { send(s); }}
-                    className="text-xs px-3 py-1.5 rounded-full border hover:bg-zinc-100 transition-colors"
+                    disabled={!connected || thinking}
+                    onClick={() => { if (!thinking) send(s); }}
+                    className="text-xs px-3 py-1.5 rounded-full border hover:bg-zinc-100 transition-colors disabled:opacity-50 disabled:pointer-events-none"
                   >
                     {s}
                   </button>

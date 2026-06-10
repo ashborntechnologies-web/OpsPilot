@@ -132,6 +132,31 @@ func (s *Service) HandleUpsert(c *gin.Context) {
 	c.JSON(http.StatusOK, v)
 }
 
+// HandleReveal returns the plaintext value of a single env var. List responses
+// redact secret values; this endpoint is the deliberate, per-variable reveal path
+// (project ownership is enforced by middleware, env↔project by resolveEnv).
+func (s *Service) HandleReveal(c *gin.Context) {
+	varID, err := uuid.Parse(c.Param("varId"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid var id"})
+		return
+	}
+	envID, ok := s.resolveEnv(c)
+	if !ok {
+		return
+	}
+
+	var value string
+	err = s.db.Pool.QueryRow(c.Request.Context(),
+		`SELECT value FROM env_vars WHERE id = $1 AND environment_id = $2`, varID, envID,
+	).Scan(&value)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "env var not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"value": value})
+}
+
 // HandleDelete removes an env var by ID.
 func (s *Service) HandleDelete(c *gin.Context) {
 	varID, err := uuid.Parse(c.Param("varId"))
