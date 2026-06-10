@@ -16,8 +16,17 @@ async function request<T>(
   });
 
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error((body as { error?: string }).error ?? `HTTP ${res.status}`);
+    const body = await res.json().catch(() => null);
+    const apiError = (body as { error?: string } | null)?.error;
+    if (apiError) {
+      throw new Error(apiError);
+    }
+    // No JSON error body — the response didn't come from a backend handler
+    // (proxy 404/502 when the Go API is down, or an unregistered route).
+    const method = options.method ?? "GET";
+    throw new Error(
+      `${method} /api/v1${path} failed with HTTP ${res.status} — is the backend running?`
+    );
   }
 
   if (res.status === 204) return undefined as T;
@@ -248,9 +257,16 @@ export function getConversationHistory(token: string, projectId: string) {
 
 // ---- CloudFormation ----------------------------------------------------------
 
-export function getBootstrapTemplate(region: string) {
-  return fetch(`/api/v1/cloudformation/bootstrap-template?region=${region}`)
-    .then((r) => r.json()) as Promise<{ template: string; script: string; external_id?: string; error?: string }>;
+export async function getBootstrapTemplate(region: string) {
+  const res = await fetch(`/api/v1/cloudformation/bootstrap-template?region=${region}`);
+  const body = await res.json().catch(() => null);
+  if (!res.ok || !body) {
+    throw new Error(
+      (body as { error?: string } | null)?.error ??
+        `Failed to load the setup template (HTTP ${res.status}) — is the backend running?`
+    );
+  }
+  return body as { template: string; script: string; external_id?: string; error?: string };
 }
 
 // ---- Webhooks ----------------------------------------------------------------
@@ -295,6 +311,19 @@ export function deleteWebhook(token: string, projectId: string, webhookId: strin
 
 export function getProjectCosts(token: string, projectId: string) {
   return request<CostSummary>(`/projects/${projectId}/costs`, token);
+}
+
+// ---- Health Score --------------------------------------------------------------
+
+export interface HealthScore {
+  score: number;
+  grade: "healthy" | "degraded" | "at_risk" | "critical";
+  components: Record<string, number>;
+  insights: string[];
+}
+
+export function getHealthScore(token: string, projectId: string) {
+  return request<HealthScore>(`/projects/${projectId}/health-score`, token);
 }
 
 // ---- PR Preview Environments -------------------------------------------------

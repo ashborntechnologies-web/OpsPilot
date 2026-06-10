@@ -1,24 +1,22 @@
 package conversation
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
+	"log"
 	"net/http"
+	"strings"
 
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/ws"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
-
-const anthropicAPIURL = "https://api.anthropic.com/v1/messages"
-const claudeModel = "claude-sonnet-4-20250514"
 
 const intentClassifierPrompt = `You are the intent classifier for a deployment platform.
 Classify the user's message into exactly one of these intents:
@@ -49,26 +47,8 @@ type Service struct {
 	db           *models.DB
 	deploySvc    *deploy.Service
 	diagnosisSvc *diagnosis.Service
-	apiKey       string
+	llm          *llm.Client
 	hub          *ws.Hub
-}
-
-type claudeRequest struct {
-	Model     string          `json:"model"`
-	MaxTokens int             `json:"max_tokens"`
-	System    string          `json:"system"`
-	Messages  []claudeMessage `json:"messages"`
-}
-
-type claudeMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type claudeResponse struct {
-	Content []struct {
-		Text string `json:"text"`
-	} `json:"content"`
 }
 
 type IntentResult struct {
@@ -82,7 +62,7 @@ func NewService(db *models.DB, deploySvc *deploy.Service, diagnosisSvc *diagnosi
 		db:           db,
 		deploySvc:    deploySvc,
 		diagnosisSvc: diagnosisSvc,
-		apiKey:       apiKey,
+		llm:          llm.New(apiKey),
 		hub:          hub,
 	}
 }
@@ -157,13 +137,26 @@ func (s *Service) HandleHistory(c *gin.Context) {
 // the user message and the assistant response to the conversations table.
 // Implements ws.MessageHandler.
 func (s *Service) ProcessMessage(ctx context.Context, projectID uuid.UUID, userID uuid.UUID, message string) (string, error) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return "Please type a message — for example \"deploy\" or \"show me the logs\".", nil
+	}
+	if len(message) > 4000 {
+		return "That message is too long for me to process — please keep it under 4000 characters.", nil
+	}
+
 	// Persist user message first so history is correct even if processing fails
 	s.saveMessage(ctx, projectID, userID, "user", message, nil)
 
-	// Classify intent
+	// Classify intent. On failure (API outage, rate limit) degrade to a helpful
+	// fallback response instead of breaking the chat with a raw error.
 	intent, err := s.classifyIntent(ctx, message)
 	if err != nil {
-		return "", fmt.Errorf("failed to classify intent: %w", err)
+		log.Printf("[conversation] intent classification failed: %v", err)
+		fallback := "I'm having trouble understanding requests right now (the AI service is unavailable). " +
+			"You can still use the dashboard buttons to deploy, roll back, or view logs — or try again in a moment."
+		s.saveMessage(ctx, projectID, userID, "assistant", fallback, nil)
+		return fallback, nil
 	}
 
 	// Route to the matching workflow — Go code executes, Claude never touches AWS
@@ -220,53 +213,26 @@ func (s *Service) ProcessMessage(ctx context.Context, projectID uuid.UUID, userI
 
 // classifyIntent sends the message to Claude and returns the parsed intent.
 func (s *Service) classifyIntent(ctx context.Context, message string) (*IntentResult, error) {
-	reqBody := claudeRequest{
-		Model:     claudeModel,
-		MaxTokens: 200,
-		System:    intentClassifierPrompt,
-		Messages:  []claudeMessage{{Role: "user", Content: message}},
-	}
-
-	body, err := json.Marshal(reqBody)
+	text, err := s.llm.Complete(ctx, intentClassifierPrompt, message, 200)
 	if err != nil {
 		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", anthropicAPIURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", s.apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var claudeResp claudeResponse
-	if err := json.Unmarshal(respBody, &claudeResp); err != nil {
-		return nil, err
-	}
-
-	if len(claudeResp.Content) == 0 {
-		return nil, fmt.Errorf("empty response from Claude")
 	}
 
 	var result IntentResult
-	if err := json.Unmarshal([]byte(claudeResp.Content[0].Text), &result); err != nil {
+	if err := json.Unmarshal([]byte(stripJSONFences(text)), &result); err != nil {
 		return nil, fmt.Errorf("failed to parse intent JSON: %w", err)
 	}
-
 	return &result, nil
+}
+
+// stripJSONFences removes markdown code fences the model occasionally wraps
+// around JSON despite instructions.
+func stripJSONFences(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "```json")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	return strings.TrimSpace(s)
 }
 
 // saveMessage persists a conversation turn. Errors are logged but never surfaced —

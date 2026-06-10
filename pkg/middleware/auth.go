@@ -18,11 +18,17 @@ const ClerkIDContextKey = "clerk_id" // string
 // ResolveToken validates a raw Clerk JWT string and returns the platform user ID.
 // Used by both the HTTP middleware and the WebSocket first-message auth handler.
 func ResolveToken(ctx context.Context, db *models.DB, authSvc *auth.Service, tokenString string) (uuid.UUID, error) {
+	userID, _, err := resolveTokenWithClerkID(ctx, db, authSvc, tokenString)
+	return userID, err
+}
+
+func resolveTokenWithClerkID(ctx context.Context, db *models.DB, authSvc *auth.Service, tokenString string) (uuid.UUID, string, error) {
 	claims, err := authSvc.ValidateToken(tokenString)
 	if err != nil {
-		return uuid.UUID{}, fmt.Errorf("invalid token: %w", err)
+		return uuid.UUID{}, "", fmt.Errorf("invalid token: %w", err)
 	}
-	return upsertUser(ctx, db, authSvc, claims.Subject)
+	userID, err := upsertUser(ctx, db, authSvc, claims.Subject)
+	return userID, claims.Subject, err
 }
 
 // RequireAuth validates the Clerk JWT from the Authorization header, upserts the user
@@ -41,14 +47,13 @@ func RequireAuth(authSvc *auth.Service, db *models.DB) gin.HandlerFunc {
 			return
 		}
 
-		userID, err := ResolveToken(c.Request.Context(), db, authSvc, parts[1])
+		userID, clerkID, err := resolveTokenWithClerkID(c.Request.Context(), db, authSvc, parts[1])
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 			return
 		}
 
-		claims, _ := authSvc.ValidateToken(parts[1])
-		c.Set(ClerkIDContextKey, claims.Subject)
+		c.Set(ClerkIDContextKey, clerkID)
 		c.Set(UserIDContextKey, userID)
 		c.Next()
 	}
@@ -112,7 +117,7 @@ func upsertUser(ctx context.Context, db *models.DB, authSvc *auth.Service, clerk
 
 	email := clerkUser.PrimaryEmail()
 	if email == "" {
-		return uuid.UUID{}, nil // should not happen for real users
+		return uuid.UUID{}, fmt.Errorf("clerk user %s has no primary email", clerkID)
 	}
 
 	// INSERT ... ON CONFLICT handles the race between concurrent first-logins

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -66,10 +67,55 @@ func resolvePlatformIdentity() (accountID, callerARN string) {
 	return accountID, callerARN
 }
 
+// validateEnv fails fast at startup when required configuration is missing,
+// instead of surfacing as confusing runtime errors hours later.
+func validateEnv() {
+	required := []string{
+		"DATABASE_URL",
+		"REDIS_URL",
+		"CLERK_SECRET_KEY",
+		"CLERK_PUBLISHABLE_KEY",
+		"ENCRYPTION_KEY",
+	}
+	var missing []string
+	for _, key := range required {
+		if os.Getenv(key) == "" {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		log.Fatalf("Missing required environment variables: %s — see .env.example", strings.Join(missing, ", "))
+	}
+
+	// The AES key is derived by SHA-256 hashing this value, so any length works —
+	// just enforce a minimum so a trivially guessable key can't be used.
+	if key := os.Getenv("ENCRYPTION_KEY"); len(key) < 16 {
+		log.Fatalf("ENCRYPTION_KEY must be at least 16 characters (got %d) — GitHub tokens are encrypted with a key derived from it", len(key))
+	}
+
+	// Optional integrations — warn so operators know a feature is disabled, not broken.
+	if os.Getenv("ANTHROPIC_API_KEY") == "" {
+		log.Println("WARNING: ANTHROPIC_API_KEY not set — chat intent classification, AI diagnosis, and AI framework detection are disabled")
+	}
+	if os.Getenv("GITHUB_CLIENT_ID") == "" || os.Getenv("GITHUB_CLIENT_SECRET") == "" {
+		log.Println("WARNING: GitHub OAuth credentials not set — repository connection is disabled")
+	}
+	if os.Getenv("FRONTEND_URL") == "" {
+		log.Println("WARNING: FRONTEND_URL not set — CORS and WebSocket origin checks allow all origins (dev mode)")
+	}
+}
+
 func main() {
 	// Load env
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using system env")
+	}
+
+	validateEnv()
+
+	// Run Gin in release mode outside development to avoid debug logging overhead.
+	if env := os.Getenv("ENV"); env != "" && env != "development" {
+		gin.SetMode(gin.ReleaseMode)
 	}
 
 	// Connect DB
@@ -258,6 +304,9 @@ func main() {
 		// Cost intelligence
 		proj.GET("/costs", deploySvc.HandleGetCosts)
 
+		// Deployment health score (computed from platform data, no AWS calls)
+		proj.GET("/health-score", deploySvc.HandleGetHealthScore)
+
 		// PR Preview Environments
 		proj.POST("/previews/enable", deploySvc.HandleEnablePreviews)
 		proj.POST("/previews/disable", deploySvc.HandleDisablePreviews)
@@ -288,6 +337,10 @@ func main() {
 	srv := &http.Server{
 		Addr:    ":" + port,
 		Handler: r,
+		// ReadHeaderTimeout protects against slowloris. Full read/write timeouts are
+		// deliberately absent — they would kill long-lived WebSocket connections.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {

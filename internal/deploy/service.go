@@ -7,7 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,6 +96,49 @@ func NewService(db *models.DB, awsSvc awssvc.AWSProvider, githubSvc githubsvc.Gi
 
 // ---- HTTP handlers ----
 
+var (
+	// projectNameRe permits names safe to embed in AWS resource names
+	// (CloudFormation stacks, ECS services, log groups).
+	projectNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9 _.-]{0,62}$`)
+	// githubNameRe matches valid GitHub owner/repo segments.
+	githubNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$`)
+)
+
+// isNonPublicURL reports whether the URL's host is loopback, private, or link-local —
+// i.e. somewhere GitHub's webhook delivery cannot reach.
+func isNonPublicURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return true
+	}
+	host := u.Hostname()
+	if host == "localhost" || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()
+	}
+	return false
+}
+
+func validateProjectInput(name, repoOwner, repoName string, branch *string) error {
+	if !projectNameRe.MatchString(name) {
+		return fmt.Errorf("project name must be 1-63 characters: letters, numbers, spaces, dots, dashes, underscores")
+	}
+	if !githubNameRe.MatchString(repoOwner) {
+		return fmt.Errorf("invalid repository owner")
+	}
+	if !githubNameRe.MatchString(repoName) {
+		return fmt.Errorf("invalid repository name")
+	}
+	if branch != nil && *branch != "" {
+		if len(*branch) > 255 || strings.ContainsAny(*branch, " \t\n~^:?*[\\") || strings.Contains(*branch, "..") {
+			return fmt.Errorf("invalid branch name")
+		}
+	}
+	return nil
+}
+
 func (s *Service) HandleCreateProject(c *gin.Context) {
 	var req struct {
 		Name         string  `json:"name" binding:"required"`
@@ -105,6 +152,12 @@ func (s *Service) HandleCreateProject(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	if err := validateProjectInput(req.Name, req.RepoOwner, req.RepoName, req.Branch); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -217,7 +270,16 @@ func (s *Service) HandleDeploy(c *gin.Context) {
 
 	response, err := s.TriggerDeploy(c.Request.Context(), projectID, envName)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		status := http.StatusInternalServerError
+		switch {
+		case strings.Contains(err.Error(), "not found"):
+			status = http.StatusNotFound
+		case strings.Contains(err.Error(), "already in progress"):
+			status = http.StatusConflict
+		case strings.Contains(err.Error(), "GitHub not connected"):
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -312,6 +374,11 @@ func (s *Service) HandleRedeploy(c *gin.Context) {
 		return
 	}
 
+	if inFlight, _ := s.hasInFlightDeployment(c.Request.Context(), dep.EnvironmentID); inFlight {
+		c.JSON(http.StatusConflict, gin.H{"error": "a deployment is already in progress for this environment"})
+		return
+	}
+
 	commitMsg := ""
 	if dep.CommitMessage != nil {
 		commitMsg = *dep.CommitMessage
@@ -329,6 +396,8 @@ func (s *Service) HandleRedeploy(c *gin.Context) {
 		newDep.ID.String(),
 		dep.CommitSHA,
 	); err != nil {
+		reason := "failed to queue redeploy job"
+		s.updateDeploymentStatus(c.Request.Context(), newDep.ID, models.DeployStatusFailed, &reason, nil)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to queue redeploy job"})
 		return
 	}
@@ -393,6 +462,10 @@ func (s *Service) TriggerDeploy(ctx context.Context, projectID uuid.UUID, envNam
 		return "", fmt.Errorf("environment %q not found — create it first: %w", envName, err)
 	}
 
+	if inFlight, _ := s.hasInFlightDeployment(ctx, env.ID); inFlight {
+		return "", fmt.Errorf("a deployment is already in progress for %s — wait for it to finish or for the watchdog to clear it", envName)
+	}
+
 	token, err := s.githubSvc.GetTokenForDeployment(ctx, project.UserID)
 	if err != nil {
 		return "", fmt.Errorf("GitHub not connected: %w", err)
@@ -418,6 +491,9 @@ func (s *Service) TriggerDeploy(ctx context.Context, projectID uuid.UUID, envNam
 		deployment.ID.String(),
 		commitSHA,
 	); err != nil {
+		// Mark the orphaned record failed so it doesn't block future deploys.
+		reason := "failed to queue deploy job"
+		s.updateDeploymentStatus(ctx, deployment.ID, models.DeployStatusFailed, &reason, nil)
 		return "", fmt.Errorf("failed to queue deploy job: %w", err)
 	}
 
@@ -536,12 +612,16 @@ func (s *Service) RunDeployWorkflow(ctx context.Context, projectID, environmentI
 
 	// The GitHub token is stored in SSM for the duration of the build (secure path) and
 	// deleted once the build finishes, win or lose. cleanupSecret is idempotent and safe.
+	// It uses a detached context: the most common failure path is the workflow context
+	// expiring, and the delete must still go through or the token leaks in SSM.
 	cleanupSecret := func() {
 		if buildRes.TokenParamName == "" {
 			return
 		}
-		s.awsSvc.DeleteSSMParameter(ctx, clients, buildRes.TokenParamName)
-		s.events.Emit(ctx, events.Event{
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		s.awsSvc.DeleteSSMParameter(cleanupCtx, clients, buildRes.TokenParamName)
+		s.events.Emit(cleanupCtx, events.Event{
 			ProjectID:     projectID,
 			EnvironmentID: envIDPtr,
 			DeploymentID:  depIDPtr,
@@ -824,7 +904,7 @@ func (s *Service) ReconcileStuckResources(ctx context.Context) error {
 	rows, err := s.db.Pool.Query(ctx,
 		`UPDATE deployments
 		    SET status = $1, failure_reason = $2, updated_at = NOW()
-		  WHERE status IN ('building', 'deploying')
+		  WHERE status IN ('pending', 'building', 'deploying')
 		    AND updated_at < NOW() - make_interval(mins => $3)
 		 RETURNING id, project_id, environment_id, status`,
 		models.DeployStatusFailed, reason, stuckThresholdMinutes,
@@ -914,6 +994,10 @@ func (s *Service) TriggerRollback(ctx context.Context, projectID uuid.UUID, envN
 		return "", fmt.Errorf("environment %q not found", envName)
 	}
 
+	if inFlight, _ := s.hasInFlightDeployment(ctx, env.ID); inFlight {
+		return "", fmt.Errorf("a deployment is already in progress for %s — wait for it to finish before rolling back", envName)
+	}
+
 	deployable, err := s.getRecentDeployableDeployments(ctx, env.ID, 2)
 	if err != nil {
 		return "", fmt.Errorf("failed to load deployment history: %w", err)
@@ -940,6 +1024,8 @@ func (s *Service) TriggerRollback(ctx context.Context, projectID uuid.UUID, envN
 	if err := s.enqueuer.EnqueueRollback(
 		projectID.String(), env.ID.String(), newDep.ID.String(), current.ID.String(),
 	); err != nil {
+		reason := "failed to queue rollback job"
+		s.updateDeploymentStatus(ctx, newDep.ID, models.DeployStatusFailed, &reason, nil)
 		return "", fmt.Errorf("failed to queue rollback job: %w", err)
 	}
 
@@ -1592,6 +1678,21 @@ func (s *Service) getEnvironmentByID(ctx context.Context, envID uuid.UUID) (*mod
 	return &env, nil
 }
 
+// hasInFlightDeployment reports whether the environment already has a deployment in
+// pending/building/deploying state. Guards against concurrent rollouts racing on the
+// same ECS service. The watchdog auto-fails rows stuck past stuckThresholdMinutes,
+// so a crashed worker cannot block deploys forever.
+func (s *Service) hasInFlightDeployment(ctx context.Context, envID uuid.UUID) (bool, error) {
+	var exists bool
+	err := s.db.Pool.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM deployments
+			WHERE environment_id = $1 AND status IN ('pending', 'building', 'deploying')
+		)`, envID,
+	).Scan(&exists)
+	return exists, err
+}
+
 func (s *Service) getDeployment(ctx context.Context, deploymentID uuid.UUID) (*models.Deployment, error) {
 	var d models.Deployment
 	err := s.db.Pool.QueryRow(ctx,
@@ -1914,10 +2015,31 @@ func (s *Service) HandleEnablePreviews(c *gin.Context) {
 	rand.Read(secretBytes)
 	secret := hex.EncodeToString(secretBytes)
 
-	webhookURL := c.GetHeader("X-Forwarded-Proto") + "://" + c.Request.Host + "/api/v1/github/webhook"
-	// Fallback for local dev.
-	if webhookURL == "://" + c.Request.Host + "/api/v1/github/webhook" {
-		webhookURL = "http://" + c.Request.Host + "/api/v1/github/webhook"
+	// Prefer the explicitly configured public URL — the Host header is client-controlled
+	// and wrong behind proxies. Fall back to request-derived URL for local dev.
+	var webhookURL string
+	if base := os.Getenv("PUBLIC_API_URL"); base != "" {
+		webhookURL = strings.TrimRight(base, "/") + "/api/v1/github/webhook"
+	} else {
+		proto := c.GetHeader("X-Forwarded-Proto")
+		if proto == "" {
+			proto = "http"
+		}
+		webhookURL = proto + "://" + c.Request.Host + "/api/v1/github/webhook"
+	}
+
+	// GitHub rejects webhook URLs that aren't reachable over the public Internet.
+	// Catch the common local-dev case up front with a clear explanation instead of
+	// surfacing GitHub's 422.
+	if isNonPublicURL(webhookURL) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf(
+				"PR previews need a publicly reachable API URL, but this server is at %s. "+
+					"Expose it with a tunnel (e.g. `ngrok http 8080`), set PUBLIC_API_URL to the tunnel URL in .env, restart, and try again.",
+				webhookURL,
+			),
+		})
+		return
 	}
 
 	// Delete old hook if present.
@@ -1927,6 +2049,15 @@ func (s *Service) HandleEnablePreviews(c *gin.Context) {
 
 	hookID, err := s.githubSvc.RegisterRepoWebhook(c.Request.Context(), token, project.RepoOwner, project.RepoName, webhookURL, secret)
 	if err != nil {
+		if strings.Contains(err.Error(), "reachable over the public Internet") {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf(
+					"GitHub can't reach %s from the Internet. Expose the API with a tunnel (e.g. `ngrok http 8080`), set PUBLIC_API_URL to the tunnel URL in .env, restart, and try again.",
+					webhookURL,
+				),
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register webhook: " + err.Error()})
 		return
 	}
@@ -2256,7 +2387,12 @@ func (s *Service) runPreviewDeployWorkflow(ctx context.Context, projectID, envID
 	}
 
 	if buildRes.TokenParamName != "" {
-		defer s.awsSvc.DeleteSSMParameter(ctx, clients, buildRes.TokenParamName)
+		// Detached context — the delete must succeed even if the workflow context expired.
+		defer func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			s.awsSvc.DeleteSSMParameter(cleanupCtx, clients, buildRes.TokenParamName)
+		}()
 	}
 
 	if err := s.awsSvc.WaitForCodeBuild(ctx, clients, buildRes.BuildID, func(msg string) {

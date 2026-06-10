@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import useSWR from "swr";
 import { useAuth } from "@clerk/nextjs";
 import { Navbar } from "@/components/layout/navbar";
 import { Button } from "@/components/ui/button";
@@ -8,39 +9,38 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { ConnectAWSModal } from "@/components/project/connect-aws-modal";
 import { listAWSAccounts, deleteAWSAccount } from "@/lib/api";
-import type { AWSAccount } from "@/types/api";
+
 import { toast } from "sonner";
 import { Plus, Trash2, Cloud, Loader2 } from "lucide-react";
 
 export default function AWSAccountsPage() {
   const { getToken } = useAuth();
-  const [accounts, setAccounts] = useState<AWSAccount[]>([]);
-  const [loading, setLoading] = useState(true);
   const [connectOpen, setConnectOpen] = useState(false);
   const [deleting, setDeleting] = useState<string | null>(null);
 
-  async function load() {
+  const {
+    data: accounts = [],
+    isLoading: loading,
+    mutate,
+  } = useSWR("aws-accounts", async () => {
     const token = await getToken();
-    if (!token) return;
-    try {
-      const data = await listAWSAccounts(token);
-      setAccounts(data ?? []);
-    } catch {
-      toast.error("Failed to load AWS accounts");
-    }
-  }
-
-  useEffect(() => {
-    load().finally(() => setLoading(false));
-  }, []);
+    if (!token) return [];
+    return (await listAWSAccounts(token)) ?? [];
+  }, {
+    onError: () => toast.error("Failed to load AWS accounts"),
+  });
 
   async function handleDelete(id: string) {
+    const account = accounts.find((a) => a.id === id);
+    if (!window.confirm(`Remove AWS account "${account?.label ?? id}"? Projects using it will no longer be able to deploy.`)) {
+      return;
+    }
     const token = await getToken();
     if (!token) return;
     setDeleting(id);
     try {
       await deleteAWSAccount(token, id);
-      setAccounts((prev) => prev.filter((a) => a.id !== id));
+      void mutate((prev) => (prev ?? []).filter((a) => a.id !== id), { revalidate: false });
       toast.success("AWS account removed");
     } catch (e: unknown) {
       toast.error((e as Error).message ?? "Failed to remove account");
@@ -57,7 +57,7 @@ export default function AWSAccountsPage() {
         open={connectOpen}
         onClose={() => setConnectOpen(false)}
         onConnected={(account) => {
-          setAccounts((prev) => [account, ...prev]);
+          void mutate((prev) => [account, ...(prev ?? [])], { revalidate: false });
           setConnectOpen(false);
         }}
       />

@@ -128,7 +128,13 @@ func (s *Server) handleDeploy(ctx context.Context, t *asynq.Task) error {
 	log.Printf("[deploy] starting job project=%s env=%s deploy=%s commit=%s",
 		p.ProjectID[:8], p.EnvironmentID[:8], p.DeploymentID[:8], p.CommitSHA[:8])
 
-	return s.deploySvc.RunDeployWorkflow(ctx, projectID, environmentID, deploymentID)
+	if err := s.deploySvc.RunDeployWorkflow(ctx, projectID, environmentID, deploymentID); err != nil {
+		// Never auto-retry deploys — the workflow already marked the deployment
+		// failed and notified the user; a retry would launch a duplicate CodeBuild
+		// job and ECS rollout for a deployment the user believes is dead.
+		return fmt.Errorf("%w: %w", asynq.SkipRetry, err)
+	}
+	return nil
 }
 
 func (s *Server) handleProvision(ctx context.Context, t *asynq.Task) error {
@@ -250,7 +256,9 @@ func NewDeployTask(projectID, environmentID, deploymentID, commitSHA string) (*a
 	if err != nil {
 		return nil, err
 	}
-	return asynq.NewTask(TaskDeploy, payload, asynq.Queue("critical")), nil
+	// MaxRetry(0): deploy failures are terminal (see handleDeploy) — the user
+	// redeploys explicitly.
+	return asynq.NewTask(TaskDeploy, payload, asynq.Queue("critical"), asynq.MaxRetry(0)), nil
 }
 
 func NewRollbackTask(projectID, environmentID, deploymentID, previousDeploymentID string) (*asynq.Task, error) {
@@ -291,7 +299,9 @@ func NewDiagnoseTask(projectID, deploymentID string) (*asynq.Task, error) {
 	if err != nil {
 		return nil, err
 	}
-	return asynq.NewTask(TaskDiagnose, payload, asynq.Queue("default")), nil
+	// Diagnosis hits the Claude API — cap retries so a persistent failure
+	// doesn't burn tokens for hours.
+	return asynq.NewTask(TaskDiagnose, payload, asynq.Queue("default"), asynq.MaxRetry(2)), nil
 }
 
 // ---- Scheduler — enqueues periodic tasks (stuck-resource watchdog) ----

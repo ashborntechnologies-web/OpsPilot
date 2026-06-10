@@ -8,11 +8,11 @@ import { Navbar } from "@/components/layout/navbar";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Badge } from "@/components/ui/badge";
+
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { useProjectWS, type ChatEntry } from "@/lib/use-ws";
 import { getConversationHistory, getProject } from "@/lib/api";
-import type { Project, ConversationMessage } from "@/types/api";
+import type { Project } from "@/types/api";
 import { ArrowLeft, Send, Wifi, WifiOff, Loader2, Rocket } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -111,8 +111,13 @@ export default function ChatPage() {
     };
   }, [getToken]);
 
+  // Fetch project + history once when a token first becomes available. Without the
+  // guard, every periodic token refresh would refetch and loadHistory would wipe
+  // live WS messages from the conversation.
+  const historyFetched = useRef(false);
   useEffect(() => {
-    if (!token) return;
+    if (!token || historyFetched.current) return;
+    historyFetched.current = true;
     Promise.all([
       getProject(token, id).then(setProject),
       getConversationHistory(token, id),
@@ -120,7 +125,7 @@ export default function ChatPage() {
       if (history?.length) loadHistory(history);
       setHistoryLoaded(true);
     }).catch(() => setHistoryLoaded(true));
-  }, [token, id]);
+  }, [token, id, loadHistory]);
 
   // Auto-scroll on new messages
   useEffect(() => {

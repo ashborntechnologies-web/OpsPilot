@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -117,6 +118,27 @@ func (s *Service) AssumeRoleForEnvironment(ctx context.Context, env *models.Envi
 	return s.assumeRole(ctx, iamRoleARN, env.AWSRegion, env.ID.String(), externalID)
 }
 
+// explainAssumeRoleError turns the raw STS AccessDenied into an actionable message.
+// The two real-world causes are (a) external-ID mismatch after the customer re-ran the
+// setup script, and (b) same-account setups where the platform caller is missing the
+// sts:AssumeRole identity policy (trust policy alone is insufficient within one account).
+func (s *Service) explainAssumeRoleError(err error, iamRoleARN string) error {
+	if !strings.Contains(err.Error(), "AccessDenied") {
+		return fmt.Errorf("failed to assume IAM role %s: %w", iamRoleARN, err)
+	}
+
+	hint := "the role's trust policy may no longer match this connection — if you re-ran the setup script, reconnect the AWS account in ConvDeploy so the external ID matches"
+	// Same-account: the platform caller needs an identity policy, which the setup
+	// script normally grants. Spell out the exact missing grant.
+	if s.platformAccountID != "" && strings.Contains(iamRoleARN, ":"+s.platformAccountID+":") {
+		hint = fmt.Sprintf(
+			"platform and target role are in the same AWS account (%s), which requires an explicit sts:AssumeRole grant on the platform identity (%s). Re-run the latest setup script, or attach a policy allowing sts:AssumeRole on %s",
+			s.platformAccountID, s.platformCallerARN, iamRoleARN,
+		)
+	}
+	return fmt.Errorf("AWS denied sts:AssumeRole on %s: %s (%w)", iamRoleARN, hint, err)
+}
+
 // assumeRole is the shared helper that loads config and assumes a role ARN with the
 // given STS external ID.
 func (s *Service) assumeRole(ctx context.Context, iamRoleARN, region, sessionSuffix, externalID string) (*ClientBundle, error) {
@@ -130,6 +152,13 @@ func (s *Service) assumeRole(ctx context.Context, iamRoleARN, region, sessionSuf
 		o.RoleSessionName = fmt.Sprintf("convdeploy-%s", sessionSuffix)
 		o.ExternalID = aws.String(externalID)
 	})
+
+	// Verify the role can be assumed NOW. The credentials provider is lazy, so
+	// without this check an AssumeRole failure surfaces later buried inside an
+	// unrelated ECS/CloudFormation operation error.
+	if _, err := provider.Retrieve(ctx); err != nil {
+		return nil, s.explainAssumeRoleError(err, iamRoleARN)
+	}
 
 	assumedCfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(region),
@@ -426,6 +455,20 @@ func (s *Service) RegisterECSTaskDefinition(
 
 // ---- HTTP handlers ----
 
+var (
+	awsAccountIDRe = regexp.MustCompile(`^\d{12}$`)
+	iamRoleARNRe   = regexp.MustCompile(`^arn:aws:iam::(\d{12}):role/[\w+=,.@/-]+$`)
+)
+
+// validAWSRegions are the regions ConvDeploy supports for environment provisioning.
+var validAWSRegions = map[string]bool{
+	"us-east-1": true, "us-east-2": true, "us-west-1": true, "us-west-2": true,
+	"eu-west-1": true, "eu-west-2": true, "eu-west-3": true, "eu-central-1": true, "eu-north-1": true,
+	"ap-south-1": true, "ap-southeast-1": true, "ap-southeast-2": true,
+	"ap-northeast-1": true, "ap-northeast-2": true,
+	"ca-central-1": true, "sa-east-1": true,
+}
+
 func (s *Service) HandleCreateEnvironment(c *gin.Context) {
 	projectID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -450,6 +493,10 @@ func (s *Service) HandleCreateEnvironment(c *gin.Context) {
 
 	if req.AWSRegion == "" {
 		req.AWSRegion = "us-east-1"
+	}
+	if !validAWSRegions[req.AWSRegion] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported AWS region: " + req.AWSRegion})
+		return
 	}
 
 	// Look up the project's account_id so we can inherit it on the environment.
@@ -482,6 +529,12 @@ func (s *Service) HandleCreateEnvironment(c *gin.Context) {
 		env.ProjectID, env.Name, env.AWSRegion, env.AccountID, env.StackStatus,
 	).Scan(&env.ID, &env.CreatedAt, &env.UpdatedAt)
 	if err != nil {
+		// Unique violation (23505): this project already has an environment with that name.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("a %s environment already exists for this project", req.Name)})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create environment"})
 		return
 	}
@@ -585,6 +638,24 @@ func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 		return
 	}
 
+	if !awsAccountIDRe.MatchString(req.AWSAccountID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "aws_account_id must be a 12-digit AWS account ID"})
+		return
+	}
+	m := iamRoleARNRe.FindStringSubmatch(req.IAMRoleARN)
+	if m == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "iam_role_arn must be a valid IAM role ARN (arn:aws:iam::<account>:role/<name>)"})
+		return
+	}
+	if m[1] != req.AWSAccountID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "the IAM role ARN belongs to a different AWS account than aws_account_id"})
+		return
+	}
+	if len(req.Label) > 100 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "label too long (max 100 characters)"})
+		return
+	}
+
 	// The external ID is the per-connection value embedded in the bootstrap template the
 	// user just deployed (returned by HandleGetBootstrapTemplate). Older clients that don't
 	// send one fall back to the legacy shared value so their pre-existing roles still work.
@@ -681,13 +752,18 @@ func (s *Service) HandleRetryProvision(c *gin.Context) {
 		return
 	}
 
-	// Reset status to provisioning.
-	_, err = s.db.Pool.Exec(c.Request.Context(),
+	// Reset status to provisioning. The project_id predicate plus the RowsAffected check
+	// ensures a foreign envId can never trigger provisioning of another tenant's environment.
+	result, err := s.db.Pool.Exec(c.Request.Context(),
 		`UPDATE environments SET stack_status = $1, updated_at = NOW() WHERE id = $2 AND project_id = $3`,
 		models.StackStatusProvisioning, envID, projectID,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update environment"})
+		return
+	}
+	if result.RowsAffected() == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "environment not found"})
 		return
 	}
 

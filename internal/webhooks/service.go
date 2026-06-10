@@ -9,7 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"syscall"
 	"time"
 
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
@@ -24,11 +28,75 @@ type Service struct {
 	client *http.Client
 }
 
+// isDisallowedIP blocks loopback, private, link-local (incl. 169.254.169.254
+// instance metadata), and unspecified addresses — webhook URLs are user-supplied,
+// so delivery must never reach internal infrastructure (SSRF).
+func isDisallowedIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
 func NewService(db *models.DB) *Service {
-	return &Service{
-		db:     db,
-		client: &http.Client{Timeout: 10 * time.Second},
+	// The Control hook runs against the *resolved* address right before connect,
+	// so a hostname that re-resolves to an internal IP (DNS rebinding) is still blocked.
+	// ALLOW_PRIVATE_WEBHOOKS=true relaxes this for local development.
+	allowPrivate := os.Getenv("ALLOW_PRIVATE_WEBHOOKS") == "true"
+	dialer := &net.Dialer{
+		Timeout: 5 * time.Second,
+		Control: func(network, address string, _ syscall.RawConn) error {
+			if allowPrivate {
+				return nil
+			}
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			ip := net.ParseIP(host)
+			if ip == nil || isDisallowedIP(ip) {
+				return fmt.Errorf("webhook destination %s is not allowed", host)
+			}
+			return nil
+		},
 	}
+	return &Service{
+		db: db,
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				DialContext:           dialer.DialContext,
+				TLSHandshakeTimeout:   5 * time.Second,
+				ResponseHeaderTimeout: 10 * time.Second,
+			},
+			// Don't follow redirects — a permitted URL could redirect to an internal one.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+}
+
+// validWebhookEvents is the set of event types a webhook may subscribe to.
+var validWebhookEvents = map[string]bool{
+	models.WebhookEventDeployStarted:   true,
+	models.WebhookEventDeploySucceeded: true,
+	models.WebhookEventDeployFailed:    true,
+}
+
+// validateWebhookInput checks the URL scheme/host and the subscribed event types.
+func validateWebhookInput(rawURL string, events []string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("url must be a valid http(s) URL")
+	}
+	if len(rawURL) > 2048 {
+		return fmt.Errorf("url too long")
+	}
+	for _, ev := range events {
+		if !validWebhookEvents[ev] {
+			return fmt.Errorf("unknown event type %q — valid: deploy.started, deploy.succeeded, deploy.failed", ev)
+		}
+	}
+	return nil
 }
 
 // ---- HTTP handlers ----
@@ -80,6 +148,10 @@ func (s *Service) HandleCreate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "url and at least one event are required"})
 		return
 	}
+	if err := validateWebhookInput(body.URL, body.Events); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	var h models.Webhook
 	err = s.db.Pool.QueryRow(c.Request.Context(),
@@ -116,6 +188,18 @@ func (s *Service) HandleUpdate(c *gin.Context) {
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
+	}
+	if body.URL != nil {
+		if err := validateWebhookInput(*body.URL, nil); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if body.Events != nil {
+		if err := validateWebhookInput("https://placeholder.invalid", body.Events); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	var h models.Webhook
