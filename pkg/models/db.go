@@ -292,16 +292,16 @@ CREATE INDEX IF NOT EXISTS idx_op_events_project    ON operational_events(projec
 const addPreviewColumnsToEnvironments = `
 ALTER TABLE environments DROP CONSTRAINT IF EXISTS environments_name_check;
 ALTER TABLE environments DROP CONSTRAINT IF EXISTS environments_project_id_name_key;
+ALTER TABLE environments
+    ADD COLUMN IF NOT EXISTS is_preview           BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS pr_number            INTEGER,
+    ADD COLUMN IF NOT EXISTS pr_branch            TEXT,
+    ADD COLUMN IF NOT EXISTS pr_head_sha          TEXT,
+    ADD COLUMN IF NOT EXISTS github_pr_comment_id BIGINT;
 CREATE UNIQUE INDEX IF NOT EXISTS environments_non_preview_name_uniq
     ON environments(project_id, name) WHERE is_preview = false;
 CREATE UNIQUE INDEX IF NOT EXISTS environments_preview_pr_uniq
-    ON environments(project_id, pr_number) WHERE is_preview = true;
-ALTER TABLE environments
-    ADD COLUMN IF NOT EXISTS is_preview         BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN IF NOT EXISTS pr_number          INTEGER,
-    ADD COLUMN IF NOT EXISTS pr_branch          TEXT,
-    ADD COLUMN IF NOT EXISTS pr_head_sha        TEXT,
-    ADD COLUMN IF NOT EXISTS github_pr_comment_id BIGINT;`
+    ON environments(project_id, pr_number) WHERE is_preview = true;`
 
 // addWebhookColumnsToProjects stores the GitHub repo webhook installed when PR previews
 // are enabled, so events can be verified (HMAC) and the hook can be removed on deletion.

@@ -1,4 +1,4 @@
-.PHONY: run build tidy migrate lint test test-unit test-integration test-all
+.PHONY: run build tidy migrate lint test test-unit test-integration test-all e2e e2e-deploy e2e-failure e2e-rollback e2e-diagnosis e2e-dry-run
 
 run:
 	go run ./cmd/api/main.go
@@ -53,3 +53,30 @@ docker-up:
 
 docker-down:
 	docker compose down
+
+# ── E2E Tests ──────────────────────────────────────────────────────────────────
+# Requires: E2E_AUTH_TOKEN, E2E_GITHUB_TOKEN, E2E_AWS_ACCOUNT_ID, E2E_AWS_ROLE_ARN
+# Optional: E2E_OPSPILOT_URL (default http://localhost:8080), E2E_PARALLEL, E2E_CLEANUP
+
+E2E_FLAGS ?=
+
+# Run a specific suite
+e2e-deploy:
+	go run ./e2e/cmd/runner -suite=deploy $(E2E_FLAGS)
+
+e2e-failure:
+	go run ./e2e/cmd/runner -suite=failure $(E2E_FLAGS)
+
+e2e-rollback:
+	go run ./e2e/cmd/runner -suite=rollback $(E2E_FLAGS)
+
+e2e-diagnosis:
+	go run ./e2e/cmd/runner -suite=diagnosis $(E2E_FLAGS)
+
+# Full E2E suite (all scenarios)
+e2e:
+	go run ./e2e/cmd/runner -suite=all $(E2E_FLAGS)
+
+# Print what would run without executing
+e2e-dry-run:
+	go run ./e2e/cmd/runner -suite=all -dry-run $(E2E_FLAGS)

@@ -29,7 +29,7 @@ func NewTestDB(t *testing.T) *models.DB {
 
 	db, err := models.NewDB(url)
 	if err != nil {
-		t.Fatalf("testutil.NewTestDB: connect: %v", err)
+		t.Skipf("testutil.NewTestDB: cannot connect to test DB (%v) — is docker running?", err)
 	}
 
 	if err := models.RunMigrations(db); err != nil {
