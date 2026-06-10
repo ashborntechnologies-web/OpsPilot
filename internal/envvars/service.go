@@ -3,6 +3,7 @@ package envvars
 import (
 	"context"
 	"net/http"
+	"regexp"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
@@ -19,11 +20,40 @@ func NewService(db *models.DB) *Service {
 	return &Service{db: db}
 }
 
-// HandleList returns all env vars for an environment. Secret values are replaced with "***".
-func (s *Service) HandleList(c *gin.Context) {
-	envID, err := uuid.Parse(c.Param("envId"))
+// resolveEnv parses :id and :envId and verifies the environment belongs to the project.
+// RequireProjectOwnership guards the project; this guards the cross-reference so a caller
+// cannot operate on another tenant's environment by passing a foreign envId.
+func (s *Service) resolveEnv(c *gin.Context) (envID uuid.UUID, ok bool) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+		return uuid.UUID{}, false
+	}
+	envID, err = uuid.Parse(c.Param("envId"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid environment id"})
+		return uuid.UUID{}, false
+	}
+	var exists bool
+	err = s.db.Pool.QueryRow(c.Request.Context(),
+		`SELECT EXISTS (SELECT 1 FROM environments WHERE id = $1 AND project_id = $2)`,
+		envID, projectID,
+	).Scan(&exists)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify environment"})
+		return uuid.UUID{}, false
+	}
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "environment not found"})
+		return uuid.UUID{}, false
+	}
+	return envID, true
+}
+
+// HandleList returns all env vars for an environment. Secret values are replaced with "***".
+func (s *Service) HandleList(c *gin.Context) {
+	envID, ok := s.resolveEnv(c)
+	if !ok {
 		return
 	}
 
@@ -53,11 +83,14 @@ func (s *Service) HandleList(c *gin.Context) {
 	c.JSON(http.StatusOK, vars)
 }
 
+// envVarKeyRe validates POSIX-style env var names; invalid names would be
+// rejected by ECS at deploy time, long after the user typed them.
+var envVarKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,255}$`)
+
 // HandleUpsert creates or updates a single env var (identified by key).
 func (s *Service) HandleUpsert(c *gin.Context) {
-	envID, err := uuid.Parse(c.Param("envId"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid environment id"})
+	envID, ok := s.resolveEnv(c)
+	if !ok {
 		return
 	}
 
@@ -70,9 +103,17 @@ func (s *Service) HandleUpsert(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if !envVarKeyRe.MatchString(req.Key) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid key: must start with a letter or underscore and contain only letters, numbers, underscores"})
+		return
+	}
+	if len(req.Value) > 32768 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "value too large (max 32KB)"})
+		return
+	}
 
 	var v models.EnvVar
-	err = s.db.Pool.QueryRow(c.Request.Context(),
+	err := s.db.Pool.QueryRow(c.Request.Context(),
 		`INSERT INTO env_vars (environment_id, key, value, is_secret)
 		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (environment_id, key)
@@ -98,9 +139,8 @@ func (s *Service) HandleDelete(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid var id"})
 		return
 	}
-	envID, err := uuid.Parse(c.Param("envId"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid environment id"})
+	envID, ok := s.resolveEnv(c)
+	if !ok {
 		return
 	}
 

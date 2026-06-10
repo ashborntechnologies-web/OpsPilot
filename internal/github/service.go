@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
@@ -38,6 +39,7 @@ type Service struct {
 	// anthropicKey enables the AI framework-detection fallback. Empty = AI path
 	// never runs (rule-based detection only).
 	anthropicKey string
+	llm          *llm.Client
 	db           *models.DB
 }
 
@@ -75,6 +77,7 @@ func NewService(clientID, clientSecret, redirectURL, encryptionKey string, db *m
 		encryptionKey: encryptionKey,
 		prevKey:       os.Getenv("ENCRYPTION_KEY_PREV"),
 		anthropicKey:  anthropicKey,
+		llm:           llm.New(anthropicKey),
 		db:            db,
 	}
 }
@@ -413,49 +416,13 @@ func (s *Service) aiDetect(
 	}
 
 	// (c) Call the Anthropic API.
-	reqBody := map[string]any{
-		"model":      "claude-sonnet-4-20250514",
-		"max_tokens": 1024,
-		"system":     aiDetectSystemPrompt,
-		"messages": []map[string]string{
-			{"role": "user", "content": sb.String()},
-		},
-	}
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return ruleResult, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", strings.NewReader(string(body)))
-	if err != nil {
-		return ruleResult, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", s.anthropicKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return ruleResult, err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
+	rawText, err := s.llm.Complete(ctx, aiDetectSystemPrompt, sb.String(), 1024)
 	if err != nil {
 		return ruleResult, err
 	}
 
 	// (d) Parse the response.
-	var claudeResp struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(respBody, &claudeResp); err != nil || len(claudeResp.Content) == 0 {
-		return ruleResult, fmt.Errorf("empty or invalid Claude response")
-	}
-
-	text := stripJSONFences(claudeResp.Content[0].Text)
+	text := stripJSONFences(rawText)
 
 	var ai struct {
 		Framework    string   `json:"framework"`

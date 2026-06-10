@@ -55,13 +55,20 @@ func NewService(publishableKey, secretKey string) *Service {
 
 // ValidateToken validates a Clerk-issued JWT and returns the claims.
 func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
+	// Bound JWKS fetches so a hung endpoint can't stall every authenticated request.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		kid, _ := token.Header["kid"].(string)
-		return s.getPublicKey(context.Background(), kid)
-	})
+		return s.getPublicKey(ctx, kid)
+	},
+		jwt.WithValidMethods([]string{"RS256"}),
+		jwt.WithExpirationRequired(),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse token: %w", err)
 	}
@@ -194,6 +201,10 @@ func (s *Service) refreshJWKS(ctx context.Context) error {
 		return fmt.Errorf("failed to fetch JWKS: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("JWKS endpoint returned %s", resp.Status)
+	}
 
 	var jwks struct {
 		Keys []struct {

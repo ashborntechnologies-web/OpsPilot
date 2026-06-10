@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import useSWR from "swr";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@clerk/nextjs";
 import { Navbar } from "@/components/layout/navbar";
@@ -102,7 +103,6 @@ export default function NewProjectPage() {
 
   const [step, setStep] = useState<Step>("github");
   const [repos, setRepos] = useState<GithubRepo[]>([]);
-  const [filtered, setFiltered] = useState<GithubRepo[]>([]);
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<GithubRepo | null>(null);
   const [name, setName] = useState("");
@@ -116,11 +116,10 @@ export default function NewProjectPage() {
   const [loadingRepos, setLoadingRepos] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
-  useEffect(() => {
-    setFiltered(
-      repos.filter((r) => r.full_name.toLowerCase().includes(search.toLowerCase()))
-    );
-  }, [repos, search]);
+  // Derived during render — no state/effect needed.
+  const filtered = repos.filter((r) =>
+    r.full_name.toLowerCase().includes(search.toLowerCase())
+  );
 
   // Auto-detect if GitHub is already connected — skip the connect step
   useEffect(() => {
@@ -139,22 +138,16 @@ export default function NewProjectPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function loadAccounts() {
+  const { mutate: reloadAccounts } = useSWR("aws-accounts", async () => {
     const token = await getToken();
-    if (!token) return;
-    try {
-      const data = await listAWSAccounts(token);
-      setAccounts(data ?? []);
-      if (data?.length === 1) setAccountId(data[0].id);
-    } catch {
-      // non-fatal
-    }
-  }
-
-  useEffect(() => {
-    loadAccounts();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (!token) return [];
+    return (await listAWSAccounts(token)) ?? [];
+  }, {
+    onSuccess: (data) => {
+      setAccounts(data);
+      if (data.length === 1) setAccountId(data[0].id);
+    },
+  });
 
   async function handleConnectGithub() {
     const token = await getToken();
@@ -245,6 +238,7 @@ export default function NewProjectPage() {
           setAccounts((prev) => [account, ...prev]);
           setAccountId(account.id);
           setConnectOpen(false);
+          void reloadAccounts();
         }}
       />
 

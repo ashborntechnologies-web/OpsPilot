@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
+import useSWR from "swr";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useAuth } from "@clerk/nextjs";
@@ -23,8 +24,10 @@ import {
   diagnoseDeployment, checkHealth, scaleService,
   listWebhooks, createWebhook, updateWebhook, deleteWebhook,
   terminalWsURL, getProjectCosts, enablePreviews, disablePreviews,
+  getHealthScore,
 } from "@/lib/api";
 import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar, Webhook, CostSummary } from "@/types/api";
+import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
   MessageSquare, Plus, Rocket, RotateCcw,
@@ -70,6 +73,30 @@ const PROVISION_STEPS = ["AWS", "Platform stack", "Project resources"];
 // Progress percentages for each inferred step (0 = just queued, 3 = resources deploying)
 const STEP_PROGRESS = [5, 25, 55, 80];
 
+// Deploy pipeline stages shown on the Overview tab while a deployment is in flight.
+const DEPLOY_STAGES = ["Build", "Configure", "Rollout"];
+const DEPLOY_STAGE_PROGRESS = [8, 30, 70, 88];
+
+// Returns 0–3 based on the latest deploy progress messages (see backend broadcasts:
+// "Starting container build..." → "Build in progress: PHASE" → "Registering task
+// definition..." → "Ensuring ALB..." → "Deploying to ECS..." → "x/y tasks running").
+function inferDeployStage(logs: string[], dep?: Deployment): number {
+  const text = logs.join(" ").toLowerCase();
+  if (text.includes("tasks running") || text.includes("deploying to ecs")) return 3;
+  if (
+    text.includes("task definition") ||
+    text.includes("target group") ||
+    text.includes("listener rule")
+  ) {
+    return 2;
+  }
+  if (text.includes("build")) return 1;
+  // No WS messages yet (page opened mid-deploy) — infer from the record's status.
+  if (dep?.status === "deploying") return 3;
+  if (dep?.status === "building") return 1;
+  return 0;
+}
+
 const EVENT_LABELS: Record<string, string> = {
   "deploy.started":      "Deploy started",
   "build.started":       "Build started",
@@ -99,12 +126,13 @@ export default function ProjectPage() {
   const [project, setProject] = useState<Project | null>(null);
   const [environments, setEnvironments] = useState<Environment[]>([]);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
-  const [loading, setLoading] = useState(true);
   const [deploying, setDeploying] = useState<string | null>(null);
   const [retrying, setRetrying] = useState<string | null>(null);
 
   // live provision messages received via WebSocket
   const [provisionLog, setProvisionLog] = useState<string[]>([]);
+  // live deploy progress messages received via WebSocket (cleared when a deploy finishes)
+  const [deployLog, setDeployLog] = useState<string[]>([]);
 
   // deployment event timeline
   const [expandedDepId, setExpandedDepId] = useState<string | null>(null);
@@ -182,26 +210,27 @@ export default function ProjectPage() {
     setProject(proj);
     setEnvironments(envs ?? []);
     setDeployments(deps ?? []);
+    // Auto-select tab targets once environments arrive: logs prefers a ready env;
+    // env vars accepts any env (you can set vars before deploying).
+    const ready = (envs ?? []).find((e) => e.stack_status === "ready");
+    if (ready) setLogsEnvId((prev) => prev || ready.id);
+    if (envs?.length) setEnvVarEnvId((prev) => prev || envs[0].id);
   }, [id, getToken]);
 
-  useEffect(() => {
-    refresh().finally(() => setLoading(false));
-  }, [refresh]);
+  // Initial load (and revalidate-on-focus) via SWR; refresh stays available for
+  // event-driven re-fetches (WS messages, after mutations, provisioning poll).
+  const { isLoading: loading } = useSWR(["project-page", id], refresh);
 
-  // Auto-select first ready environment for logs tab
-  useEffect(() => {
-    if (!logsEnvId && environments.length > 0) {
-      const ready = environments.find((e) => e.stack_status === "ready");
-      if (ready) setLogsEnvId(ready.id);
-    }
-  }, [environments, logsEnvId]);
-
-  // Auto-select first environment for env vars tab (any status — you can set vars before deploying)
-  useEffect(() => {
-    if (!envVarEnvId && environments.length > 0) {
-      setEnvVarEnvId(environments[0].id);
-    }
-  }, [environments, envVarEnvId]);
+  // Deployment health score — refreshed every minute while the page is open.
+  const { data: healthScore } = useSWR(
+    ["health-score", id],
+    async () => {
+      const token = await getToken();
+      if (!token) return null;
+      return getHealthScore(token, id);
+    },
+    { refreshInterval: 60_000 }
+  );
 
   // WebSocket — open while the page is mounted so we receive provision_progress in real time.
   useEffect(() => {
@@ -220,7 +249,14 @@ export default function ProjectPage() {
             setProvisionLog((prev) => [...prev.slice(-49), msg.payload]);
           } else if (msg.type === "provision_done" || msg.type === "provision_failed") {
             setProvisionLog((prev) => [...prev.slice(-49), msg.payload]);
-            refresh();
+            refresh().catch(() => {});
+          } else if (msg.type === "deploy_progress") {
+            setDeployLog((prev) => [...prev.slice(-49), msg.payload]);
+          } else if (msg.type === "deploy_done" || msg.type === "deploy_failed") {
+            setDeployLog([]);
+            if (msg.type === "deploy_done") toast.success(msg.payload);
+            else toast.error(msg.payload);
+            refresh().catch(() => {});
           }
         } catch {}
       };
@@ -294,12 +330,21 @@ export default function ProjectPage() {
     };
   }, [terminalEnvId, id, getToken]);
 
-  // Polling — re-fetch environments every 5 s while any are still provisioning.
+  // Polling — re-fetch every 5 s while an environment is provisioning or a
+  // deployment is in flight, so status flips even if WebSocket messages are missed.
+  const hasActivity =
+    environments.some((e) => e.stack_status === "provisioning") ||
+    deployments.some((d) => ["pending", "building", "deploying"].includes(d.status));
   useEffect(() => {
-    if (!environments.some((e) => e.stack_status === "provisioning")) return;
+    if (!hasActivity) return;
     const t = setInterval(() => { refresh().catch(() => {}); }, 5000);
     return () => clearInterval(t);
-  }, [environments, refresh]);
+  }, [hasActivity, refresh]);
+
+  // The most recent in-flight deployment, if any — drives the Overview progress card.
+  const activeDeployment = deployments.find((d) =>
+    ["pending", "building", "deploying"].includes(d.status)
+  );
 
   async function handleCreateEnv() {
     if (!envDialog) return;
@@ -845,6 +890,117 @@ export default function ProjectPage() {
           {/* ── Overview (environments) ── */}
           <TabsContent value="overview">
             <div className="space-y-4">
+              {activeDeployment && (() => {
+                const stage = inferDeployStage(deployLog, activeDeployment);
+                const latestMsg =
+                  deployLog.length > 0
+                    ? deployLog[deployLog.length - 1]
+                    : activeDeployment.status === "pending"
+                      ? "Queued — waiting for a build worker..."
+                      : "Deployment in progress...";
+                return (
+                  <Card className="border-indigo-200 bg-indigo-50/40">
+                    <CardContent className="py-4 space-y-3">
+                      <div className="flex items-center justify-between gap-3 flex-wrap">
+                        <div className="flex items-center gap-2 text-sm font-medium">
+                          <Loader2 className="h-4 w-4 animate-spin text-indigo-600" />
+                          Deploying{" "}
+                          <span className="font-mono text-xs bg-white border rounded px-1.5 py-0.5">
+                            {activeDeployment.commit_sha.slice(0, 8)}
+                          </span>
+                          {activeDeployment.commit_message && (
+                            <span className="text-muted-foreground font-normal truncate max-w-[18rem]">
+                              {activeDeployment.commit_message}
+                            </span>
+                          )}
+                        </div>
+                        <Badge variant="outline" className="capitalize">{activeDeployment.status}</Badge>
+                      </div>
+
+                      {/* Stage checklist */}
+                      <div className="flex items-center gap-2 text-xs">
+                        {DEPLOY_STAGES.map((label, i) => {
+                          const stepNum = i + 1;
+                          const done = stage > stepNum;
+                          const current = stage === stepNum;
+                          return (
+                            <div key={label} className="flex items-center gap-2">
+                              {i > 0 && <div className={cn("h-px w-6", stage >= stepNum ? "bg-indigo-400" : "bg-zinc-300")} />}
+                              <span
+                                className={cn(
+                                  "flex items-center gap-1.5",
+                                  done && "text-green-700",
+                                  current && "text-indigo-700 font-medium",
+                                  !done && !current && "text-muted-foreground"
+                                )}
+                              >
+                                {done ? (
+                                  <CheckCircle2 className="h-3.5 w-3.5" />
+                                ) : current ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <Clock className="h-3.5 w-3.5" />
+                                )}
+                                {label}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* Progress bar + latest message */}
+                      <div className="space-y-1.5">
+                        <div className="h-1.5 w-full rounded-full bg-zinc-200 overflow-hidden">
+                          <div
+                            className="h-full rounded-full bg-indigo-500 transition-all duration-700"
+                            style={{ width: `${DEPLOY_STAGE_PROGRESS[stage]}%` }}
+                          />
+                        </div>
+                        <p className="text-xs text-muted-foreground">{latestMsg}</p>
+                      </div>
+                    </CardContent>
+                  </Card>
+                );
+              })()}
+
+              {healthScore && environments.length > 0 && (
+                <Card>
+                  <CardContent className="py-4">
+                    <div className="flex items-center justify-between gap-4 flex-wrap">
+                      <div className="flex items-center gap-3">
+                        <div
+                          className={cn(
+                            "flex h-12 w-12 items-center justify-center rounded-full text-base font-bold",
+                            healthScore.grade === "healthy" && "bg-green-100 text-green-700",
+                            healthScore.grade === "degraded" && "bg-amber-100 text-amber-700",
+                            healthScore.grade === "at_risk" && "bg-orange-100 text-orange-700",
+                            healthScore.grade === "critical" && "bg-red-100 text-red-700"
+                          )}
+                        >
+                          {healthScore.score}
+                        </div>
+                        <div>
+                          <p className="text-sm font-medium">
+                            Deployment health:{" "}
+                            <span className="capitalize">{healthScore.grade.replace("_", " ")}</span>
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            Based on recent deploy success, environment status, and incidents
+                          </p>
+                        </div>
+                      </div>
+                      {healthScore.insights.length > 0 && (
+                        <ul className="text-xs text-muted-foreground space-y-0.5 max-w-md">
+                          {healthScore.insights.slice(0, 2).map((insight) => (
+                            <li key={insight}>• {insight}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+
               {environments.length === 0 && (
                 <Card className="border-dashed">
                   <CardContent className="flex flex-col items-center justify-center py-12 text-center">
@@ -1616,7 +1772,7 @@ export default function ProjectPage() {
                     {Object.entries(costs.by_service)
                       .filter(([, v]) => v > 0.001)
                       .sort(([, a], [, b]) => b - a)
-                      .map(([svc, amount], i, arr) => (
+                      .map(([svc, amount], i) => (
                         <div key={svc}>
                           {i > 0 && <Separator />}
                           <div className="flex items-center justify-between px-4 py-3">

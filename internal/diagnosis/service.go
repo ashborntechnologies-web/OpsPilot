@@ -1,16 +1,14 @@
 package diagnosis
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
 	"github.com/ashborntechnologies-web/OpsPilot/internal/aws"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -45,11 +43,11 @@ type Service struct {
 	db     *models.DB
 	awsSvc *aws.Service
 	events *events.Service
-	apiKey string
+	llm    *llm.Client
 }
 
 func NewService(db *models.DB, awsSvc *aws.Service, eventSvc *events.Service, apiKey string) *Service {
-	return &Service{db: db, awsSvc: awsSvc, events: eventSvc, apiKey: apiKey}
+	return &Service{db: db, awsSvc: awsSvc, events: eventSvc, llm: llm.New(apiKey)}
 }
 
 // HandleDiagnose is the HTTP handler for diagnosis requests
@@ -225,55 +223,7 @@ func buildDiagnosisContext(failureReason string, logLines []string, history, pas
 }
 
 func (s *Service) analyzeWithClaude(ctx context.Context, userMessage string) (string, error) {
-	reqBody := map[string]interface{}{
-		"model":      "claude-sonnet-4-20250514",
-		"max_tokens": 1000,
-		"system":     diagnosisPrompt,
-		"messages": []map[string]string{
-			{"role": "user", "content": userMessage},
-		},
-	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", s.apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var claudeResp struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-
-	if err := json.Unmarshal(respBody, &claudeResp); err != nil {
-		return "", err
-	}
-
-	if len(claudeResp.Content) == 0 {
-		return "", fmt.Errorf("empty response from Claude")
-	}
-
-	return claudeResp.Content[0].Text, nil
+	return s.llm.Complete(ctx, diagnosisPrompt, userMessage, 1000)
 }
 
 func (s *Service) getLastFailedDeployment(ctx context.Context, projectID uuid.UUID) (*models.Deployment, error) {

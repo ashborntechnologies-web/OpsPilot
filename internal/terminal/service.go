@@ -97,8 +97,12 @@ func (s *Service) HandleTerminal(c *gin.Context) {
 		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","payload":"environment not found"}`))
 		return
 	}
-	if env.ECSServiceName == nil || env.ECSClusterName == nil {
+	if env.ECSServiceName == nil {
 		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","payload":"environment not deployed — deploy first"}`))
+		return
+	}
+	if env.ECSClusterName == nil {
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","payload":"could not resolve the ECS cluster for this environment — try re-provisioning"}`))
 		return
 	}
 
@@ -214,14 +218,20 @@ func (s *Service) HandleTerminal(c *gin.Context) {
 
 func (s *Service) loadEnv(ctx context.Context, envID, projectID uuid.UUID) (*models.Environment, error) {
 	var env models.Environment
+	// The ECS cluster lives on the shared platform stack in the two-tier model;
+	// COALESCE falls back to the legacy per-environment field for old environments.
 	err := s.db.Pool.QueryRow(ctx,
-		`SELECT id, project_id, name, aws_region, account_id, platform_stack_id,
-		        cloudformation_stack_id, stack_status, alb_dns,
-		        ecr_repo_uri, ecs_cluster_name, ecs_service_name,
-		        codebuild_project_name, task_execution_role_arn, log_group_name,
-		        alb_target_group_arn, alb_listener_rule_arn, ecs_security_group_id, vpc_subnets,
-		        created_at, updated_at
-		 FROM environments WHERE id = $1 AND project_id = $2`, envID, projectID,
+		`SELECT e.id, e.project_id, e.name, e.aws_region, e.account_id, e.platform_stack_id,
+		        e.cloudformation_stack_id, e.stack_status, e.alb_dns,
+		        e.ecr_repo_uri,
+		        COALESCE(ps.ecs_cluster_name, e.ecs_cluster_name) AS ecs_cluster_name,
+		        e.ecs_service_name,
+		        e.codebuild_project_name, e.task_execution_role_arn, e.log_group_name,
+		        e.alb_target_group_arn, e.alb_listener_rule_arn, e.ecs_security_group_id, e.vpc_subnets,
+		        e.created_at, e.updated_at
+		 FROM environments e
+		 LEFT JOIN platform_stacks ps ON ps.id = e.platform_stack_id
+		 WHERE e.id = $1 AND e.project_id = $2`, envID, projectID,
 	).Scan(
 		&env.ID, &env.ProjectID, &env.Name, &env.AWSRegion,
 		&env.AccountID, &env.PlatformStackID,

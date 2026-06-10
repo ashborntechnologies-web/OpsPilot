@@ -37,9 +37,13 @@ export default function ProjectsPage() {
 
   useEffect(() => {
     getToken().then((t) => {
-      if (!t) return;
+      if (!t) {
+        setLoading(false);
+        return;
+      }
       listProjects(t)
         .then(setProjects)
+        .catch((e: Error) => toast.error(e.message))
         .finally(() => setLoading(false));
     });
   }, [getToken]);
