@@ -7,12 +7,12 @@ import (
 )
 
 type User struct {
-	ID          uuid.UUID  `json:"id" db:"id"`
-	ClerkID     string     `json:"clerk_id" db:"clerk_id"`
-	Email       string     `json:"email" db:"email"`
-	GithubToken *string    `json:"-" db:"github_token"` // never expose in JSON
-	CreatedAt   time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at" db:"updated_at"`
+	ID          uuid.UUID `json:"id" db:"id"`
+	ClerkID     string    `json:"clerk_id" db:"clerk_id"`
+	Email       string    `json:"email" db:"email"`
+	GithubToken *string   `json:"-" db:"github_token"` // never expose in JSON
+	CreatedAt   time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at" db:"updated_at"`
 }
 
 type AWSAccount struct {
@@ -30,20 +30,20 @@ type AWSAccount struct {
 }
 
 type Project struct {
-	ID                   uuid.UUID  `json:"id" db:"id"`
-	UserID               uuid.UUID  `json:"user_id" db:"user_id"`
-	Name                 string     `json:"name" db:"name"`
-	RepoURL              string     `json:"repo_url" db:"repo_url"`
-	RepoOwner            string     `json:"repo_owner" db:"repo_owner"`
-	RepoName             string     `json:"repo_name" db:"repo_name"`
-	Framework            string     `json:"framework" db:"framework"`
-	Branch               *string    `json:"branch" db:"branch"`
-	StartCommand         *string    `json:"start_command" db:"start_command"`
-	AccountID            *uuid.UUID `json:"account_id" db:"account_id"`
-	GithubWebhookID      *int64     `json:"github_webhook_id,omitempty" db:"github_webhook_id"`
-	GithubWebhookSecret  string     `json:"-" db:"github_webhook_secret"` // never exposed
-	CreatedAt            time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt            time.Time  `json:"updated_at" db:"updated_at"`
+	ID                  uuid.UUID  `json:"id" db:"id"`
+	UserID              uuid.UUID  `json:"user_id" db:"user_id"`
+	Name                string     `json:"name" db:"name"`
+	RepoURL             string     `json:"repo_url" db:"repo_url"`
+	RepoOwner           string     `json:"repo_owner" db:"repo_owner"`
+	RepoName            string     `json:"repo_name" db:"repo_name"`
+	Framework           string     `json:"framework" db:"framework"`
+	Branch              *string    `json:"branch" db:"branch"`
+	StartCommand        *string    `json:"start_command" db:"start_command"`
+	AccountID           *uuid.UUID `json:"account_id" db:"account_id"`
+	GithubWebhookID     *int64     `json:"github_webhook_id,omitempty" db:"github_webhook_id"`
+	GithubWebhookSecret string     `json:"-" db:"github_webhook_secret"` // never exposed
+	CreatedAt           time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at" db:"updated_at"`
 	// PreviewsEnabled is derived (true when GithubWebhookID is non-nil).
 	PreviewsEnabled bool `json:"previews_enabled" db:"-"`
 }
@@ -51,23 +51,23 @@ type Project struct {
 // PlatformStack represents the shared infrastructure (VPC, ECS cluster, ALB) provisioned
 // once per AWS account × region. Multiple project environments share a single platform stack.
 type PlatformStack struct {
-	ID                 uuid.UUID  `json:"id" db:"id"`
-	AccountID          uuid.UUID  `json:"account_id" db:"account_id"`
-	AWSRegion          string     `json:"aws_region" db:"aws_region"`
-	StackID            *string    `json:"cloudformation_stack_id" db:"stack_id"`
-	StackStatus        string     `json:"stack_status" db:"stack_status"`
-	ECSClusterName     *string    `json:"ecs_cluster_name" db:"ecs_cluster_name"`
-	ALBArn             *string    `json:"alb_arn" db:"alb_arn"`
-	ALBDNS             *string    `json:"alb_dns" db:"alb_dns"`
-	ALBListenerArn     *string    `json:"alb_listener_arn" db:"alb_listener_arn"`
+	ID             uuid.UUID `json:"id" db:"id"`
+	AccountID      uuid.UUID `json:"account_id" db:"account_id"`
+	AWSRegion      string    `json:"aws_region" db:"aws_region"`
+	StackID        *string   `json:"cloudformation_stack_id" db:"stack_id"`
+	StackStatus    string    `json:"stack_status" db:"stack_status"`
+	ECSClusterName *string   `json:"ecs_cluster_name" db:"ecs_cluster_name"`
+	ALBArn         *string   `json:"alb_arn" db:"alb_arn"`
+	ALBDNS         *string   `json:"alb_dns" db:"alb_dns"`
+	ALBListenerArn *string   `json:"alb_listener_arn" db:"alb_listener_arn"`
 	// HTTPSEnabled is true when the stack was provisioned with an ACM certificate —
 	// ALBListenerArn then refers to the 443 listener and app URLs use https://.
-	HTTPSEnabled       bool       `json:"https_enabled" db:"https_enabled"`
-	ALBSecurityGroupID *string    `json:"alb_security_group_id" db:"alb_security_group_id"`
-	ECSSecurityGroupID *string    `json:"ecs_security_group_id" db:"ecs_security_group_id"`
-	SubnetIDs          *string    `json:"subnet_ids" db:"subnet_ids"` // comma-separated
-	CreatedAt          time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at" db:"updated_at"`
+	HTTPSEnabled       bool      `json:"https_enabled" db:"https_enabled"`
+	ALBSecurityGroupID *string   `json:"alb_security_group_id" db:"alb_security_group_id"`
+	ECSSecurityGroupID *string   `json:"ecs_security_group_id" db:"ecs_security_group_id"`
+	SubnetIDs          *string   `json:"subnet_ids" db:"subnet_ids"` // comma-separated
+	CreatedAt          time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at" db:"updated_at"`
 }
 
 type Environment struct {
@@ -90,9 +90,9 @@ type Environment struct {
 	LogGroupName         *string `json:"log_group_name" db:"log_group_name"`
 
 	// Deploy-time resources (created by SDK at each deploy, not CF)
-	ALBTargetGroupARN   *string `json:"alb_target_group_arn" db:"alb_target_group_arn"`
-	ALBListenerRuleARN  *string `json:"alb_listener_rule_arn" db:"alb_listener_rule_arn"`
-	ALBDNS              *string `json:"alb_dns" db:"alb_dns"` // platform ALB DNS (convenience)
+	ALBTargetGroupARN  *string `json:"alb_target_group_arn" db:"alb_target_group_arn"`
+	ALBListenerRuleARN *string `json:"alb_listener_rule_arn" db:"alb_listener_rule_arn"`
+	ALBDNS             *string `json:"alb_dns" db:"alb_dns"` // platform ALB DNS (convenience)
 
 	// Legacy single-stack fields — populated for pre-platform-stack environments only.
 	// New environments source these from the platform_stacks table via PlatformStackID.
@@ -101,27 +101,27 @@ type Environment struct {
 	VPCSubnets         *string `json:"vpc_subnets" db:"vpc_subnets"`
 
 	// PR preview fields — only set when IsPreview = true.
-	IsPreview          bool    `json:"is_preview" db:"is_preview"`
-	PRNumber           *int    `json:"pr_number,omitempty" db:"pr_number"`
-	PRBranch           *string `json:"pr_branch,omitempty" db:"pr_branch"`
-	PRHeadSHA          *string `json:"pr_head_sha,omitempty" db:"pr_head_sha"`
-	GithubPRCommentID  *int64  `json:"github_pr_comment_id,omitempty" db:"github_pr_comment_id"`
+	IsPreview         bool    `json:"is_preview" db:"is_preview"`
+	PRNumber          *int    `json:"pr_number,omitempty" db:"pr_number"`
+	PRBranch          *string `json:"pr_branch,omitempty" db:"pr_branch"`
+	PRHeadSHA         *string `json:"pr_head_sha,omitempty" db:"pr_head_sha"`
+	GithubPRCommentID *int64  `json:"github_pr_comment_id,omitempty" db:"github_pr_comment_id"`
 
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
 }
 
 type Deployment struct {
-	ID            uuid.UUID  `json:"id" db:"id"`
-	ProjectID     uuid.UUID  `json:"project_id" db:"project_id"`
-	EnvironmentID uuid.UUID  `json:"environment_id" db:"environment_id"`
-	CommitSHA     string     `json:"commit_sha" db:"commit_sha"`
-	CommitMessage *string    `json:"commit_message" db:"commit_message"`
-	ImageURI      *string    `json:"image_uri" db:"image_uri"`
-	Status        string     `json:"status" db:"status"` // pending | building | deploying | live | failed | rolled_back
-	FailureReason *string    `json:"failure_reason" db:"failure_reason"`
-	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at" db:"updated_at"`
+	ID            uuid.UUID `json:"id" db:"id"`
+	ProjectID     uuid.UUID `json:"project_id" db:"project_id"`
+	EnvironmentID uuid.UUID `json:"environment_id" db:"environment_id"`
+	CommitSHA     string    `json:"commit_sha" db:"commit_sha"`
+	CommitMessage *string   `json:"commit_message" db:"commit_message"`
+	ImageURI      *string   `json:"image_uri" db:"image_uri"`
+	Status        string    `json:"status" db:"status"` // pending | building | deploying | live | failed | rolled_back
+	FailureReason *string   `json:"failure_reason" db:"failure_reason"`
+	CreatedAt     time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at" db:"updated_at"`
 }
 
 type Incident struct {
@@ -137,14 +137,14 @@ type Incident struct {
 }
 
 type Conversation struct {
-	ID        uuid.UUID  `json:"id" db:"id"`
-	ProjectID uuid.UUID  `json:"project_id" db:"project_id"`
-	UserID    uuid.UUID  `json:"user_id" db:"user_id"`
-	Role      string     `json:"role" db:"role"` // user | assistant
-	Message   string     `json:"message" db:"message"`
-	Intent    *string    `json:"intent" db:"intent"`
-	Metadata  *string    `json:"metadata" db:"metadata"` // JSONB stored as string
-	CreatedAt time.Time  `json:"created_at" db:"created_at"`
+	ID        uuid.UUID `json:"id" db:"id"`
+	ProjectID uuid.UUID `json:"project_id" db:"project_id"`
+	UserID    uuid.UUID `json:"user_id" db:"user_id"`
+	Role      string    `json:"role" db:"role"` // user | assistant
+	Message   string    `json:"message" db:"message"`
+	Intent    *string   `json:"intent" db:"intent"`
+	Metadata  *string   `json:"metadata" db:"metadata"` // JSONB stored as string
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
 }
 
 // Framework constants
@@ -156,16 +156,16 @@ const (
 	FrameworkPython  = "python"
 
 	// Node.js / JavaScript
-	FrameworkNodeJS   = "nodejs"
-	FrameworkExpress  = "express"
-	FrameworkNextJS   = "nextjs"
-	FrameworkNestJS   = "nestjs"
-	FrameworkRemix    = "remix"
-	FrameworkNuxtJS   = "nuxtjs"
+	FrameworkNodeJS    = "nodejs"
+	FrameworkExpress   = "express"
+	FrameworkNextJS    = "nextjs"
+	FrameworkNestJS    = "nestjs"
+	FrameworkRemix     = "remix"
+	FrameworkNuxtJS    = "nuxtjs"
 	FrameworkSvelteKit = "svelte"
-	FrameworkAstro    = "astro"
-	FrameworkReactSPA = "react-spa"
-	FrameworkVite     = "vite"
+	FrameworkAstro     = "astro"
+	FrameworkReactSPA  = "react-spa"
+	FrameworkVite      = "vite"
 
 	// Go
 	FrameworkGo = "go"
@@ -224,12 +224,12 @@ type CostSummary struct {
 
 // MutationProposal holds a pending infra change waiting for user confirmation.
 type MutationProposal struct {
-	ProjectID uuid.UUID `json:"project_id"`
-	EnvName   string    `json:"env_name"`
-	CPU       string    `json:"cpu"`
-	Memory    string    `json:"memory"`
-	CurrentCPU    string `json:"current_cpu"`
-	CurrentMemory string `json:"current_memory"`
+	ProjectID     uuid.UUID `json:"project_id"`
+	EnvName       string    `json:"env_name"`
+	CPU           string    `json:"cpu"`
+	Memory        string    `json:"memory"`
+	CurrentCPU    string    `json:"current_cpu"`
+	CurrentMemory string    `json:"current_memory"`
 }
 
 // EnvVar is a key/value environment variable scoped to a specific environment. It is
@@ -365,4 +365,105 @@ func (f *DiagnosisFeedback) RatingScore() float64 {
 	default:
 		return 0.0
 	}
+}
+
+// Runtime monitoring event types (emitted by the continuous health poller and
+// log scanner between deploys).
+const (
+	EventRuntimeTasksDegraded    = "runtime.tasks_degraded"
+	EventRuntimeServiceDown      = "runtime.service_down"
+	EventRuntimeHighErrorRate    = "runtime.high_error_rate"
+	EventRuntimeHighLatency      = "runtime.high_latency"
+	EventRuntimeServiceRecovered = "runtime.service_recovered"
+	EventRuntimeLogAnomaly       = "runtime.log_anomaly"
+	EventAlertFired              = "alert.fired"
+	EventAlertResolved           = "alert.resolved"
+)
+
+// Alert type constants
+const (
+	AlertTypeServiceDown   = "service_down"
+	AlertTypeTasksDegraded = "tasks_degraded"
+	AlertTypeHighErrorRate = "high_error_rate"
+	AlertTypeHighLatency   = "high_latency"
+	AlertTypeCrashLoop     = "crash_loop"
+	AlertTypeLogAnomaly    = "log_anomaly"
+	AlertTypeDeployStuck   = "deploy_stuck"
+)
+
+// Alert status constants
+const (
+	AlertStatusOpen     = "open"
+	AlertStatusResolved = "resolved"
+	AlertStatusSnoozed  = "snoozed"
+)
+
+// Alert is a deduplicated, user-facing notification derived from operational
+// events by the alert engine. Alerts carry an AI-generated summary and live
+// until resolved (automatically on recovery, or manually).
+type Alert struct {
+	ID             uuid.UUID   `json:"id" db:"id"`
+	ProjectID      uuid.UUID   `json:"project_id" db:"project_id"`
+	EnvironmentID  *uuid.UUID  `json:"environment_id" db:"environment_id"`
+	AlertType      string      `json:"alert_type" db:"alert_type"`
+	Severity       string      `json:"severity" db:"severity"`
+	Title          string      `json:"title" db:"title"`
+	Summary        string      `json:"summary" db:"summary"`
+	Status         string      `json:"status" db:"status"`
+	TriggeredAt    time.Time   `json:"triggered_at" db:"triggered_at"`
+	ResolvedAt     *time.Time  `json:"resolved_at" db:"resolved_at"`
+	SnoozedUntil   *time.Time  `json:"snoozed_until" db:"snoozed_until"`
+	SourceEventIDs []uuid.UUID `json:"source_event_ids" db:"source_event_ids"`
+	CreatedAt      time.Time   `json:"created_at" db:"created_at"`
+}
+
+// Project memory type constants
+const (
+	MemoryRecurringFailure = "recurring_failure"
+	MemorySuccessfulFix    = "successful_fix"
+	MemoryDeployPattern    = "deploy_pattern"
+	MemoryAlertPreference  = "alert_preference"
+	MemoryInfraPattern     = "infra_pattern"
+)
+
+// Memory source constants
+const (
+	MemorySourceDiagnosis       = "diagnosis"
+	MemorySourceUserConfirmed   = "user_confirmed"
+	MemorySourcePatternDetected = "pattern_detected"
+)
+
+// ProjectMemory is a long-lived fact OpsPilot has learned about a project —
+// recurring failures, confirmed fixes, deploy patterns. Injected into diagnosis
+// prompts so the AI gets smarter about each project over time.
+type ProjectMemory struct {
+	ID               uuid.UUID `json:"id" db:"id"`
+	ProjectID        uuid.UUID `json:"project_id" db:"project_id"`
+	MemoryType       string    `json:"memory_type" db:"memory_type"`
+	Content          string    `json:"content" db:"content"`
+	Confidence       float64   `json:"confidence" db:"confidence"`
+	Source           string    `json:"source" db:"source"`
+	CreatedAt        time.Time `json:"created_at" db:"created_at"`
+	LastReferencedAt time.Time `json:"last_referenced_at" db:"last_referenced_at"`
+	ReferenceCount   int       `json:"reference_count" db:"reference_count"`
+}
+
+// Plan name constants
+const (
+	PlanFree = "free"
+	PlanPro  = "pro"
+	PlanTeam = "team"
+)
+
+// ValidFramework reports whether the string is a supported framework identifier.
+func ValidFramework(f string) bool {
+	switch f {
+	case FrameworkFastAPI, FrameworkFlask, FrameworkDjango, FrameworkPython,
+		FrameworkNodeJS, FrameworkExpress, FrameworkNextJS, FrameworkNestJS,
+		FrameworkRemix, FrameworkNuxtJS, FrameworkSvelteKit, FrameworkAstro,
+		FrameworkReactSPA, FrameworkVite, FrameworkGo, FrameworkRails,
+		FrameworkSpring, FrameworkStatic:
+		return true
+	}
+	return false
 }

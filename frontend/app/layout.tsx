@@ -9,8 +9,9 @@ const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
 const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "ConvDeploy",
-  description: "Deploy your apps through conversation",
+  title: "OpsPilot — AI DevOps Assistant",
+  description:
+    "Monitor, deploy, and operate your AWS infrastructure through conversation. 24/7 AI watching your production.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

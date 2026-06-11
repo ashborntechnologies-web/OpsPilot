@@ -5,8 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,9 +19,13 @@ import (
 	"time"
 
 	awssvc "github.com/ashborntechnologies-web/OpsPilot/internal/aws"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/billing"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/envvars"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
 	githubsvc "github.com/ashborntechnologies-web/OpsPilot/internal/github"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/memory"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/notify"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/webhooks"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
@@ -57,6 +62,12 @@ type Enqueuer interface {
 	EnqueueProvision(projectID, environmentID string) error
 	EnqueueRollback(projectID, environmentID, deploymentID, previousDeploymentID string) error
 	EnqueueDeleteProject(p DeleteProjectPayload) error
+
+	// Pending-mutation store (Redis-backed): chat-proposed infra changes that
+	// await user confirmation, surviving restarts and shared across replicas.
+	SetPendingMutation(ctx context.Context, projectID string, proposal models.MutationProposal, ttl time.Duration) error
+	GetPendingMutation(ctx context.Context, projectID string) (*models.MutationProposal, error)
+	DeletePendingMutation(ctx context.Context, projectID string) error
 }
 
 type Service struct {
@@ -69,10 +80,14 @@ type Service struct {
 	envVars     *envvars.Service
 	webhooksSvc *webhooks.Service
 
-	// pendingMutations holds infra changes proposed via chat that are waiting for confirmation.
-	// Keyed by projectID; TTL of 10 minutes enforced at read time.
-	pendingMutations map[uuid.UUID]*pendingMutation
-	mutationMu       sync.Mutex
+	// emailSvc sends deploy-result notifications (no-op when SMTP unconfigured).
+	emailSvc *notify.EmailService
+	// memorySvc records deploy patterns into long-term project memory.
+	memorySvc *memory.Service
+	// riskLLM writes one-sentence explanations for high pre-deploy risk scores.
+	riskLLM *llm.Client
+	// billingSvc enforces plan limits on project creation.
+	billingSvc *billing.Service
 
 	// seenDeliveries dedupes GitHub webhook deliveries by X-GitHub-Delivery GUID so a
 	// replayed request with a valid signature is not processed twice. Entries expire
@@ -105,25 +120,31 @@ func (s *Service) isReplayedDelivery(guid string) bool {
 	return false
 }
 
-type pendingMutation struct {
-	proposal   *models.MutationProposal
-	proposedAt time.Time
-}
-
 func NewService(db *models.DB, awsSvc awssvc.AWSProvider, githubSvc githubsvc.GitHubProvider, hub *ws.Hub, enqueuer Enqueuer, eventSvc *events.Service, envVarSvc *envvars.Service, webhookSvc *webhooks.Service) *Service {
 	return &Service{
-		db:               db,
-		awsSvc:           awsSvc,
-		githubSvc:        githubSvc,
-		hub:              hub,
-		enqueuer:         enqueuer,
-		events:           eventSvc,
-		envVars:          envVarSvc,
-		webhooksSvc:      webhookSvc,
-		pendingMutations: make(map[uuid.UUID]*pendingMutation),
-		seenDeliveries:   make(map[string]time.Time),
+		db:             db,
+		awsSvc:         awsSvc,
+		githubSvc:      githubSvc,
+		hub:            hub,
+		enqueuer:       enqueuer,
+		events:         eventSvc,
+		envVars:        envVarSvc,
+		webhooksSvc:    webhookSvc,
+		seenDeliveries: make(map[string]time.Time),
 	}
 }
+
+// SetEmailService injects the deploy-result email sender (set once at startup).
+func (s *Service) SetEmailService(e *notify.EmailService) { s.emailSvc = e }
+
+// SetMemoryService injects the project-memory recorder (set once at startup).
+func (s *Service) SetMemoryService(m *memory.Service) { s.memorySvc = m }
+
+// SetRiskLLM injects the LLM used for risk-score explanations.
+func (s *Service) SetRiskLLM(c *llm.Client) { s.riskLLM = c }
+
+// SetBillingService enables plan-limit enforcement (set once at startup).
+func (s *Service) SetBillingService(b *billing.Service) { s.billingSvc = b }
 
 // ---- HTTP handlers ----
 
@@ -209,6 +230,18 @@ func (s *Service) HandleCreateProject(c *gin.Context) {
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user not authenticated"})
 		return
+	}
+
+	if s.billingSvc != nil {
+		if err := s.billingSvc.CheckProjectLimit(c.Request.Context(), userID); err != nil {
+			var limitErr *billing.ErrLimitReached
+			if errors.As(err, &limitErr) {
+				c.JSON(http.StatusForbidden, gin.H{"error": limitErr.Message})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check plan limits"})
+			return
+		}
 	}
 
 	var accountID *uuid.UUID
@@ -526,6 +559,13 @@ func (s *Service) TriggerDeploy(ctx context.Context, projectID uuid.UUID, envNam
 		return "", fmt.Errorf("failed to fetch latest commit: %w", err)
 	}
 
+	// Advisory pre-deploy risk score — broadcast to the UI, never blocking.
+	if risk, err := s.ComputeRiskScore(ctx, projectID, envName, commitSHA); err == nil && risk != nil {
+		if b, err := json.Marshal(risk); err == nil {
+			s.broadcast(projectID, ws.Message{Type: "deploy_risk", Payload: string(b)})
+		}
+	}
+
 	deployment, err := s.createDeployment(ctx, projectID, env.ID, commitSHA, commitMsg)
 	if err != nil {
 		return "", fmt.Errorf("failed to create deployment record: %w", err)
@@ -548,7 +588,7 @@ func (s *Service) TriggerDeploy(ctx context.Context, projectID uuid.UUID, envNam
 
 // RunDeployWorkflow executes the deploy pipeline. Workload topology (public service) is
 // currently hardcoded; AI classification will be wired in a future iteration.
-func (s *Service) RunDeployWorkflow(ctx context.Context, projectID, environmentID, deploymentID uuid.UUID) error {
+func (s *Service) RunDeployWorkflow(ctx context.Context, projectID, environmentID, deploymentID uuid.UUID) (workflowErr error) {
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Minute)
 	defer cancel()
 
@@ -561,6 +601,18 @@ func (s *Service) RunDeployWorkflow(ctx context.Context, projectID, environmentI
 	if err != nil {
 		return fmt.Errorf("environment not found: %w", err)
 	}
+
+	// On completion (success or failure): record the deploy pattern into project
+	// memory and email the owner per their notification preferences. Detached
+	// context — the workflow ctx may already be expired on the failure path.
+	defer func() {
+		doneCtx, done := context.WithTimeout(context.Background(), 30*time.Second)
+		defer done()
+		if s.memorySvc != nil {
+			s.memorySvc.RecordDeployPattern(doneCtx, projectID)
+		}
+		s.sendDeployResultEmail(doneCtx, project, env, deploymentID, workflowErr == nil)
+	}()
 
 	if env.StackStatus != models.StackStatusReady {
 		return s.failDeployment(ctx, projectID, deploymentID,
@@ -655,6 +707,12 @@ func (s *Service) RunDeployWorkflow(ctx context.Context, projectID, environmentI
 		return s.failDeployment(ctx, projectID, deploymentID, fmt.Sprintf("failed to start build: %s", err))
 	}
 	buildID := buildRes.BuildID
+	s.db.Pool.Exec(ctx, `UPDATE deployments SET build_id = $1, updated_at = NOW() WHERE id = $2`, buildID, deploymentID)
+
+	// Stream raw build output to the UI while the build runs.
+	streamCtx, stopStream := context.WithCancel(ctx)
+	defer stopStream()
+	go s.streamBuildLogs(streamCtx, clients, buildID, projectID)
 
 	// The GitHub token is stored in SSM for the duration of the build (secure path) and
 	// deleted once the build finishes, win or lose. cleanupSecret is idempotent and safe.
@@ -1019,7 +1077,7 @@ func (s *Service) ReconcileStuckResources(ctx context.Context) error {
 	}
 
 	if len(deps) > 0 || len(envs) > 0 {
-		log.Printf("[watchdog] auto-failed %d stuck deployment(s) and %d stuck environment(s)", len(deps), len(envs))
+		slog.Error(fmt.Sprintf("[watchdog] auto-failed %d stuck deployment(s) and %d stuck environment(s)", len(deps), len(envs)))
 	}
 	return nil
 }
@@ -1354,7 +1412,7 @@ func (s *Service) HandleDeleteProject(c *gin.Context) {
 		}
 		if err := s.enqueuer.EnqueueDeleteProject(payload); err != nil {
 			// Log but don't fail the HTTP response — the DB record is already deleted.
-			log.Printf("[delete-project] failed to enqueue AWS cleanup for %s: %v", project.Name, err)
+			slog.Error(fmt.Sprintf("[delete-project] failed to enqueue AWS cleanup for %s: %v", project.Name, err))
 		}
 	}
 
@@ -1386,13 +1444,13 @@ func (s *Service) collectEnvCleanupInfos(ctx context.Context, projectID uuid.UUI
 	var infos []DeleteEnvCleanupInfo
 	for rows.Next() {
 		var (
-			envID                              string
-			region                             string
-			iamRole, extID                     *string
-			cfStackID                          *string
-			ecrURI, ecsService                 *string
-			albRule, albTG                     *string
-			clusterName                        *string
+			envID              string
+			region             string
+			iamRole, extID     *string
+			cfStackID          *string
+			ecrURI, ecsService *string
+			albRule, albTG     *string
+			clusterName        *string
 		)
 		if err := rows.Scan(&envID, &region, &iamRole, &extID, &cfStackID,
 			&ecrURI, &ecsService, &albRule, &albTG, &clusterName); err != nil {
@@ -1457,13 +1515,13 @@ func (s *Service) RunDeleteProjectCleanup(ctx context.Context, payload DeletePro
 	defer cancel()
 
 	for _, env := range payload.Environments {
-		log.Printf("[delete-project] cleaning up env region=%s stack=%s", env.Region, env.ProjectStackID)
+		slog.Info(fmt.Sprintf("[delete-project] cleaning up env region=%s stack=%s", env.Region, env.ProjectStackID))
 		if err := s.cleanupEnv(ctx, env); err != nil {
 			// Log and continue — other environments should still be cleaned up.
-			log.Printf("[delete-project] cleanup error for env region=%s: %v", env.Region, err)
+			slog.Error(fmt.Sprintf("[delete-project] cleanup error for env region=%s: %v", env.Region, err))
 		}
 	}
-	log.Printf("[delete-project] cleanup complete for %q", payload.ProjectName)
+	slog.Info(fmt.Sprintf("[delete-project] cleanup complete for %q", payload.ProjectName))
 	return nil
 }
 
@@ -1476,31 +1534,31 @@ func (s *Service) cleanupEnv(ctx context.Context, env DeleteEnvCleanupInfo) erro
 	// 1. Delete ECS service (scale to 0 first, then force-delete).
 	if env.ECSClusterName != "" && env.ECSServiceName != "" {
 		if err := s.awsSvc.DeleteECSService(ctx, clients, env.ECSClusterName, env.ECSServiceName); err != nil {
-			log.Printf("[delete-project] DeleteECSService: %v", err)
+			slog.Info(fmt.Sprintf("[delete-project] DeleteECSService: %v", err))
 		}
 	}
 
 	// 2. Delete ALB listener rule.
 	if err := s.awsSvc.DeleteListenerRule(ctx, clients, env.ALBListenerRuleARN); err != nil {
-		log.Printf("[delete-project] DeleteListenerRule: %v", err)
+		slog.Info(fmt.Sprintf("[delete-project] DeleteListenerRule: %v", err))
 	}
 
 	// 3. Delete ALB target group.
 	if err := s.awsSvc.DeleteTargetGroup(ctx, clients, env.ALBTargetGroupARN); err != nil {
-		log.Printf("[delete-project] DeleteTargetGroup: %v", err)
+		slog.Info(fmt.Sprintf("[delete-project] DeleteTargetGroup: %v", err))
 	}
 
 	// 4. Purge ECR images so CloudFormation can delete the repository.
 	if env.ECRRepoName != "" {
 		if err := s.awsSvc.PurgeECRRepository(ctx, clients, env.ECRRepoName); err != nil {
-			log.Printf("[delete-project] PurgeECRRepository: %v", err)
+			slog.Info(fmt.Sprintf("[delete-project] PurgeECRRepository: %v", err))
 		}
 	}
 
 	// 5. Delete the CloudFormation project stack (ECR repo, IAM roles, CodeBuild, log group).
 	if env.ProjectStackID != "" {
 		if err := s.awsSvc.DeleteProjectStack(ctx, clients, env.ProjectStackID); err != nil {
-			log.Printf("[delete-project] DeleteProjectStack: %v", err)
+			slog.Info(fmt.Sprintf("[delete-project] DeleteProjectStack: %v", err))
 		}
 	}
 
@@ -1986,9 +2044,9 @@ func (s *Service) ProposeResourceChange(ctx context.Context, projectID, userID u
 		CurrentMemory: currentMem,
 	}
 
-	s.mutationMu.Lock()
-	s.pendingMutations[projectID] = &pendingMutation{proposal: proposal, proposedAt: time.Now()}
-	s.mutationMu.Unlock()
+	if err := s.enqueuer.SetPendingMutation(ctx, projectID.String(), *proposal, 10*time.Minute); err != nil {
+		return "", fmt.Errorf("failed to store pending change: %w", err)
+	}
 
 	return fmt.Sprintf(
 		"I'll update **%s** from %s CPU / %s MB → **%s CPU / %s MB**. This triggers a rolling restart (~30s downtime window).\n\nReply **confirm** to apply, or anything else to cancel.",
@@ -1998,18 +2056,14 @@ func (s *Service) ProposeResourceChange(ctx context.Context, projectID, userID u
 
 // ApplyPendingMutation executes the most recently proposed infra change for the project.
 func (s *Service) ApplyPendingMutation(ctx context.Context, projectID, userID uuid.UUID) (string, error) {
-	s.mutationMu.Lock()
-	pm, ok := s.pendingMutations[projectID]
-	if ok {
-		delete(s.pendingMutations, projectID)
+	p, err := s.enqueuer.GetPendingMutation(ctx, projectID.String())
+	if err != nil {
+		return "", fmt.Errorf("failed to load pending change: %w", err)
 	}
-	s.mutationMu.Unlock()
-
-	if !ok || time.Since(pm.proposedAt) > 10*time.Minute {
+	if p == nil {
 		return "No pending change to confirm (it may have expired). Propose a new change first.", nil
 	}
-
-	p := pm.proposal
+	s.enqueuer.DeletePendingMutation(ctx, projectID.String())
 	env, err := s.getEnvironment(ctx, projectID, p.EnvName)
 	if err != nil {
 		return "", fmt.Errorf("environment not found: %w", err)
@@ -2238,7 +2292,7 @@ func (s *Service) handlePROpenedOrSync(ctx context.Context, projectID, userID uu
 
 	project, err := s.getProject(ctx, projectID)
 	if err != nil {
-		log.Printf("[preview] project %s not found: %v", projectID, err)
+		slog.Info(fmt.Sprintf("[preview] project %s not found: %v", projectID, err))
 		return
 	}
 	if project.AccountID == nil {
@@ -2248,7 +2302,7 @@ func (s *Service) handlePROpenedOrSync(ctx context.Context, projectID, userID uu
 	// Need a ready staging env to share infra with.
 	stagingEnv, err := s.getEnvironment(ctx, projectID, "staging")
 	if err != nil || stagingEnv.StackStatus != models.StackStatusReady {
-		log.Printf("[preview] no ready staging env for project %s", projectID)
+		slog.Info(fmt.Sprintf("[preview] no ready staging env for project %s", projectID))
 		return
 	}
 
@@ -2281,7 +2335,7 @@ func (s *Service) handlePROpenedOrSync(ctx context.Context, projectID, userID uu
 		prNum, prBranch, prSHA,
 	).Scan(&previewEnvID)
 	if err != nil {
-		log.Printf("[preview] failed to upsert preview env: %v", err)
+		slog.Error(fmt.Sprintf("[preview] failed to upsert preview env: %v", err))
 		return
 	}
 
@@ -2311,7 +2365,7 @@ func (s *Service) handlePROpenedOrSync(ctx context.Context, projectID, userID uu
 
 	// Run the preview deploy (blocking, called in goroutine already).
 	if err := s.runPreviewDeployWorkflow(ctx, projectID, previewEnvID, depID, prSHA); err != nil {
-		log.Printf("[preview] deploy failed for PR #%d: %v", prNum, err)
+		slog.Error(fmt.Sprintf("[preview] deploy failed for PR #%d: %v", prNum, err))
 		if token != "" && commentID > 0 {
 			s.githubSvc.UpdatePRComment(ctx, token, project.RepoOwner, project.RepoName, commentID,
 				fmt.Sprintf("❌ **ConvDeploy** preview build failed for PR #%d.\n\n```\n%s\n```", prNum, err.Error()))
@@ -2459,7 +2513,7 @@ func (s *Service) runPreviewDeployWorkflow(ctx context.Context, projectID, envID
 	}
 
 	if err := s.awsSvc.WaitForCodeBuild(ctx, clients, buildRes.BuildID, func(msg string) {
-		log.Printf("[preview] build %s: %s", buildRes.BuildID, msg)
+		slog.Info(fmt.Sprintf("[preview] build %s: %s", buildRes.BuildID, msg))
 	}); err != nil {
 		s.updateDeploymentStatus(ctx, depID, models.DeployStatusFailed, strPtr("build failed: "+err.Error()), nil)
 		return fmt.Errorf("build failed: %w", err)
@@ -2495,3 +2549,180 @@ func (s *Service) runPreviewDeployWorkflow(ctx context.Context, projectID, envID
 }
 
 func strPtr(s string) *string { return &s }
+
+// streamBuildLogs polls CodeBuild's CloudWatch log stream every 5 seconds and
+// broadcasts each new line as a "build_log" WebSocket message until ctx is
+// cancelled (the build finished) or the stream goes quiet.
+func (s *Service) streamBuildLogs(ctx context.Context, clients *awssvc.ClientBundle, buildID string, projectID uuid.UUID) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error(fmt.Sprintf("[build-log] panic recovered: %v", r))
+		}
+	}()
+	cursor := time.Now().Add(-1 * time.Minute)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			next, err := s.awsSvc.StreamCodeBuildLogs(ctx, clients, buildID, cursor, func(line string) {
+				s.broadcast(projectID, ws.Message{Type: "build_log", Payload: line})
+			})
+			if err == nil {
+				cursor = next
+			}
+		}
+	}
+}
+
+// sendDeployResultEmail notifies the project owner of the deploy outcome,
+// honoring their notification preferences.
+func (s *Service) sendDeployResultEmail(ctx context.Context, project *models.Project, env *models.Environment, deploymentID uuid.UUID, success bool) {
+	if s.emailSvc == nil {
+		return
+	}
+	var email string
+	var enabled bool
+	prefColumn := "notify_deploy_failed"
+	if success {
+		prefColumn = "notify_deploy_succeeded"
+	}
+	err := s.db.Pool.QueryRow(ctx,
+		`SELECT email, notifications_enabled AND `+prefColumn+` FROM users WHERE id = $1`,
+		project.UserID,
+	).Scan(&email, &enabled)
+	if err != nil || !enabled {
+		return
+	}
+
+	var commitSHA string
+	s.db.Pool.QueryRow(ctx, `SELECT commit_sha FROM deployments WHERE id = $1`, deploymentID).Scan(&commitSHA)
+
+	status := "failed"
+	if success {
+		status = "live"
+	}
+	url := strings.TrimRight(os.Getenv("FRONTEND_URL"), "/") + "/projects/" + project.ID.String()
+	if err := s.emailSvc.SendDeployResult(ctx, email, project.Name, env.Name, status, commitSHA, url); err != nil {
+		slog.Error(fmt.Sprintf("[deploy] result email failed: %v", err))
+	}
+}
+
+// HandleCancelDeployment stops an in-flight build and marks the deployment failed.
+// POST /projects/:id/deployments/:deployId/cancel
+func (s *Service) HandleCancelDeployment(c *gin.Context) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+		return
+	}
+	deploymentID, err := uuid.Parse(c.Param("deployId"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid deployment id"})
+		return
+	}
+
+	dep, err := s.getDeployment(c.Request.Context(), deploymentID)
+	if err != nil || dep.ProjectID != projectID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "deployment not found"})
+		return
+	}
+	if dep.Status != models.DeployStatusBuilding && dep.Status != models.DeployStatusDeploying && dep.Status != models.DeployStatusPending {
+		c.JSON(http.StatusConflict, gin.H{"error": "nothing to cancel — deployment is not in progress"})
+		return
+	}
+
+	// Stop the CodeBuild job when one is running (best-effort — the deployment
+	// is marked cancelled regardless so the UI unblocks).
+	var buildID *string
+	s.db.Pool.QueryRow(c.Request.Context(),
+		`SELECT build_id FROM deployments WHERE id = $1`, deploymentID).Scan(&buildID)
+	if buildID != nil && *buildID != "" {
+		env, err := s.getEnvironmentByID(c.Request.Context(), dep.EnvironmentID)
+		if err == nil {
+			if clients, err := s.awsSvc.AssumeRoleForEnvironment(c.Request.Context(), env); err == nil {
+				if err := s.awsSvc.StopCodeBuildJob(c.Request.Context(), clients, *buildID); err != nil {
+					slog.Error(fmt.Sprintf("[cancel] StopCodeBuildJob failed: %v", err))
+				}
+			}
+		}
+	}
+
+	reason := "Cancelled by user"
+	s.updateDeploymentStatus(c.Request.Context(), deploymentID, models.DeployStatusFailed, &reason, nil)
+	s.broadcast(projectID, ws.Message{Type: "deploy_failed", Payload: "Deployment cancelled"})
+
+	c.JSON(http.StatusOK, gin.H{"message": "Deployment cancelled"})
+}
+
+// HandleUpdateProject edits project settings. PATCH /projects/:id
+// Allowed fields: name, branch, start_command, framework.
+func (s *Service) HandleUpdateProject(c *gin.Context) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+		return
+	}
+
+	var req struct {
+		Name         *string `json:"name"`
+		Branch       *string `json:"branch"`
+		StartCommand *string `json:"start_command"`
+		Framework    *string `json:"framework"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	project, err := s.getProject(c.Request.Context(), projectID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
+		return
+	}
+
+	if req.Name != nil {
+		trimmed := strings.TrimSpace(*req.Name)
+		if !projectNameRe.MatchString(trimmed) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "project name must be 1-63 characters: letters, numbers, spaces, dots, dashes, underscores"})
+			return
+		}
+		project.Name = trimmed
+	}
+	if req.Branch != nil {
+		if err := validateProjectInput(project.Name, project.RepoOwner, project.RepoName, req.Branch); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		project.Branch = req.Branch
+	}
+	if req.StartCommand != nil {
+		if len(*req.StartCommand) > 500 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "start command too long (max 500 characters)"})
+			return
+		}
+		project.StartCommand = req.StartCommand
+	}
+	if req.Framework != nil {
+		if !models.ValidFramework(*req.Framework) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "unknown framework"})
+			return
+		}
+		project.Framework = *req.Framework
+	}
+
+	err = s.db.Pool.QueryRow(c.Request.Context(), `
+		UPDATE projects SET name = $1, branch = $2, start_command = $3, framework = $4, updated_at = NOW()
+		WHERE id = $5
+		RETURNING updated_at`,
+		project.Name, project.Branch, project.StartCommand, project.Framework, projectID,
+	).Scan(&project.UpdatedAt)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update project"})
+		return
+	}
+
+	c.JSON(http.StatusOK, project)
+}

@@ -128,8 +128,49 @@ export interface WsMessage {
     | "provision_progress"
     | "provision_done"
     | "provision_failed"
+    | "alert"
+    | "alert_resolved"
+    | "deploy_risk"
+    | "build_log"
+    | "runtime_event"
     | "error";
   payload: string;
+}
+
+export interface Alert {
+  id: string;
+  project_id: string;
+  environment_id: string | null;
+  alert_type: string;
+  severity: "warn" | "error" | "info";
+  title: string;
+  summary: string;
+  status: "open" | "resolved" | "snoozed";
+  triggered_at: string;
+  resolved_at: string | null;
+  snoozed_until: string | null;
+}
+
+export interface RiskScore {
+  score: number;
+  level: "low" | "medium" | "high" | "critical";
+  factors: { name: string; points: number; reason: string }[];
+  explanation: string;
+}
+
+export interface UserMe {
+  email: string;
+  plan: "free" | "pro" | "team";
+  ai_actions_this_month: number;
+  ai_actions_limit: number;
+  projects_count: number;
+  projects_limit: number;
+  notifications: {
+    enabled: boolean;
+    deploy_failed: boolean;
+    deploy_succeeded: boolean;
+    alert_fired: boolean;
+  };
 }
 
 export interface ConversationMessage {

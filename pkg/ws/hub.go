@@ -3,7 +3,8 @@ package ws
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -83,7 +84,7 @@ func (h *Hub) HandleUpgrade(c *gin.Context, authFn AuthFunc, handler MessageHand
 
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		log.Printf("WebSocket upgrade error: %v", err)
+		slog.Error(fmt.Sprintf("WebSocket upgrade error: %v", err))
 		return
 	}
 

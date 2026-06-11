@@ -5,10 +5,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	awsiface "github.com/ashborntechnologies-web/OpsPilot/internal/aws"
-	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/google/uuid"
 )
 
@@ -125,7 +126,8 @@ func (m *MockAWSProvider) FetchRecentECSLogs(_ context.Context, _ *awsiface.Clie
 	return m.LogLines, m.LogsErr
 }
 
-func (m *MockAWSProvider) CreateLogGroupIfNotExists(_ context.Context, _ *awsiface.ClientBundle, _ string) {}
+func (m *MockAWSProvider) CreateLogGroupIfNotExists(_ context.Context, _ *awsiface.ClientBundle, _ string) {
+}
 
 func (m *MockAWSProvider) GetOrCreatePlatformStack(_ context.Context, _ uuid.UUID, _ string) (*models.PlatformStack, bool, error) {
 	if m.PlatformStack != nil {
@@ -197,14 +199,14 @@ func (m *MockAWSProvider) TeardownPreviewService(_ context.Context, _ *awsiface.
 
 // MockGitHubProvider is a no-op implementation of github.GitHubProvider.
 type MockGitHubProvider struct {
-	Token      string
-	TokenErr   error
-	CommitSHA  string
-	CommitMsg  string
-	CommitErr  error
-	WebhookID  int64
-	WebhookErr error
-	PRCommentID int64
+	Token        string
+	TokenErr     error
+	CommitSHA    string
+	CommitMsg    string
+	CommitErr    error
+	WebhookID    int64
+	WebhookErr   error
+	PRCommentID  int64
 	PRCommentErr error
 }
 
@@ -252,4 +254,14 @@ func WebhookSink(t *testing.T) (url string, payloads func() [][]byte) {
 	}))
 	t.Cleanup(srv.Close)
 	return srv.URL, func() [][]byte { return received }
+}
+
+// StreamCodeBuildLogs satisfies aws.AWSProvider for tests — returns the cursor unchanged.
+func (m *MockAWSProvider) StreamCodeBuildLogs(_ context.Context, _ *awsiface.ClientBundle, _ string, since time.Time, _ func(string)) (time.Time, error) {
+	return since, nil
+}
+
+// StopCodeBuildJob satisfies aws.AWSProvider for tests.
+func (m *MockAWSProvider) StopCodeBuildJob(_ context.Context, _ *awsiface.ClientBundle, _ string) error {
+	return nil
 }

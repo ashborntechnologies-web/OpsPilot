@@ -1,6 +1,7 @@
 package diagnosis
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
@@ -93,6 +94,11 @@ func (s *Service) HandleSubmitFeedback(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save feedback"})
 		return
+	}
+
+	// Positive, verified feedback becomes long-term project memory.
+	if s.memory != nil && fb.Rating == models.RatingHelpful && fb.FixedIssue {
+		go s.memory.RecordDiagnosisFeedback(context.Background(), projectID, incidentID)
 	}
 
 	c.JSON(http.StatusCreated, gin.H{"feedback": fb, "score": fb.RatingScore()})

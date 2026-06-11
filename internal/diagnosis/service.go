@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/ashborntechnologies-web/OpsPilot/internal/aws"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/memory"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/prompts"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
@@ -23,7 +25,12 @@ type Service struct {
 	awsSvc *aws.Service
 	events *events.Service
 	llm    *llm.Client
+	memory *memory.Service
 }
+
+// SetMemoryService injects the project-memory service (set once at startup).
+// Diagnosis works without it; memory just makes prompts smarter over time.
+func (s *Service) SetMemoryService(m *memory.Service) { s.memory = m }
 
 func NewService(db *models.DB, awsSvc *aws.Service, eventSvc *events.Service, apiKey string) *Service {
 	return &Service{db: db, awsSvc: awsSvc, events: eventSvc, llm: llm.New(apiKey)}
@@ -114,8 +121,14 @@ func (s *Service) diagnose(ctx context.Context, projectID uuid.UUID, deployment 
 	// Step 6: the deployment's operational event timeline
 	eventTimeline := s.getEventTimeline(ctx, deployment.ID)
 
+	// Step 6.5: project memory — facts learned from this project's history
+	memorySection := s.memorySection(ctx, projectID)
+
 	// Step 7: assemble bounded context and send to Claude
 	userMessage := buildDiagnosisContext(failureReason, logLines, history, pastIncidents, eventTimeline)
+	if memorySection != "" {
+		userMessage += "\n\n" + memorySection
+	}
 	diagnosis, err := s.analyzeWithClaude(ctx, userMessage)
 	if err != nil {
 		return "", uuid.Nil, fmt.Errorf("analysis failed: %w", err)
@@ -330,4 +343,151 @@ func (s *Service) saveIncident(ctx context.Context, projectID, deploymentID uuid
 		projectID, deploymentID, trigger, rootCause, resolution, logs,
 	).Scan(&id)
 	return id
+}
+
+// memorySection renders the project's learned memory for prompt injection.
+func (s *Service) memorySection(ctx context.Context, projectID uuid.UUID) string {
+	if s.memory == nil {
+		return ""
+	}
+	memories, err := s.memory.GetRelevantMemory(ctx, projectID, 5)
+	if err != nil {
+		return ""
+	}
+	return memory.FormatForPrompt(memories)
+}
+
+// DiagnoseRuntime analyzes the current runtime state of a project without a
+// specific failed deployment — triggered autonomously when the monitoring
+// subsystem emits an error-severity runtime anomaly. Context is built from
+// recent logs, the latest operational events, project memory, and past
+// incidents. The result is stored as a runtime_anomaly incident and the most
+// recent open alert's summary is refreshed with the diagnosis headline.
+func (s *Service) DiagnoseRuntime(ctx context.Context, projectID uuid.UUID) (string, error) {
+	// Most recently active ready environment for the project.
+	var env models.Environment
+	err := s.db.Pool.QueryRow(ctx, `
+		SELECT id, project_id, account_id, aws_region, log_group_name
+		FROM environments
+		WHERE project_id = $1 AND stack_status = 'ready' AND is_preview = false
+		ORDER BY updated_at DESC LIMIT 1`, projectID,
+	).Scan(&env.ID, &env.ProjectID, &env.AccountID, &env.AWSRegion, &env.LogGroupName)
+	if err != nil {
+		return "", fmt.Errorf("no ready environment to diagnose: %w", err)
+	}
+
+	// Recent application logs (best-effort).
+	var logLines []string
+	if env.LogGroupName != nil && env.AccountID != nil {
+		if clients, err := s.awsSvc.AssumeRoleForEnvironment(ctx, &env); err == nil {
+			logLines, _ = s.awsSvc.FetchRecentECSLogs(ctx, clients, *env.LogGroupName, 200)
+		}
+	}
+
+	// Last 10 operational events for this environment.
+	eventTimeline := s.getEnvEventTimeline(ctx, env.ID, 10)
+
+	pastIncidents, err := s.getPastIncidents(ctx, projectID, 3)
+	if err != nil {
+		pastIncidents = "No past incidents on record."
+	}
+	memorySection := s.memorySection(ctx, projectID)
+
+	userMessage := "# Runtime Anomaly Analysis\nNo deployment is in flight — the running service started misbehaving.\n\n" +
+		buildDiagnosisContext("Runtime anomaly detected by continuous monitoring (no recorded deploy failure).",
+			logLines, "Not applicable — no recent deployment triggered this.", pastIncidents, eventTimeline)
+	if memorySection != "" {
+		userMessage += "\n\n" + memorySection
+	}
+
+	envID := env.ID
+	s.events.Emit(ctx, events.Event{
+		ProjectID:     projectID,
+		EnvironmentID: &envID,
+		Type:          models.EventDiagnosisStarted,
+		Source:        models.SourceAI,
+		ActorType:     models.ActorAI,
+		Payload:       map[string]any{"trigger": "runtime_anomaly"},
+	})
+
+	diagnosis, err := s.analyzeWithClaude(ctx, userMessage)
+	if err != nil {
+		return "", fmt.Errorf("runtime analysis failed: %w", err)
+	}
+
+	rawForMemory := ""
+	if len(logLines) > 0 {
+		rawForMemory = strings.Join(logLines, "\n")
+	}
+
+	// Store as a runtime_anomaly incident (no deployment attached).
+	rootCause := extractDiagnosisField(diagnosis, "Root Cause")
+	if rootCause == "" {
+		rootCause = diagnosis
+	}
+	resolution := extractDiagnosisField(diagnosis, "Fix")
+	var incidentID uuid.UUID
+	s.db.Pool.QueryRow(ctx,
+		`INSERT INTO incidents (project_id, environment_id, trigger, root_cause, resolution, raw_logs)
+		 VALUES ($1, $2, 'runtime_anomaly', $3, $4, $5) RETURNING id`,
+		projectID, envID, rootCause, resolution, rawForMemory,
+	).Scan(&incidentID)
+
+	// Refresh the latest open alert with the diagnosis headline so the alert
+	// panel shows the root cause, not just the symptom.
+	if headline := firstSentence(rootCause); headline != "" {
+		s.db.Pool.Exec(ctx, `
+			UPDATE alerts SET summary = $1
+			WHERE id = (SELECT id FROM alerts WHERE project_id = $2 AND status = 'open'
+			            ORDER BY triggered_at DESC LIMIT 1)`,
+			headline, projectID)
+	}
+
+	s.events.Emit(ctx, events.Event{
+		ProjectID:     projectID,
+		EnvironmentID: &envID,
+		Type:          models.EventDiagnosisCompleted,
+		Source:        models.SourceAI,
+		ActorType:     models.ActorAI,
+		Payload:       map[string]any{"trigger": "runtime_anomaly", "incident_id": incidentID.String()},
+	})
+
+	return diagnosis, nil
+}
+
+// getEnvEventTimeline renders the last N operational events for an environment.
+func (s *Service) getEnvEventTimeline(ctx context.Context, envID uuid.UUID, limit int) string {
+	rows, err := s.db.Pool.Query(ctx, `
+		SELECT event_type, severity, occurred_at FROM operational_events
+		WHERE environment_id = $1 ORDER BY occurred_at DESC LIMIT $2`, envID, limit)
+	if err != nil {
+		return "No event timeline available."
+	}
+	defer rows.Close()
+
+	var lines []string
+	for rows.Next() {
+		var eventType, severity string
+		var occurredAt time.Time
+		if rows.Scan(&eventType, &severity, &occurredAt) != nil {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s [%s] %s", occurredAt.Format(time.RFC3339), severity, eventType))
+	}
+	if len(lines) == 0 {
+		return "No event timeline available."
+	}
+	return strings.Join(lines, "\n")
+}
+
+// firstSentence returns the text up to the first period (or the whole string).
+func firstSentence(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, ". "); i != -1 {
+		return s[:i+1]
+	}
+	if len(s) > 200 {
+		return s[:200]
+	}
+	return s
 }

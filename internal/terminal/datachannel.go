@@ -39,10 +39,10 @@ import (
 )
 
 const (
-	headerLengthValue uint32 = 116
+	headerLengthValue  uint32 = 116
 	schemaVersionValue uint32 = 1
-	payloadTypeData   uint32 = 1
-	payloadTypeSize   uint32 = 17 // PTY resize
+	payloadTypeData    uint32 = 1
+	payloadTypeSize    uint32 = 17 // PTY resize
 
 	msgTypeOpen   = "open_data_channel"
 	msgTypeInput  = "input_stream_data"

@@ -6,11 +6,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ashborntechnologies-web/OpsPilot/internal/awstags"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudformation"
 	cftypes "github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
-	"github.com/ashborntechnologies-web/OpsPilot/internal/awstags"
-	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/google/uuid"
 )
 
@@ -107,6 +107,7 @@ Resources:
                   - codebuild:BatchGetProjects
                   - codebuild:ListBuildsForProject
                   - codebuild:UpdateProject
+                  - codebuild:StopBuild
                   - codebuild:TagResource
                 Resource: '*'
               - Sid: CloudWatchLogs
@@ -122,6 +123,12 @@ Resources:
                   - logs:TagLogGroup
                   - logs:TagResource
                   - logs:ListTagsLogGroup
+                Resource: '*'
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
                 Resource: '*'
               - Sid: ACMRead
                 Effect: Allow

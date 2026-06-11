@@ -3,11 +3,13 @@ package terminal
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
 
-	awssvc "github.com/ashborntechnologies-web/OpsPilot/internal/aws"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/auth"
+	awssvc "github.com/ashborntechnologies-web/OpsPilot/internal/aws"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
@@ -31,7 +33,15 @@ func NewService(db *models.DB, awsSvc awssvc.AWSProvider, authSvc *auth.Service)
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true }, // auth via first message
+	// Origin is enforced against FRONTEND_URL (empty = dev mode, allow all);
+	// authentication still happens via the first message.
+	CheckOrigin: func(r *http.Request) bool {
+		allowedOrigin := os.Getenv("FRONTEND_URL")
+		if allowedOrigin == "" {
+			return true
+		}
+		return r.Header.Get("Origin") == allowedOrigin
+	},
 }
 
 // HandleTerminal upgrades the connection to WebSocket and proxies an ECS Exec shell.
@@ -160,7 +170,7 @@ func (s *Service) HandleTerminal(c *gin.Context) {
 			}
 			msg, err := deserialize(data)
 			if err != nil {
-				log.Printf("[terminal] deserialize error: %v", err)
+				slog.Error(fmt.Sprintf("[terminal] deserialize error: %v", err))
 				continue
 			}
 

@@ -77,6 +77,11 @@ func RunMigrations(db *DB) error {
 		addWebhookColumnsToProjects,
 		addHTTPSSupport,
 		createDiagnosisFeedbackTable,
+		createAlertsTable,
+		createAlertPreferencesTable,
+		createProjectMemoryTable,
+		addNotificationAndPlanToUsers,
+		addBuildIDToDeployments,
 	}
 
 	for _, m := range migrations {
@@ -304,6 +309,73 @@ CREATE UNIQUE INDEX IF NOT EXISTS environments_non_preview_name_uniq
     ON environments(project_id, name) WHERE is_preview = false;
 CREATE UNIQUE INDEX IF NOT EXISTS environments_preview_pr_uniq
     ON environments(project_id, pr_number) WHERE is_preview = true;`
+
+// createAlertsTable holds user-facing alerts derived from operational events by
+// the alert engine — deduplicated, AI-summarized, resolvable.
+const createAlertsTable = `
+CREATE TABLE IF NOT EXISTS alerts (
+	id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	project_id       UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+	environment_id   UUID REFERENCES environments(id) ON DELETE CASCADE,
+	alert_type       TEXT NOT NULL,
+	severity         TEXT NOT NULL DEFAULT 'warn',
+	title            TEXT NOT NULL,
+	summary          TEXT NOT NULL,
+	status           TEXT NOT NULL DEFAULT 'open',
+	triggered_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	resolved_at      TIMESTAMPTZ,
+	snoozed_until    TIMESTAMPTZ,
+	source_event_ids UUID[] NOT NULL DEFAULT '{}',
+	created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_project ON alerts(project_id, status, triggered_at DESC);`
+
+// createAlertPreferencesTable stores per-environment alert snoozes so the alert
+// engine can suppress alert types the user has muted.
+const createAlertPreferencesTable = `
+CREATE TABLE IF NOT EXISTS alert_preferences (
+	id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	project_id     UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+	environment_id UUID REFERENCES environments(id) ON DELETE CASCADE,
+	alert_type     TEXT NOT NULL,
+	snoozed_until  TIMESTAMPTZ,
+	created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	UNIQUE(project_id, environment_id, alert_type)
+);`
+
+// createProjectMemoryTable is OpsPilot's long-term memory: facts learned about a
+// project (recurring failures, confirmed fixes, deploy patterns) that are
+// injected into future diagnosis prompts.
+const createProjectMemoryTable = `
+CREATE TABLE IF NOT EXISTS project_memory (
+	id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	project_id         UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+	memory_type        TEXT NOT NULL,
+	content            TEXT NOT NULL,
+	confidence         FLOAT NOT NULL DEFAULT 1.0,
+	source             TEXT NOT NULL,
+	created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	last_referenced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	reference_count    INT NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_project_memory_project
+	ON project_memory(project_id, memory_type, last_referenced_at DESC);`
+
+// addNotificationAndPlanToUsers: per-user notification toggles plus plan and
+// AI-action metering for usage limits.
+const addNotificationAndPlanToUsers = `
+ALTER TABLE users ADD COLUMN IF NOT EXISTS notifications_enabled    BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_deploy_failed     BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_deploy_succeeded  BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_alert_fired       BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS plan                     TEXT NOT NULL DEFAULT 'free';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ai_actions_this_month    INT NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ai_actions_reset_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();`
+
+// addBuildIDToDeployments stores the CodeBuild build ID so an in-flight build
+// can be cancelled and its logs streamed.
+const addBuildIDToDeployments = `
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS build_id TEXT;`
 
 // createDiagnosisFeedbackTable records user ratings of AI diagnoses. helpful+fixed
 // rows are the gold-standard dataset for improving the diagnosis model.

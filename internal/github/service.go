@@ -44,10 +44,10 @@ type Service struct {
 }
 
 type Repo struct {
-	ID    int    `json:"id"`
+	ID       int    `json:"id"`
 	FullName string `json:"full_name"`
-	Name  string `json:"name"`
-	Owner struct {
+	Name     string `json:"name"`
+	Owner    struct {
 		Login string `json:"login"`
 	} `json:"owner"`
 	Private     bool   `json:"private"`
@@ -826,8 +826,8 @@ func verifyState(state, encKey string) (uuid.UUID, error) {
 
 // PREvent is the subset of a GitHub pull_request webhook payload we care about.
 type PREvent struct {
-	Action string `json:"action"` // opened | synchronize | closed | reopened
-	Number int    `json:"number"`
+	Action      string `json:"action"` // opened | synchronize | closed | reopened
+	Number      int    `json:"number"`
 	PullRequest struct {
 		Head struct {
 			Ref string `json:"ref"` // branch name

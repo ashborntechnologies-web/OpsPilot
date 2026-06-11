@@ -11,9 +11,10 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { useProjectWS, type ChatEntry } from "@/lib/use-ws";
-import { getConversationHistory, getProject } from "@/lib/api";
-import type { Project } from "@/types/api";
-import { ArrowLeft, Send, Wifi, WifiOff, Loader2, Rocket } from "lucide-react";
+import { getConversationHistory, getProject, listAlerts, listDeployments, submitDiagnosisFeedback } from "@/lib/api";
+import type { Project, Alert, Deployment } from "@/types/api";
+import { toast } from "sonner";
+import { ArrowLeft, Send, Wifi, WifiOff, Loader2, Rocket, CheckCircle2, AlertTriangle, ThumbsUp, ThumbsDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const SUGGESTED = [
@@ -36,6 +37,12 @@ function msgClass(type: ChatEntry["type"]) {
     case "deploy_progress":
     case "provision_progress":
       return "bg-blue-50 border border-blue-200 text-blue-900";
+    case "alert":
+      return "bg-red-50 border border-red-200 text-red-900";
+    case "alert_resolved":
+      return "bg-green-50 border border-green-200 text-green-900";
+    case "deploy_risk":
+      return "bg-amber-50 border border-amber-200 text-amber-900";
     default:
       return "bg-muted";
   }
@@ -92,6 +99,9 @@ export default function ChatPage() {
   const [project, setProject] = useState<Project | null>(null);
   const [input, setInput] = useState("");
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [openAlerts, setOpenAlerts] = useState<Alert[]>([]);
+  const [deployments, setDeployments] = useState<Deployment[]>([]);
+  const [ratedEntries, setRatedEntries] = useState<Record<string, boolean>>({});
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const { entries, connected, thinking, send, loadHistory } = useProjectWS(id, token);
@@ -121,6 +131,8 @@ export default function ChatPage() {
     Promise.all([
       getProject(token, id).then(setProject),
       getConversationHistory(token, id),
+      listAlerts(token, id, "open").then(setOpenAlerts).catch(() => {}),
+      listDeployments(token, id).then((d) => setDeployments(d ?? [])).catch(() => {}),
     ]).then(([, history]) => {
       if (history?.length) loadHistory(history);
       setHistoryLoaded(true);
@@ -131,6 +143,36 @@ export default function ChatPage() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [entries]);
+
+  // Context-aware suggestions: alerts > failed deploy > first-run > defaults.
+  const lastFinished = deployments.find((d) => ["live", "failed", "rolled_back"].includes(d.status));
+  let suggestions: string[] = SUGGESTED.slice();
+  if (openAlerts.length > 0) {
+    suggestions = ["What's wrong?", "Diagnose the issue", "Show me recent logs", "Check application health"];
+  } else if (lastFinished?.status === "failed") {
+    suggestions = ["Why did the last deploy fail?", "Redeploy", "Show me recent logs", "Roll back the last deployment"];
+  } else if (deployments.length === 0) {
+    suggestions = ["Deploy to production", "Set up staging", "Check application health"];
+  }
+
+  const lastFailedDeployId = deployments.find((d) => d.status === "failed")?.id ?? null;
+
+  async function handleRateDiagnosis(entryId: string, rating: "helpful" | "not_helpful", fixedIssue: boolean) {
+    if (!token || !lastFailedDeployId) {
+      setRatedEntries((p) => ({ ...p, [entryId]: true }));
+      return;
+    }
+    try {
+      await submitDiagnosisFeedback(token, id, lastFailedDeployId, { rating, fixed_issue: fixedIssue });
+      setRatedEntries((p) => ({ ...p, [entryId]: true }));
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+    }
+  }
+
+  function handleStatusPillClick() {
+    if (connected && !thinking) send("What's the current status of my infrastructure?");
+  }
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -157,7 +199,32 @@ export default function ChatPage() {
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <div className="flex items-center gap-3 text-xs text-muted-foreground">
+          {/* System status pill — click to ask the assistant for a status report */}
+          <button
+            onClick={handleStatusPillClick}
+            disabled={!connected || thinking}
+            className={cn(
+              "flex items-center gap-1.5 rounded-full border px-2.5 py-1 transition-colors disabled:opacity-60",
+              openAlerts.length > 0
+                ? "border-red-200 bg-red-50 text-red-700 hover:bg-red-100"
+                : "border-green-200 bg-green-50 text-green-700 hover:bg-green-100"
+            )}
+            title="Ask about infrastructure status"
+          >
+            {openAlerts.length > 0 ? (
+              <>
+                <AlertTriangle className="h-3 w-3" />
+                {openAlerts.length} open alert{openAlerts.length > 1 ? "s" : ""}
+              </>
+            ) : (
+              <>
+                <CheckCircle2 className="h-3 w-3" />
+                All systems healthy
+              </>
+            )}
+          </button>
+          <span className="flex items-center gap-1.5">
           {connected ? (
             <>
               <Wifi className="h-3.5 w-3.5 text-green-500" />
@@ -169,6 +236,7 @@ export default function ChatPage() {
               <span>Connecting...</span>
             </>
           )}
+          </span>
         </div>
       </div>
 
@@ -184,7 +252,7 @@ export default function ChatPage() {
                 Deploy, rollback, check logs, and diagnose issues — all in conversation.
               </p>
               <div className="flex flex-wrap justify-center gap-2">
-                {SUGGESTED.map((s) => (
+                {suggestions.map((s) => (
                   <button
                     key={s}
                     disabled={!connected || thinking}
@@ -199,7 +267,39 @@ export default function ChatPage() {
           )}
 
           {entries.map((entry) => (
-            <MessageBubble key={entry.id} entry={entry} />
+            <div key={entry.id}>
+              <MessageBubble entry={entry} />
+              {/* Diagnosis feedback — shown after assistant messages containing a root cause */}
+              {entry.role === "assistant" && entry.content.includes("Root Cause:") && (
+                <div className="mt-1.5 ml-10 text-xs">
+                  {ratedEntries[entry.id] ? (
+                    <span className="text-muted-foreground">Thanks — this helps improve future diagnoses.</span>
+                  ) : (
+                    <span className="flex items-center gap-2 text-muted-foreground">
+                      Was this diagnosis helpful?
+                      <button
+                        onClick={() => handleRateDiagnosis(entry.id, "helpful", true)}
+                        className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 hover:bg-green-50 hover:border-green-300 hover:text-green-700"
+                      >
+                        <ThumbsUp className="h-3 w-3" /> Fixed it
+                      </button>
+                      <button
+                        onClick={() => handleRateDiagnosis(entry.id, "helpful", false)}
+                        className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 hover:bg-green-50 hover:border-green-300 hover:text-green-700"
+                      >
+                        <ThumbsUp className="h-3 w-3" /> Helpful
+                      </button>
+                      <button
+                        onClick={() => handleRateDiagnosis(entry.id, "not_helpful", false)}
+                        className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 hover:bg-red-50 hover:border-red-300 hover:text-red-700"
+                      >
+                        <ThumbsDown className="h-3 w-3" /> Not helpful
+                      </button>
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
           ))}
 
           <div ref={bottomRef} />
@@ -209,7 +309,7 @@ export default function ChatPage() {
       {/* Suggested pills (shown while conversation is active) */}
       {entries.length > 0 && (
         <div className="border-t bg-white px-4 py-2 flex gap-2 overflow-x-auto">
-          {SUGGESTED.slice(0, 3).map((s) => (
+          {suggestions.slice(0, 3).map((s) => (
             <button
               key={s}
               onClick={() => { setInput(s); }}

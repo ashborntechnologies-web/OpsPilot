@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,10 +13,9 @@ import (
 	"syscall"
 	"time"
 
-	awssdk "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/auth"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/aws"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/billing"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/conversation"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
@@ -22,13 +23,20 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/export"
 	githubsvc "github.com/ashborntechnologies-web/OpsPilot/internal/github"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/memory"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/monitor"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/notify"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/prompts"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/queue"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/terminal"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/users"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/webhooks"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	pkgws "github.com/ashborntechnologies-web/OpsPilot/pkg/ws"
+	awssdk "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -47,13 +55,13 @@ func resolvePlatformIdentity() (accountID, callerARN string) {
 
 	cfg, err := awssdk.LoadDefaultConfig(ctx)
 	if err != nil {
-		log.Printf("WARNING: could not load AWS config: %v — bootstrap template unavailable", err)
+		slog.Warn(fmt.Sprintf("WARNING: could not load AWS config: %v — bootstrap template unavailable", err))
 		return os.Getenv("PLATFORM_AWS_ACCOUNT_ID"), ""
 	}
 
 	out, err := sts.NewFromConfig(cfg).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 	if err != nil {
-		log.Printf("WARNING: sts:GetCallerIdentity failed: %v — bootstrap template unavailable", err)
+		slog.Warn(fmt.Sprintf("WARNING: sts:GetCallerIdentity failed: %v — bootstrap template unavailable", err))
 		return os.Getenv("PLATFORM_AWS_ACCOUNT_ID"), ""
 	}
 
@@ -65,7 +73,7 @@ func resolvePlatformIdentity() (accountID, callerARN string) {
 		accountID = override
 	}
 
-	log.Printf("Platform identity: account=%s arn=%s", accountID, callerARN)
+	slog.Info(fmt.Sprintf("Platform identity: account=%s arn=%s", accountID, callerARN))
 	return accountID, callerARN
 }
 
@@ -120,6 +128,12 @@ func validateEnv() {
 }
 
 func main() {
+	// Structured JSON logging — every component logs through slog.
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	// Load env
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using system env")
@@ -199,14 +213,40 @@ func main() {
 	terminalSvc := terminal.NewService(db, awsSvc, authSvc)
 	deploySvc := deploy.NewService(db, awsSvc, githubSvc, hub, queueClient, eventSvc, envVarSvc, webhookSvc)
 
+	// Notification service — no-op (logging) when SMTP is not configured.
+	emailSvc := notify.NewEmailService(
+		os.Getenv("SMTP_HOST"), os.Getenv("SMTP_PORT"),
+		os.Getenv("SMTP_USER"), os.Getenv("SMTP_PASS"),
+		os.Getenv("SMTP_FROM"),
+	)
+
+	// Project memory — long-term facts injected into diagnosis prompts.
+	memorySvc := memory.NewService(db, llm.New(os.Getenv("ANTHROPIC_API_KEY")))
+
+	// Alert engine — turns operational events into user-facing alerts.
+	alertEngine := monitor.NewAlertEngine(db, llm.New(os.Getenv("ANTHROPIC_API_KEY")), hub, emailSvc)
+	eventSvc.SetAlertEngine(alertEngine)
+	eventSvc.SetDiagnosisEnqueuer(queueClient)
+
+	// Billing limits + users endpoints.
+	billingSvc := billing.NewService(db)
+	usersSvc := users.NewService(db, billingSvc)
+
+	deploySvc.SetEmailService(emailSvc)
+	deploySvc.SetMemoryService(memorySvc)
+	deploySvc.SetRiskLLM(llm.New(os.Getenv("ANTHROPIC_API_KEY")))
+	deploySvc.SetBillingService(billingSvc)
+
 	// After an environment is created with a linked AWS account, auto-trigger provisioning.
 	awsSvc.SetOnEnvCreated(func(projectID, environmentID uuid.UUID) {
 		if err := queueClient.EnqueueProvision(projectID.String(), environmentID.String()); err != nil {
-			log.Printf("failed to enqueue provision job for env %s: %v", environmentID, err)
+			slog.Error(fmt.Sprintf("failed to enqueue provision job for env %s: %v", environmentID, err))
 		}
 	})
 	diagnosisSvc := diagnosis.NewService(db, awsSvc, eventSvc, os.Getenv("ANTHROPIC_API_KEY"))
+	diagnosisSvc.SetMemoryService(memorySvc)
 	conversationSvc := conversation.NewService(db, deploySvc, diagnosisSvc, os.Getenv("ANTHROPIC_API_KEY"), hub)
+	conversationSvc.SetBillingService(billingSvc)
 
 	// Init job queue server
 	queueServer := queue.NewServer(
@@ -220,15 +260,26 @@ func main() {
 	// Periodic watchdog — enqueues a stuck-resource reconcile every 5 minutes.
 	scheduler := queue.NewScheduler(os.Getenv("REDIS_URL"))
 	if err := scheduler.Start(); err != nil {
-		log.Printf("WARNING: failed to start watchdog scheduler: %v", err)
+		slog.Warn(fmt.Sprintf("WARNING: failed to start watchdog scheduler: %v", err))
 	}
 	defer scheduler.Stop()
+
+	// Continuous monitoring — health poller (ECS/ALB, every 60s) and log anomaly
+	// scanner (every 5m), one worker per ready environment.
+	poller := monitor.NewPoller(db, awsSvc, eventSvc, hub)
+	go poller.Start()
+	defer poller.Stop()
+
+	logScanner := monitor.NewLogScanner(db, awsSvc, eventSvc, hub)
+	go logScanner.Start()
+	defer logScanner.Stop()
 
 	// Setup router — gin.New (not Default) so the platform controls every header;
 	// logging and panic recovery are attached explicitly.
 	r := gin.New()
 	r.Use(gin.Logger())
 	r.Use(gin.Recovery())
+	r.Use(middleware.RequestID())
 	r.Use(middleware.Proprietary())
 	r.Use(middleware.CORS(os.Getenv("FRONTEND_URL")))
 
@@ -285,6 +336,10 @@ func main() {
 		protected.GET("/projects", deploySvc.HandleListProjects)
 
 		// AWS Accounts (user-level — ownership enforced inside the handlers)
+		// Account (plan, usage, notification preferences)
+		protected.GET("/users/me", usersSvc.HandleGetMe)
+		protected.PATCH("/users/me/notifications", usersSvc.HandleUpdateNotifications)
+
 		protected.GET("/aws-accounts", awsSvc.HandleListAWSAccounts)
 		protected.POST("/aws-accounts", awsSvc.HandleConnectAWSAccount)
 		protected.DELETE("/aws-accounts/:id", awsSvc.HandleDeleteAWSAccount)
@@ -331,6 +386,20 @@ func main() {
 
 		// Deployment events (operational timeline)
 		proj.GET("/deployments/:deployId/events", eventSvc.HandleGetDeploymentEvents)
+
+		// Project-wide recent events (sidebar activity feed)
+		proj.GET("/events", eventSvc.HandleGetProjectEvents)
+
+		// Alerts
+		proj.GET("/alerts", alertEngine.HandleListAlerts)
+		proj.POST("/alerts/:alertId/snooze", alertEngine.HandleSnooze)
+		proj.POST("/alerts/:alertId/resolve", alertEngine.HandleResolve)
+
+		// Deploy cancellation
+		proj.POST("/deployments/:deployId/cancel", deploySvc.HandleCancelDeployment)
+
+		// Project settings
+		proj.PATCH("", deploySvc.HandleUpdateProject)
 
 		// Diagnosis
 		proj.GET("/deployments/:deployId/diagnose", diagnosisSvc.HandleDiagnose)
@@ -389,7 +458,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("Server running on port %s", port)
+		slog.Info(fmt.Sprintf("Server running on port %s", port))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
 		}

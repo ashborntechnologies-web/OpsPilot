@@ -6,17 +6,22 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"log"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/ashborntechnologies-web/OpsPilot/internal/awstags"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/cloudformation"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/codebuild"
 	cbtypes "github.com/aws/aws-sdk-go-v2/service/codebuild/types"
@@ -30,10 +35,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
-	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
-	"github.com/ashborntechnologies-web/OpsPilot/internal/awstags"
-	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -41,8 +42,8 @@ import (
 
 type Service struct {
 	db                *models.DB
-	platformAccountID string // AWS account ID of the entity running ConvDeploy
-	platformCallerARN string // full ARN of the entity running ConvDeploy (user or role)
+	platformAccountID string          // AWS account ID of the entity running ConvDeploy
+	platformCallerARN string          // full ARN of the entity running ConvDeploy (user or role)
 	events            *events.Service // optional; set via SetEvents for audit events
 	onEnvCreated      func(projectID, environmentID uuid.UUID)
 }
@@ -83,6 +84,7 @@ type ClientBundle struct {
 	ELB            *elasticloadbalancingv2.Client
 	CloudFormation *cloudformation.Client
 	CloudWatch     *cloudwatchlogs.Client
+	Metrics        *cloudwatch.Client
 	CodeBuild      *codebuild.Client
 	SSM            *ssm.Client
 	CostExplorer   *costexplorer.Client // always us-east-1 (global service)
@@ -181,6 +183,7 @@ func (s *Service) assumeRole(ctx context.Context, iamRoleARN, region, sessionSuf
 		ELB:            elasticloadbalancingv2.NewFromConfig(assumedCfg),
 		CloudFormation: cloudformation.NewFromConfig(assumedCfg),
 		CloudWatch:     cloudwatchlogs.NewFromConfig(assumedCfg),
+		Metrics:        cloudwatch.NewFromConfig(assumedCfg),
 		CodeBuild:      codebuild.NewFromConfig(assumedCfg),
 		SSM:            ssm.NewFromConfig(assumedCfg),
 		CostExplorer:   costexplorer.NewFromConfig(ceCfg),
@@ -246,7 +249,7 @@ func (s *Service) StartCodeBuildJob(
 	if err := s.putSecureParameter(ctx, clients, paramName, githubToken); err != nil {
 		// Legacy role without SSM permissions — fall back to inline token so deploys keep
 		// working. The operator should re-run the bootstrap stack to enable the secure path.
-		log.Printf("WARNING: SSM PutParameter failed (%v) — falling back to inline GitHub token for project %s. Re-run the bootstrap stack to enable the secure path.", err, projectID)
+		slog.Warn(fmt.Sprintf("WARNING: SSM PutParameter failed (%v) — falling back to inline GitHub token for project %s. Re-run the bootstrap stack to enable the secure path.", err, projectID))
 	} else {
 		secretStored = true
 		tokenEnv = cbtypes.EnvironmentVariable{
@@ -305,7 +308,7 @@ func (s *Service) DeleteSSMParameter(ctx context.Context, clients *ClientBundle,
 	}
 	_, err := clients.SSM.DeleteParameter(ctx, &ssm.DeleteParameterInput{Name: aws.String(name)})
 	if err != nil && !strings.Contains(err.Error(), "ParameterNotFound") {
-		log.Printf("WARNING: failed to delete SSM parameter %s: %v", name, err)
+		slog.Warn(fmt.Sprintf("WARNING: failed to delete SSM parameter %s: %v", name, err))
 	}
 }
 
@@ -418,7 +421,7 @@ func (s *Service) RegisterECSTaskDefinition(
 
 	tags := awstags.ToECS(awstags.BuildResourceTags(project.ID.String(), env.Name, s.platformAccountID))
 	input := &ecs.RegisterTaskDefinitionInput{
-		Tags: tags,
+		Tags:                    tags,
 		Family:                  aws.String(family),
 		NetworkMode:             ecstypes.NetworkModeAwsvpc,
 		RequiresCompatibilities: []ecstypes.Compatibility{ecstypes.CompatibilityFargate},
@@ -454,7 +457,6 @@ func (s *Service) RegisterECSTaskDefinition(
 
 	return aws.ToString(out.TaskDefinition.TaskDefinitionArn), nil
 }
-
 
 // ---- HTTP handlers ----
 
@@ -1781,7 +1783,7 @@ func (s *Service) CreateLogGroupIfNotExists(ctx context.Context, clients *Client
 	if err != nil {
 		// ResourceAlreadyExistsException is expected — ignore it.
 		if !strings.Contains(err.Error(), "ResourceAlreadyExistsException") {
-			log.Printf("[aws] failed to create log group %s: %v", logGroupName, err)
+			slog.Error(fmt.Sprintf("[aws] failed to create log group %s: %v", logGroupName, err))
 		}
 	}
 }
@@ -1951,9 +1953,9 @@ func (s *Service) UpdateServiceResources(ctx context.Context, clients *ClientBun
 	}
 
 	_, err = clients.ECS.UpdateService(ctx, &ecs.UpdateServiceInput{
-		Cluster:        aws.String(clusterName),
-		Service:        env.ECSServiceName,
-		TaskDefinition: reg.TaskDefinition.TaskDefinitionArn,
+		Cluster:            aws.String(clusterName),
+		Service:            env.ECSServiceName,
+		TaskDefinition:     reg.TaskDefinition.TaskDefinitionArn,
 		ForceNewDeployment: true,
 	})
 	return err
@@ -2041,16 +2043,16 @@ func (s *Service) CreatePreviewService(
 
 	previewTags := awstags.BuildResourceTags(project.ID.String(), previewEnv.Name, s.platformAccountID)
 	tg, err := clients.ELB.CreateTargetGroup(ctx, &elasticloadbalancingv2.CreateTargetGroupInput{
-		Tags:                      awstags.ToELB(previewTags),
-		Name:                      aws.String(tgName),
-		Protocol:                  elbtypes.ProtocolEnumHttp,
-		Port:                      aws.Int32(port),
-		VpcId:                     aws.String(vpcID),
-		TargetType:                elbtypes.TargetTypeEnumIp,
-		HealthCheckPath:           aws.String("/"),
+		Tags:                       awstags.ToELB(previewTags),
+		Name:                       aws.String(tgName),
+		Protocol:                   elbtypes.ProtocolEnumHttp,
+		Port:                       aws.Int32(port),
+		VpcId:                      aws.String(vpcID),
+		TargetType:                 elbtypes.TargetTypeEnumIp,
+		HealthCheckPath:            aws.String("/"),
 		HealthCheckIntervalSeconds: aws.Int32(30),
-		HealthyThresholdCount:     aws.Int32(2),
-		UnhealthyThresholdCount:   aws.Int32(3),
+		HealthyThresholdCount:      aws.Int32(2),
+		UnhealthyThresholdCount:    aws.Int32(3),
 	})
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create target group: %w", err)
@@ -2138,7 +2140,7 @@ func (s *Service) CreatePreviewService(
 	}
 
 	_, err = clients.ECS.CreateService(ctx, &ecs.CreateServiceInput{
-		Tags: awstags.ToECS(previewTags),
+		Tags:           awstags.ToECS(previewTags),
 		Cluster:        aws.String(*ps.ECSClusterName),
 		ServiceName:    aws.String(serviceName),
 		TaskDefinition: reg.TaskDefinition.TaskDefinitionArn,

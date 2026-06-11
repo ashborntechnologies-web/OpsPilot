@@ -24,9 +24,12 @@ import {
   diagnoseDeployment, checkHealth, scaleService,
   listWebhooks, createWebhook, updateWebhook, deleteWebhook,
   terminalWsURL, getProjectCosts, enablePreviews, disablePreviews,
-  getHealthScore,
+  getHealthScore, listAlerts, snoozeAlert, resolveAlert, cancelDeployment,
+  updateProject, getMe, updateNotificationPrefs, deleteProject,
 } from "@/lib/api";
-import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar, Webhook, CostSummary } from "@/types/api";
+import { StatusSidebar } from "@/components/project/status-sidebar";
+import { AlertsPanel } from "@/components/project/alerts-panel";
+import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar, Webhook, CostSummary, Alert, RiskScore, UserMe } from "@/types/api";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
@@ -133,6 +136,26 @@ export default function ProjectPage() {
   const [provisionLog, setProvisionLog] = useState<string[]>([]);
   // live deploy progress messages received via WebSocket (cleared when a deploy finishes)
   const [deployLog, setDeployLog] = useState<string[]>([]);
+  // raw CodeBuild output streamed during builds
+  const [buildLogs, setBuildLogs] = useState<string[]>([]);
+  const [showBuildOutput, setShowBuildOutput] = useState(false);
+  // open alerts (SWR-backed + live WS updates)
+  const [alerts, setAlerts] = useState<Alert[]>([]);
+  // banner shown on small screens when an alert fires while the panel is hidden
+  const [alertBanner, setAlertBanner] = useState<Alert | null>(null);
+  // latest pre-deploy risk score (from the deploy_risk WS message)
+  const [currentRiskScore, setCurrentRiskScore] = useState<RiskScore | null>(null);
+  // mobile/tablet status drawer
+  const [statusDrawerOpen, setStatusDrawerOpen] = useState(false);
+  // settings tab state
+  const [settingsName, setSettingsName] = useState("");
+  const [settingsBranch, setSettingsBranch] = useState("");
+  const [settingsStartCmd, setSettingsStartCmd] = useState("");
+  const [settingsFramework, setSettingsFramework] = useState("");
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [me, setMe] = useState<UserMe | null>(null);
+  const [savingPrefs, setSavingPrefs] = useState(false);
+  const [deletingProject, setDeletingProject] = useState(false);
 
   // deployment event timeline
   const [expandedDepId, setExpandedDepId] = useState<string | null>(null);
@@ -227,6 +250,36 @@ export default function ProjectPage() {
   // event-driven re-fetches (WS messages, after mutations, provisioning poll).
   const { isLoading: loading } = useSWR(["project-page", id], refresh);
 
+  // Open alerts — refreshed every 30s; WS messages update the list live between polls.
+  useSWR(
+    ["alerts", id],
+    async () => {
+      const token = await getToken();
+      if (!token) return [];
+      return listAlerts(token, id, "open");
+    },
+    { refreshInterval: 30_000, onSuccess: (data) => setAlerts(data ?? []) }
+  );
+
+  // Settings form mirrors the project record; /users/me feeds notification toggles.
+  const settingsSeeded = useRef(false);
+  useEffect(() => {
+    if (!project || settingsSeeded.current) return;
+    settingsSeeded.current = true;
+    setSettingsName(project.name);
+    setSettingsBranch(project.branch ?? "");
+    setSettingsStartCmd(project.start_command ?? "");
+    setSettingsFramework(project.framework);
+    void (async () => {
+      const token = await getToken();
+      if (!token) return;
+      try {
+        setMe(await getMe(token));
+      } catch {}
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project]);
+
   // Deployment health score — refreshed every minute while the page is open.
   const { data: healthScore } = useSWR(
     ["health-score", id],
@@ -260,9 +313,31 @@ export default function ProjectPage() {
             setDeployLog((prev) => [...prev.slice(-49), msg.payload]);
           } else if (msg.type === "deploy_done" || msg.type === "deploy_failed") {
             setDeployLog([]);
+            setBuildLogs([]);
+            setCurrentRiskScore(null);
             if (msg.type === "deploy_done") toast.success(msg.payload);
             else toast.error(msg.payload);
             refresh().catch(() => {});
+          } else if (msg.type === "build_log") {
+            setBuildLogs((prev) => [...prev.slice(-299), msg.payload]);
+          } else if (msg.type === "alert") {
+            try {
+              const alert = JSON.parse(msg.payload) as Alert;
+              setAlerts((prev) => [alert, ...prev.filter((a) => a.id !== alert.id)]);
+              setAlertBanner(alert);
+              toast.error(`${alert.title}${alert.summary ? " — " + alert.summary : ""}`);
+            } catch {}
+          } else if (msg.type === "alert_resolved") {
+            try {
+              const resolved = JSON.parse(msg.payload) as { id: string; alert_type: string };
+              setAlerts((prev) => prev.filter((a) => a.id !== resolved.id));
+              setAlertBanner((prev) => (prev?.id === resolved.id ? null : prev));
+              toast.success(`${resolved.alert_type.replace(/_/g, " ")} resolved`);
+            } catch {}
+          } else if (msg.type === "deploy_risk") {
+            try {
+              setCurrentRiskScore(JSON.parse(msg.payload) as RiskScore);
+            } catch {}
           }
         } catch {}
       };
@@ -355,6 +430,101 @@ export default function ProjectPage() {
   const activeDeployment = deployments.find((d) =>
     ["pending", "building", "deploying"].includes(d.status)
   );
+
+  async function handleSnoozeAlert(alertId: string) {
+    const token = await getToken();
+    if (!token) return;
+    try {
+      await snoozeAlert(token, id, alertId, 60);
+      setAlerts((prev) => prev.filter((a) => a.id !== alertId));
+      setAlertBanner((prev) => (prev?.id === alertId ? null : prev));
+      toast.success("Alert snoozed for 1 hour");
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+    }
+  }
+
+  async function handleResolveAlert(alertId: string) {
+    const token = await getToken();
+    if (!token) return;
+    try {
+      await resolveAlert(token, id, alertId);
+      setAlerts((prev) => prev.filter((a) => a.id !== alertId));
+      setAlertBanner((prev) => (prev?.id === alertId ? null : prev));
+      toast.success("Alert resolved");
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+    }
+  }
+
+  async function handleCancelDeployment(dep: Deployment) {
+    if (!window.confirm(`Cancel the in-progress deployment of ${dep.commit_sha.slice(0, 8)}?`)) return;
+    const token = await getToken();
+    if (!token) return;
+    try {
+      await cancelDeployment(token, id, dep.id);
+      toast.success("Deployment cancelled");
+      await refresh();
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+    }
+  }
+
+  async function handleSaveSettings() {
+    const token = await getToken();
+    if (!token) return;
+    setSavingSettings(true);
+    try {
+      const updated = await updateProject(token, id, {
+        name: settingsName || undefined,
+        branch: settingsBranch,
+        start_command: settingsStartCmd,
+        framework: settingsFramework || undefined,
+      });
+      setProject(updated);
+      toast.success("Project settings saved");
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
+  async function handleSavePrefs(patch: { deploy_failed?: boolean; deploy_succeeded?: boolean; alert_fired?: boolean }) {
+    const token = await getToken();
+    if (!token || !me) return;
+    setSavingPrefs(true);
+    const next = { ...me, notifications: { ...me.notifications, ...patch } };
+    setMe(next);
+    try {
+      await updateNotificationPrefs(token, patch);
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+      setMe(me); // revert optimistic update
+    } finally {
+      setSavingPrefs(false);
+    }
+  }
+
+  async function handleDeleteProject() {
+    if (!project) return;
+    const typed = window.prompt(`Type the project name (${project.name}) to confirm deletion:`);
+    if (typed !== project.name) {
+      if (typed !== null) toast.error("Name did not match — deletion cancelled");
+      return;
+    }
+    const token = await getToken();
+    if (!token) return;
+    setDeletingProject(true);
+    try {
+      await deleteProject(token, id);
+      toast.success("Project deleted");
+      window.location.href = "/projects";
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+      setDeletingProject(false);
+    }
+  }
 
   async function handleCreateEnv() {
     if (!envDialog) return;
@@ -892,9 +1062,47 @@ export default function ProjectPage() {
         </DialogContent>
       </Dialog>
 
-      <main className="max-w-6xl mx-auto px-4 py-10">
+      {/* Mobile alert banner — shown when an alert fires and the side panel is hidden */}
+      {alertBanner && (
+        <div className="lg:hidden sticky top-0 z-40 bg-red-600 text-white px-4 py-2.5 flex items-center justify-between gap-2 text-sm">
+          <span className="truncate">⚠️ {alertBanner.title}{alertBanner.summary ? ` — ${alertBanner.summary}` : ""}</span>
+          <span className="flex gap-2 shrink-0">
+            <button className="underline" onClick={() => setStatusDrawerOpen(true)}>View</button>
+            <button className="opacity-80" onClick={() => setAlertBanner(null)}>Dismiss</button>
+          </span>
+        </div>
+      )}
+
+      {/* Tablet/mobile status drawer */}
+      {statusDrawerOpen && (
+        <div className="xl:hidden fixed inset-0 z-50 flex">
+          <div className="absolute inset-0 bg-black/40" onClick={() => setStatusDrawerOpen(false)} />
+          <div className="relative z-10 h-full overflow-y-auto bg-white shadow-xl">
+            <StatusSidebar
+              projectId={id}
+              environments={environments}
+              deployments={deployments}
+              alerts={alerts}
+              onSelectEnvironment={() => setStatusDrawerOpen(false)}
+            />
+          </div>
+        </div>
+      )}
+
+      <div className="flex items-stretch">
+        {/* LEFT — live status (desktop only) */}
+        <div className="hidden xl:block sticky top-0 self-start h-screen">
+          <StatusSidebar
+            projectId={id}
+            environments={environments}
+            deployments={deployments}
+            alerts={alerts}
+          />
+        </div>
+
+      <main className="flex-1 min-w-0 max-w-5xl mx-auto px-4 py-10">
         {/* Header */}
-        <div className="flex items-start justify-between mb-6">
+        <div className="flex items-start justify-between mb-6 gap-3 flex-wrap">
           <div>
             <h1 className="text-2xl font-bold tracking-tight">{project.name}</h1>
             <p className="text-muted-foreground text-sm mt-1">
@@ -902,10 +1110,21 @@ export default function ProjectPage() {
               {project.branch && <span className="ml-2 font-mono text-xs bg-zinc-100 px-1.5 py-0.5 rounded">{project.branch}</span>}
             </p>
           </div>
-          <Button variant="outline" nativeButton={false} render={<Link href={`/projects/${id}/chat`} />}>
-            <MessageSquare className="h-4 w-4 mr-2" />
-            Open Chat
-          </Button>
+          <div className="flex gap-2">
+            <Button variant="outline" className="xl:hidden" onClick={() => setStatusDrawerOpen(true)}>
+              <Activity className="h-4 w-4 mr-2" />
+              Status
+              {alerts.length > 0 && (
+                <span className="ml-1.5 inline-flex items-center justify-center h-4 min-w-4 px-1 rounded-full bg-red-500 text-white text-[10px] font-semibold">
+                  {alerts.length}
+                </span>
+              )}
+            </Button>
+            <Button variant="outline" nativeButton={false} render={<Link href={`/projects/${id}/chat`} />}>
+              <MessageSquare className="h-4 w-4 mr-2" />
+              Open Chat
+            </Button>
+          </div>
         </div>
 
         {/* No AWS account banner */}
@@ -921,6 +1140,21 @@ export default function ProjectPage() {
           </div>
         )}
 
+        {/* High-risk deploy banner (advisory, from the deploy_risk WS message) */}
+        {currentRiskScore && (currentRiskScore.level === "high" || currentRiskScore.level === "critical") && (
+          <div className="mb-6 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            <p className="font-medium">
+              ⚠️ {currentRiskScore.level === "critical" ? "Critical" : "High"} risk deploy (score {currentRiskScore.score}/100)
+            </p>
+            {currentRiskScore.explanation && <p className="mt-0.5">{currentRiskScore.explanation}</p>}
+            <ul className="mt-1.5 text-xs space-y-0.5 text-amber-800">
+              {currentRiskScore.factors.filter((f) => f.points > 0).map((f) => (
+                <li key={f.name}>• {f.reason}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         <Tabs defaultValue="overview">
           <TabsList className="mb-6">
             <TabsTrigger value="overview">Overview</TabsTrigger>
@@ -930,6 +1164,7 @@ export default function ProjectPage() {
             <TabsTrigger value="terminal">Terminal</TabsTrigger>
             <TabsTrigger value="webhooks" onClick={() => loadHooks()}>Webhooks</TabsTrigger>
             <TabsTrigger value="costs" onClick={() => loadCosts()}>Costs</TabsTrigger>
+            <TabsTrigger value="settings">Settings</TabsTrigger>
           </TabsList>
 
           {/* ── Overview (environments) ── */}
@@ -1002,6 +1237,38 @@ export default function ProjectPage() {
                           />
                         </div>
                         <p className="text-xs text-muted-foreground">{latestMsg}</p>
+                      </div>
+
+                      {/* Live build output (CodeBuild logs streamed over WS) */}
+                      {buildLogs.length > 0 && (
+                        <div>
+                          <button
+                            onClick={() => setShowBuildOutput((v) => !v)}
+                            className="text-xs text-indigo-700 hover:underline"
+                          >
+                            {showBuildOutput ? "Hide build output" : `Show build output (${buildLogs.length} lines)`}
+                          </button>
+                          {showBuildOutput && (
+                            <pre
+                              className="mt-2 rounded-md bg-zinc-950 text-zinc-200 text-[11px] font-mono p-3 overflow-y-auto whitespace-pre-wrap"
+                              style={{ maxHeight: 300 }}
+                              ref={(el) => { if (el) el.scrollTop = el.scrollHeight; }}
+                            >
+                              {buildLogs.slice(-50).join("\n")}
+                            </pre>
+                          )}
+                        </div>
+                      )}
+
+                      <div className="flex justify-end">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 text-xs text-red-600 hover:text-red-700"
+                          onClick={() => handleCancelDeployment(activeDeployment)}
+                        >
+                          Cancel deployment
+                        </Button>
                       </div>
                     </CardContent>
                   </Card>
@@ -1461,6 +1728,17 @@ export default function ProjectPage() {
                               Redeploy
                             </Button>
                           )}
+                          {(dep.status === "building" || dep.status === "deploying" || dep.status === "pending") && (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="text-red-600 hover:text-red-700"
+                              onClick={() => handleCancelDeployment(dep)}
+                            >
+                              <XCircle className="h-3 w-3 mr-1" />
+                              Cancel
+                            </Button>
+                          )}
                           {dep.status !== "building" && dep.status !== "deploying" && (
                             <Button
                               size="sm"
@@ -1861,8 +2139,121 @@ export default function ProjectPage() {
               )}
             </div>
           </TabsContent>
+
+          {/* ── Settings ── */}
+          <TabsContent value="settings">
+            <div className="max-w-2xl space-y-6">
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">Project</CardTitle>
+                  <CardDescription className="text-xs">
+                    Changes apply to the next deployment.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="space-y-1.5">
+                    <Label className="text-xs">Name</Label>
+                    <Input value={settingsName} onChange={(e) => setSettingsName(e.target.value)} />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs">Repository branch</Label>
+                    <Input
+                      value={settingsBranch}
+                      onChange={(e) => setSettingsBranch(e.target.value)}
+                      placeholder="default branch"
+                      className="font-mono text-sm"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs">Start command</Label>
+                    <Input
+                      value={settingsStartCmd}
+                      onChange={(e) => setSettingsStartCmd(e.target.value)}
+                      placeholder="e.g. node server.js"
+                      className="font-mono text-sm"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs">Framework</Label>
+                    <select
+                      value={settingsFramework}
+                      onChange={(e) => setSettingsFramework(e.target.value)}
+                      className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+                    >
+                      {["fastapi","flask","django","python","nodejs","express","nextjs","nestjs","remix","nuxtjs","svelte","astro","react-spa","vite","go","rails","spring","static"].map((f) => (
+                        <option key={f} value={f}>{f}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <Button onClick={handleSaveSettings} disabled={savingSettings}>
+                    {savingSettings ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
+                    Save changes
+                  </Button>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">Notifications</CardTitle>
+                  <CardDescription className="text-xs">
+                    Email notifications for this account ({me?.email ?? "..."}).
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {me ? (
+                    <>
+                      {([
+                        ["Email me when a deploy fails", "deploy_failed", me.notifications.deploy_failed],
+                        ["Email me when an alert fires", "alert_fired", me.notifications.alert_fired],
+                        ["Email me when a deploy succeeds", "deploy_succeeded", me.notifications.deploy_succeeded],
+                      ] as [string, "deploy_failed" | "alert_fired" | "deploy_succeeded", boolean][]).map(([label, key, value]) => (
+                        <label key={key} className="flex items-center justify-between gap-3 text-sm cursor-pointer">
+                          <span>{label}</span>
+                          <input
+                            type="checkbox"
+                            checked={value}
+                            disabled={savingPrefs}
+                            onChange={(e) => handleSavePrefs({ [key]: e.target.checked })}
+                            className="h-4 w-4 accent-indigo-600"
+                          />
+                        </label>
+                      ))}
+                    </>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">Loading preferences…</p>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card className="border-red-200">
+                <CardHeader>
+                  <CardTitle className="text-base text-red-700">Danger Zone</CardTitle>
+                  <CardDescription className="text-xs">
+                    Deletes the project, its deployments, and conversation history. AWS resources are torn down in the background.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <Button variant="outline" className="text-red-600 hover:text-red-700 border-red-300" disabled={deletingProject} onClick={handleDeleteProject}>
+                    {deletingProject ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
+                    Delete project
+                  </Button>
+                </CardContent>
+              </Card>
+            </div>
+          </TabsContent>
         </Tabs>
       </main>
+
+        {/* RIGHT — alerts + AI insights (desktop/tablet) */}
+        <div className="hidden lg:block sticky top-0 self-start h-screen">
+          <AlertsPanel
+            alerts={alerts}
+            latestInsight={diagnosisResult}
+            onSnooze={handleSnoozeAlert}
+            onResolve={handleResolveAlert}
+          />
+        </div>
+      </div>
     </div>
   );
 }

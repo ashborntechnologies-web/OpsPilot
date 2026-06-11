@@ -8,7 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -301,7 +301,7 @@ func (s *Service) FireEvent(projectID uuid.UUID, eventType string, payload map[s
 func (s *Service) deliver(url, secret string, body []byte) {
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		log.Printf("[webhook] invalid URL %s: %v", url, err)
+		slog.Info(fmt.Sprintf("[webhook] invalid URL %s: %v", url, err))
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -315,12 +315,12 @@ func (s *Service) deliver(url, secret string, body []byte) {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		log.Printf("[webhook] delivery failed to %s: %v", url, err)
+		slog.Error(fmt.Sprintf("[webhook] delivery failed to %s: %v", url, err))
 		return
 	}
 	resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		log.Printf("[webhook] delivery to %s returned %d", url, resp.StatusCode)
+		slog.Info(fmt.Sprintf("[webhook] delivery to %s returned %d", url, resp.StatusCode))
 	}
 }
 

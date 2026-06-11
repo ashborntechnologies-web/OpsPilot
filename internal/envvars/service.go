@@ -5,9 +5,9 @@ import (
 	"net/http"
 	"regexp"
 
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
-	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )

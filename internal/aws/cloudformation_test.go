@@ -4,9 +4,9 @@ import (
 	"context"
 	"testing"
 
-	cftypes "github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	cftypes "github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

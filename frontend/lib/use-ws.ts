@@ -17,6 +17,8 @@ export function useProjectWS(projectId: string, token: string | null) {
   const [entries, setEntries] = useState<ChatEntry[]>([]);
   const [connected, setConnected] = useState(false);
   const [thinking, setThinking] = useState(false);
+  // Raw CodeBuild output lines streamed during a build (capped at 200).
+  const [buildLogs, setBuildLogs] = useState<string[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttempt = useRef(0);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -106,6 +108,43 @@ export function useProjectWS(projectId: string, token: string | null) {
             upsertAssistant(msg.payload, msg.type);
             break;
 
+          case "alert": {
+            // Payload is the alert JSON — show title + summary as a system message.
+            let text = msg.payload;
+            try {
+              const a = JSON.parse(msg.payload) as { title?: string; summary?: string };
+              if (a.title) text = `${a.title}${a.summary ? " — " + a.summary : ""}`;
+            } catch {}
+            push({ role: "system", content: text, type: "alert" });
+            break;
+          }
+
+          case "alert_resolved": {
+            let text = "Alert resolved";
+            try {
+              const a = JSON.parse(msg.payload) as { alert_type?: string };
+              if (a.alert_type) text = `${a.alert_type.replace(/_/g, " ")} resolved`;
+            } catch {}
+            push({ role: "system", content: text, type: "alert_resolved" });
+            break;
+          }
+
+          case "deploy_risk": {
+            let text = msg.payload;
+            try {
+              const r = JSON.parse(msg.payload) as { level?: string; score?: number; explanation?: string };
+              if (r.level === "high" || r.level === "critical") {
+                text = `⚠️ ${r.level} risk deploy (score ${r.score})${r.explanation ? " — " + r.explanation : ""}`;
+                push({ role: "system", content: text, type: "deploy_risk" });
+              }
+            } catch {}
+            break;
+          }
+
+          case "build_log":
+            setBuildLogs((prev) => [...prev.slice(-199), msg.payload]);
+            break;
+
           case "error":
             setThinking(false);
             push({ role: "system", content: msg.payload, type: "error" });
@@ -149,5 +188,5 @@ export function useProjectWS(projectId: string, token: string | null) {
     );
   }, []);
 
-  return { entries, connected, thinking, send, loadHistory };
+  return { entries, connected, thinking, send, loadHistory, buildLogs };
 }

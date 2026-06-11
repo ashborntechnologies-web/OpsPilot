@@ -2,9 +2,10 @@ package aws
 
 import (
 	"context"
+	"time"
 
-	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/google/uuid"
 )
 
@@ -18,6 +19,8 @@ type AWSProvider interface {
 	StartCodeBuildJob(ctx context.Context, clients *ClientBundle, projectID, codeBuildProject, githubToken, owner, repo, commitSHA, imageURI, ecrRegistry, framework, startCommand string) (*StartCodeBuildResult, error)
 	WaitForCodeBuild(ctx context.Context, clients *ClientBundle, buildID string, onProgress func(string)) error
 	DeleteSSMParameter(ctx context.Context, clients *ClientBundle, name string)
+	StreamCodeBuildLogs(ctx context.Context, clients *ClientBundle, buildID string, since time.Time, callback func(line string)) (time.Time, error)
+	StopCodeBuildJob(ctx context.Context, clients *ClientBundle, buildID string) error
 
 	// ECS task definition + service lifecycle
 	RegisterECSTaskDefinition(ctx context.Context, clients *ClientBundle, env *models.Environment, project *models.Project, imageURI string, envVars []ecstypes.KeyValuePair) (string, error)

@@ -2,11 +2,13 @@ package deploy_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/envvars"
@@ -24,10 +26,17 @@ import (
 // mockEnqueuer is a no-op Enqueuer for handler tests.
 type mockEnqueuer struct{}
 
-func (m *mockEnqueuer) EnqueueDeploy(_, _, _, _ string) error           { return nil }
-func (m *mockEnqueuer) EnqueueProvision(_, _ string) error              { return nil }
-func (m *mockEnqueuer) EnqueueRollback(_, _, _, _ string) error         { return nil }
+func (m *mockEnqueuer) EnqueueDeploy(_, _, _, _ string) error                    { return nil }
+func (m *mockEnqueuer) EnqueueProvision(_, _ string) error                       { return nil }
+func (m *mockEnqueuer) EnqueueRollback(_, _, _, _ string) error                  { return nil }
 func (m *mockEnqueuer) EnqueueDeleteProject(p deploy.DeleteProjectPayload) error { return nil }
+func (m *mockEnqueuer) SetPendingMutation(_ context.Context, _ string, _ models.MutationProposal, _ time.Duration) error {
+	return nil
+}
+func (m *mockEnqueuer) GetPendingMutation(_ context.Context, _ string) (*models.MutationProposal, error) {
+	return nil, nil
+}
+func (m *mockEnqueuer) DeletePendingMutation(_ context.Context, _ string) error { return nil }
 
 // newTestRouter builds a minimal gin router for a specific handler, injecting a real
 // user ID into the context to simulate an authenticated request.

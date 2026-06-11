@@ -366,3 +366,81 @@ export function terminalWsURL(projectId: string, envId: string) {
   const base = apiUrl.replace(/^http/, "ws");
   return `${base}/api/v1/ws/${projectId}/terminal/${envId}`;
 }
+
+// ---- Alerts --------------------------------------------------------------------
+
+export function listAlerts(token: string, projectId: string, status: string = "open") {
+  return request<import("@/types/api").Alert[]>(
+    `/projects/${projectId}/alerts?status=${status}`, token
+  );
+}
+
+export function snoozeAlert(token: string, projectId: string, alertId: string, durationMinutes = 60) {
+  return request<{ message: string; snoozed_until: string }>(
+    `/projects/${projectId}/alerts/${alertId}/snooze`, token,
+    { method: "POST", body: JSON.stringify({ duration_minutes: durationMinutes }) }
+  );
+}
+
+export function resolveAlert(token: string, projectId: string, alertId: string) {
+  return request<{ message: string }>(
+    `/projects/${projectId}/alerts/${alertId}/resolve`, token,
+    { method: "POST" }
+  );
+}
+
+// ---- Deploy cancellation --------------------------------------------------------
+
+export function cancelDeployment(token: string, projectId: string, deploymentId: string) {
+  return request<{ message: string }>(
+    `/projects/${projectId}/deployments/${deploymentId}/cancel`, token,
+    { method: "POST" }
+  );
+}
+
+// ---- Project settings -----------------------------------------------------------
+
+export function updateProject(
+  token: string,
+  projectId: string,
+  body: { name?: string; branch?: string; start_command?: string; framework?: string }
+) {
+  return request<Project>(`/projects/${projectId}`, token, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+// ---- Account / usage ------------------------------------------------------------
+
+export function getMe(token: string) {
+  return request<import("@/types/api").UserMe>("/users/me", token);
+}
+
+export function updateNotificationPrefs(
+  token: string,
+  body: { enabled?: boolean; deploy_failed?: boolean; deploy_succeeded?: boolean; alert_fired?: boolean }
+) {
+  return request<{ message: string }>("/users/me/notifications", token, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+// ---- Diagnosis feedback ----------------------------------------------------------
+
+export function submitDiagnosisFeedback(
+  token: string,
+  projectId: string,
+  deploymentId: string,
+  body: { incident_id?: string; rating: "helpful" | "not_helpful" | "partially_helpful"; fixed_issue: boolean; notes?: string }
+) {
+  return request<{ feedback: unknown; score: number }>(
+    `/projects/${projectId}/deployments/${deploymentId}/diagnose/feedback`, token,
+    { method: "POST", body: JSON.stringify(body) }
+  );
+}
+
+export function getProjectEvents(token: string, projectId: string, limit = 5) {
+  return request<OperationalEvent[]>(`/projects/${projectId}/events?limit=${limit}`, token);
+}

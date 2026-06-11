@@ -4,21 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
+	"time"
 
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
-	TaskDeploy         = "deploy:run"
-	TaskDiagnose       = "diagnosis:run"
-	TaskProvision      = "provision:run"
-	TaskRollback       = "rollback:run"
-	TaskWatchdog       = "watchdog:run"
-	TaskDeleteProject  = "project:delete"
+	TaskDeploy        = "deploy:run"
+	TaskDiagnose      = "diagnosis:run"
+	TaskProvision     = "provision:run"
+	TaskRollback      = "rollback:run"
+	TaskWatchdog      = "watchdog:run"
+	TaskDeleteProject = "project:delete"
 )
 
 type DeployPayload struct {
@@ -94,7 +97,7 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 // the HTTP API running in the same process.
 func (s *Server) Start() {
 	if err := s.server.Run(s.mux); err != nil {
-		log.Printf("Asynq server stopped with error: %v", err)
+		slog.Error(fmt.Sprintf("Asynq server stopped with error: %v", err))
 	}
 }
 
@@ -125,8 +128,8 @@ func (s *Server) handleDeploy(ctx context.Context, t *asynq.Task) error {
 		return fmt.Errorf("invalid deployment ID: %w", err)
 	}
 
-	log.Printf("[deploy] starting job project=%s env=%s deploy=%s commit=%s",
-		p.ProjectID[:8], p.EnvironmentID[:8], p.DeploymentID[:8], p.CommitSHA[:8])
+	slog.Info(fmt.Sprintf("[deploy] starting job project=%s env=%s deploy=%s commit=%s",
+		p.ProjectID[:8], p.EnvironmentID[:8], p.DeploymentID[:8], p.CommitSHA[:8]))
 
 	if err := s.deploySvc.RunDeployWorkflow(ctx, projectID, environmentID, deploymentID); err != nil {
 		// Never auto-retry deploys — the workflow already marked the deployment
@@ -153,16 +156,16 @@ func (s *Server) handleProvision(ctx context.Context, t *asynq.Task) error {
 		return fmt.Errorf("%w: invalid environment ID: %w", asynq.SkipRetry, err)
 	}
 
-	log.Printf("[provision] starting job project=%s env=%s", p.ProjectID[:8], p.EnvironmentID[:8])
+	slog.Info(fmt.Sprintf("[provision] starting job project=%s env=%s", p.ProjectID[:8], p.EnvironmentID[:8]))
 
 	if err := s.deploySvc.RunProvisionWorkflow(ctx, projectID, environmentID); err != nil {
-		log.Printf("[provision] FAILED project=%s env=%s error=%v", p.ProjectID[:8], p.EnvironmentID[:8], err)
+		slog.Error(fmt.Sprintf("[provision] FAILED project=%s env=%s error=%v", p.ProjectID[:8], p.EnvironmentID[:8], err))
 		// Never auto-retry provision jobs — the env is marked failed in the DB.
 		// The user retries manually via the UI "Retry" button.
 		return fmt.Errorf("%w: %w", asynq.SkipRetry, err)
 	}
 
-	log.Printf("[provision] completed project=%s env=%s", p.ProjectID[:8], p.EnvironmentID[:8])
+	slog.Info(fmt.Sprintf("[provision] completed project=%s env=%s", p.ProjectID[:8], p.EnvironmentID[:8]))
 	return nil
 }
 
@@ -193,7 +196,7 @@ func (s *Server) handleRollback(ctx context.Context, t *asynq.Task) error {
 		}
 	}
 
-	log.Printf("[rollback] starting job project=%s env=%s deploy=%s", p.ProjectID[:8], p.EnvironmentID[:8], p.DeploymentID[:8])
+	slog.Info(fmt.Sprintf("[rollback] starting job project=%s env=%s deploy=%s", p.ProjectID[:8], p.EnvironmentID[:8], p.DeploymentID[:8]))
 
 	if err := s.deploySvc.RunRollbackWorkflow(ctx, projectID, environmentID, deploymentID, previousID); err != nil {
 		return fmt.Errorf("%w: %w", asynq.SkipRetry, err)
@@ -209,7 +212,7 @@ func (s *Server) handleDeleteProject(ctx context.Context, t *asynq.Task) error {
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		return fmt.Errorf("%w: unmarshal delete-project payload: %w", asynq.SkipRetry, err)
 	}
-	log.Printf("[delete-project] starting cleanup for %q (%d environment(s))", p.ProjectName, len(p.Environments))
+	slog.Info(fmt.Sprintf("[delete-project] starting cleanup for %q (%d environment(s))", p.ProjectName, len(p.Environments)))
 	return s.deploySvc.RunDeleteProjectCleanup(ctx, p)
 }
 
@@ -229,7 +232,12 @@ func (s *Server) handleDiagnose(ctx context.Context, t *asynq.Task) error {
 		return fmt.Errorf("invalid project ID: %w", err)
 	}
 
-	_, err = s.diagnosisSvc.DiagnoseProject(ctx, projectID)
+	if p.DeploymentID == "" {
+		// Autonomous runtime diagnosis — no specific deployment failed.
+		_, err = s.diagnosisSvc.DiagnoseRuntime(ctx, projectID)
+	} else {
+		_, err = s.diagnosisSvc.DiagnoseProject(ctx, projectID)
+	}
 	return err
 }
 
@@ -335,14 +343,55 @@ func (sc *Scheduler) Stop() {
 // It is intentionally separate from Server to avoid the deploy ↔ queue circular import.
 type Client struct {
 	c *asynq.Client
+	// rdb is a direct Redis connection used for the pending-mutation store
+	// (chat-proposed infra changes awaiting confirmation) so proposals survive
+	// process restarts and work across replicas.
+	rdb *redis.Client
 }
 
 func NewClient(redisURL string) *Client {
-	return &Client{c: asynq.NewClient(asynq.RedisClientOpt{Addr: redisURL})}
+	return &Client{
+		c:   asynq.NewClient(asynq.RedisClientOpt{Addr: redisURL}),
+		rdb: redis.NewClient(&redis.Options{Addr: redisURL}),
+	}
+}
+
+// pendingMutationKey is the Redis key for a project's proposed infra change.
+func pendingMutationKey(projectID string) string { return "mutation:" + projectID }
+
+// SetPendingMutation stores a chat-proposed infra change with a TTL.
+func (c *Client) SetPendingMutation(ctx context.Context, projectID string, proposal models.MutationProposal, ttl time.Duration) error {
+	b, err := json.Marshal(proposal)
+	if err != nil {
+		return err
+	}
+	return c.rdb.Set(ctx, pendingMutationKey(projectID), b, ttl).Err()
+}
+
+// GetPendingMutation returns the stored proposal, or nil when none exists.
+func (c *Client) GetPendingMutation(ctx context.Context, projectID string) (*models.MutationProposal, error) {
+	b, err := c.rdb.Get(ctx, pendingMutationKey(projectID)).Bytes()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var p models.MutationProposal
+	if err := json.Unmarshal(b, &p); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// DeletePendingMutation removes the stored proposal.
+func (c *Client) DeletePendingMutation(ctx context.Context, projectID string) error {
+	return c.rdb.Del(ctx, pendingMutationKey(projectID)).Err()
 }
 
 func (c *Client) Close() {
 	c.c.Close()
+	c.rdb.Close()
 }
 
 // EnqueueDeploy implements deploy.Enqueuer.
@@ -378,6 +427,17 @@ func (c *Client) EnqueueDeleteProject(p deploy.DeleteProjectPayload) error {
 // EnqueueRollback implements deploy.Enqueuer.
 func (c *Client) EnqueueRollback(projectID, environmentID, deploymentID, previousDeploymentID string) error {
 	task, err := NewRollbackTask(projectID, environmentID, deploymentID, previousDeploymentID)
+	if err != nil {
+		return err
+	}
+	_, err = c.c.Enqueue(task)
+	return err
+}
+
+// EnqueueDiagnose implements events.DiagnosisEnqueuer. Empty deploymentID means
+// "diagnose the current runtime state".
+func (c *Client) EnqueueDiagnose(projectID, deploymentID string) error {
+	task, err := NewDiagnoseTask(projectID, deploymentID)
 	if err != nil {
 		return err
 	}

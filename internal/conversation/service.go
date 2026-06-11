@@ -3,12 +3,14 @@ package conversation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"github.com/ashborntechnologies-web/OpsPilot/internal/billing"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
@@ -26,7 +28,11 @@ type Service struct {
 	diagnosisSvc *diagnosis.Service
 	llm          *llm.Client
 	hub          *ws.Hub
+	billing      *billing.Service
 }
+
+// SetBillingService enables AI-action metering (set once at startup).
+func (s *Service) SetBillingService(b *billing.Service) { s.billing = b }
 
 type IntentResult struct {
 	Intent     string                 `json:"intent"`
@@ -136,14 +142,36 @@ func (s *Service) ProcessMessage(ctx context.Context, projectID uuid.UUID, userI
 		return "That message is too long for me to process — please keep it under 4000 characters.", nil
 	}
 
+	// AI-action metering — classification calls Claude, so it counts against the
+	// plan allowance. Checked before any work so the limit message is immediate.
+	if s.billing != nil {
+		if err := s.billing.IncrementAIAction(ctx, userID); err != nil {
+			var limitErr *billing.ErrLimitReached
+			if errors.As(err, &limitErr) {
+				return limitErr.Message, nil
+			}
+			// Metering infrastructure failure — don't block the user.
+			slog.Error(fmt.Sprintf("[conversation] AI metering failed: %v", err))
+		}
+	}
+
+	// Recent conversation context lets the classifier resolve references like
+	// "that", "it", or "the same environment".
+	contextualMessage := message
+	if convContext := s.recentContext(ctx, projectID, 10); convContext != "" {
+		contextualMessage = fmt.Sprintf(
+			"Recent conversation context:\n%s\n\nCurrent message: %s",
+			convContext, message)
+	}
+
 	// Persist user message first so history is correct even if processing fails
 	s.saveMessage(ctx, projectID, userID, "user", message, nil)
 
 	// Classify intent. On failure (API outage, rate limit) degrade to a helpful
 	// fallback response instead of breaking the chat with a raw error.
-	intent, err := s.classifyIntent(ctx, message)
+	intent, err := s.classifyIntent(ctx, contextualMessage)
 	if err != nil {
-		log.Printf("[conversation] intent classification failed: %v", err)
+		slog.Error(fmt.Sprintf("[conversation] intent classification failed: %v", err))
 		fallback := "I'm having trouble understanding requests right now (the AI service is unavailable). " +
 			"You can still use the dashboard buttons to deploy, roll back, or view logs — or try again in a moment."
 		s.saveMessage(ctx, projectID, userID, "assistant", fallback, nil)
@@ -192,6 +220,33 @@ func (s *Service) ProcessMessage(ctx context.Context, projectID uuid.UUID, userI
 	s.saveMessage(ctx, projectID, userID, "assistant", response, &intent.Intent)
 
 	return response, nil
+}
+
+// recentContext renders the last N conversation turns oldest-first as a compact
+// context block for the intent classifier.
+func (s *Service) recentContext(ctx context.Context, projectID uuid.UUID, limit int) string {
+	rows, err := s.db.Pool.Query(ctx, `
+		SELECT role, message FROM (
+			SELECT role, message, created_at FROM conversations
+			WHERE project_id = $1 ORDER BY created_at DESC LIMIT $2
+		) t ORDER BY created_at ASC`, projectID, limit)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+
+	var b strings.Builder
+	for rows.Next() {
+		var role, msg string
+		if rows.Scan(&role, &msg) != nil {
+			continue
+		}
+		if len(msg) > 200 {
+			msg = msg[:200] + "..."
+		}
+		fmt.Fprintf(&b, "[%s]: %s\n", role, msg)
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // targetEnv returns the environment named in the intent params, defaulting to
