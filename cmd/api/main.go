@@ -283,6 +283,12 @@ func main() {
 	r.Use(middleware.Proprietary())
 	r.Use(middleware.CORS(os.Getenv("FRONTEND_URL")))
 
+	// robots.txt — this host only serves the API (and the proprietary admin export
+	// endpoints). Nothing here should ever be crawled or indexed; disallow everything.
+	r.GET("/robots.txt", func(c *gin.Context) {
+		c.String(http.StatusOK, "User-agent: *\nDisallow: /\n")
+	})
+
 	// Health check — verifies database connectivity so load balancers don't route to
 	// an instance that can't serve requests.
 	r.GET("/health", func(c *gin.Context) {
