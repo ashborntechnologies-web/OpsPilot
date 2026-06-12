@@ -135,9 +135,28 @@ raw logs.
   `(project_id, occurred_at DESC)`.
 
 ### `incidents`
-A diagnosed problem. `trigger` = `deploy_failure` | `runtime_anomaly` | `user_request`.
-Stores `root_cause`, `resolution`, `raw_logs` (`json:"-"`). Created by the diagnosis
-service; rated via `diagnosis_feedback`.
+A diagnosed problem and the unit of the **incident war room** (lifecycle-tracked).
+`trigger` = `deploy_failure` | `runtime_anomaly` | `user_request`. Diagnosis fields:
+`root_cause`, `resolution`, `raw_logs` (`json:"-"`). War-room fields (added by
+`extendIncidentsForWarRoom`): `title`, `status` (`open`→`investigating`→`resolved`,
+CHECK-constrained), `severity`, `acknowledged_by`/`acknowledged_at`,
+`resolved_by`/`resolved_at`, `postmortem` (AI-generated markdown), `org_id`. Created by
+`incidents.CreateIncident` from a completed diagnosis (deduplicated per deployment, or per
+environment for runtime anomalies); rated via `diagnosis_feedback`.
+
+### `incident_timeline`
+The war-room feed: ordered AI + human posts as an incident is investigated.
+`author_type` (`ai`/`human`), `author_id` (NULL for AI), `content` (markdown),
+`entry_type` (`diagnosis`/`update`/`action_taken`/`resolution`), `metadata` JSONB. Every
+insert is broadcast to the incident's war-room WebSocket. First entry of a new incident is
+the AI diagnosis.
+
+### `incident_actions`
+Remediation steps proposed during an incident (by AI or human) with an approval
+lifecycle. `proposed_by` (`ai`/`human`), `action_type`, `parameters` JSONB, `status`
+(`pending`/`approved`/`executed`/`rejected`), `approved_by`, `executed_at`. The diagnosis's
+suggested fix becomes a pending `suggested_fix` action; approve/reject are gated to
+engineer+. (No autonomous executor yet — approval records the decision.)
 
 ### `diagnosis_feedback`
 User rating of an AI diagnosis. `rating` (`helpful`/`not_helpful`/`partially_helpful`)

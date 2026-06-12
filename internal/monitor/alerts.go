@@ -268,7 +268,10 @@ func (a *AlertEngine) notifyOwner(ctx context.Context, alert models.Alert, proje
 		return
 	}
 
-	alertURL := strings.TrimRight(os.Getenv("FRONTEND_URL"), "/") + "/projects/" + alert.ProjectID.String()
+	// Link to the incident war room. The specific incident is opened by the auto-
+	// diagnosis job that follows this alert, so we link to the org incident list where
+	// the in-progress incident appears (open incidents are surfaced first).
+	alertURL := strings.TrimRight(os.Getenv("FRONTEND_URL"), "/") + "/incidents"
 	if err := a.emailSvc.SendAlert(ctx, email, projectName, envName, alert.Title, alert.Summary, alertURL); err != nil {
 		slog.Warn("alert engine: email failed", "component", "monitor.alerts",
 			"project_id", alert.ProjectID, "error", err)

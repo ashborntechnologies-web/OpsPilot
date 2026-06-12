@@ -60,6 +60,20 @@ Frontend client: [`frontend/lib/api.ts`](../../frontend/lib/api.ts). Errors are
 | GET | `/invites/:token` | — | `{message, organization}` (redeems invite, adds caller) | any user |
 | GET | `/orgs/:orgId/members` | — | `OrganizationMember[]` (with email) | member |
 | GET | `/orgs/:orgId/resources?resource_type=&region=&project_id=(uuid\|null)` | — | `DiscoveredResource[]` (discovery inventory) | member |
+| GET | `/orgs/:orgId/incidents?limit=&offset=` | — | `Incident[]` (open first, then severity, then recency) | member |
+
+## Incident war room (RequireAuth; org membership + role checked per handler)
+`:incidentId` resolves its own org. Reads need any member; mutations need engineer+.
+| Method | Path | Request | Response | Role |
+|---|---|---|---|---|
+| GET | `/incidents/:incidentId` | — | `{incident, timeline, actions}` | member |
+| POST | `/incidents/:incidentId/timeline` | `{content, entry_type?}` | `IncidentTimelineEntry` (broadcast to war room) | engineer+ |
+| POST | `/incidents/:incidentId/acknowledge` | — | `{status:"investigating"}` | engineer+ |
+| POST | `/incidents/:incidentId/resolve` | — | `{status:"resolved", postmortem}` (AI-generated draft) | engineer+ |
+| POST | `/incidents/:incidentId/postmortem` | `{postmortem}` | `{message}` (publish edited) | engineer+ |
+| POST | `/incidents/:incidentId/actions/:actionId/approve` | — | `{status}` | engineer+ |
+| POST | `/incidents/:incidentId/actions/:actionId/reject` | — | `{status}` | engineer+ |
+| GET (project) | `/projects/:id/incidents` | — | `Incident[]` | member (project tier) |
 | POST | `/orgs/:orgId/invites` | `{email, role}` | `{invite, accept_url, email_sent}` | **admin** |
 | PATCH | `/orgs/:orgId/members/:userId` | `{role}` | `{message, role}` | **admin** (can't demote last admin) |
 | DELETE | `/orgs/:orgId/members/:userId` | — | `{message}` | **admin** (can't remove last admin) |
@@ -113,11 +127,13 @@ intents.
 |---|---|---|
 | `/api/v1/ws/:projectId` | first-message token + ownership | Chat + live deploy/provision/alert/risk/build-log stream. Server→client `WsMessage{type,payload}`; client→server `{message}`. |
 | `/api/v1/ws/:projectId/terminal/:envId` | first-message token + ownership | Binary SSM exec datachannel ↔ xterm. |
+| `/api/v1/ws/incidents/:incidentId` | first-message token + incident-org membership | War-room broadcast: `incident_timeline`, `incident_update`, `incident_action`. Broadcast-only (updates posted via HTTP). |
 
 **`WsMessage.type` values:** `auth_ok`, `thinking`, `response`, `deploy_progress`,
 `deploy_done`, `deploy_failed`, `provision_progress`, `provision_done`,
-`provision_failed`, `alert`, `alert_resolved`, `deploy_risk`, `build_log`,
-`runtime_event`, `error`. (`payload` is a string; alert/risk payloads are JSON strings.)
+`provision_failed`, `alert`, `alert_resolved`, `deploy_risk`, `build_log`, `runtime_event`,
+`incident_timeline`, `incident_update`, `incident_action`, `error`. (`payload` is a
+string; alert/risk/incident payloads are JSON strings.)
 
 ## Admin (ApiKeyAuth — trade-secret datasets)
 | Method | Path | Response |

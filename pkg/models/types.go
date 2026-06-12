@@ -138,7 +138,83 @@ type Incident struct {
 	RootCause     *string    `json:"root_cause" db:"root_cause"`
 	Resolution    *string    `json:"resolution" db:"resolution"`
 	RawLogs       *string    `json:"-" db:"raw_logs"`
-	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+
+	// War-room lifecycle fields.
+	Title          *string    `json:"title" db:"title"`
+	Status         string     `json:"status" db:"status"` // open | investigating | resolved
+	Severity       string     `json:"severity" db:"severity"`
+	AcknowledgedBy *uuid.UUID `json:"acknowledged_by" db:"acknowledged_by"`
+	AcknowledgedAt *time.Time `json:"acknowledged_at" db:"acknowledged_at"`
+	ResolvedBy     *uuid.UUID `json:"resolved_by" db:"resolved_by"`
+	ResolvedAt     *time.Time `json:"resolved_at" db:"resolved_at"`
+	Postmortem     *string    `json:"postmortem" db:"postmortem"`
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+
+	// Joined/derived fields (not columns) — populated by list/get queries.
+	EnvironmentName    string `json:"environment_name,omitempty" db:"-"`
+	ProjectName        string `json:"project_name,omitempty" db:"-"`
+	AcknowledgedByName string `json:"acknowledged_by_name,omitempty" db:"-"`
+}
+
+// Incident status + severity constants.
+const (
+	IncidentStatusOpen          = "open"
+	IncidentStatusInvestigating = "investigating"
+	IncidentStatusResolved      = "resolved"
+)
+
+// Incident trigger constants.
+const (
+	IncidentTriggerDeployFailure  = "deploy_failure"
+	IncidentTriggerRuntimeAnomaly = "runtime_anomaly"
+	IncidentTriggerUserRequest    = "user_request"
+)
+
+// Incident author + entry-type + action-status constants.
+const (
+	IncidentAuthorAI    = "ai"
+	IncidentAuthorHuman = "human"
+
+	IncidentEntryDiagnosis   = "diagnosis"
+	IncidentEntryUpdate      = "update"
+	IncidentEntryActionTaken = "action_taken"
+	IncidentEntryResolution  = "resolution"
+
+	IncidentActionPending  = "pending"
+	IncidentActionApproved = "approved"
+	IncidentActionExecuted = "executed"
+	IncidentActionRejected = "rejected"
+)
+
+// IncidentTimelineEntry is one post in the war-room feed — an AI diagnosis/update or a
+// human comment. author_id is nil for AI entries.
+type IncidentTimelineEntry struct {
+	ID         uuid.UUID      `json:"id" db:"id"`
+	IncidentID uuid.UUID      `json:"incident_id" db:"incident_id"`
+	AuthorType string         `json:"author_type" db:"author_type"`
+	AuthorID   *uuid.UUID     `json:"author_id" db:"author_id"`
+	Content    string         `json:"content" db:"content"`
+	EntryType  string         `json:"entry_type" db:"entry_type"`
+	Metadata   map[string]any `json:"metadata" db:"metadata"`
+	CreatedAt  time.Time      `json:"created_at" db:"created_at"`
+	// AuthorName is the human author's email — populated by the timeline query.
+	AuthorName string `json:"author_name,omitempty" db:"-"`
+}
+
+// IncidentAction is a remediation step proposed during an incident, with an approval
+// lifecycle (pending → approved/executed | rejected).
+type IncidentAction struct {
+	ID         uuid.UUID      `json:"id" db:"id"`
+	IncidentID uuid.UUID      `json:"incident_id" db:"incident_id"`
+	ProposedBy string         `json:"proposed_by" db:"proposed_by"`
+	ActionType string         `json:"action_type" db:"action_type"`
+	Parameters map[string]any `json:"parameters" db:"parameters"`
+	Status     string         `json:"status" db:"status"`
+	ApprovedBy *uuid.UUID     `json:"approved_by" db:"approved_by"`
+	ExecutedAt *time.Time     `json:"executed_at" db:"executed_at"`
+	CreatedAt  time.Time      `json:"created_at" db:"created_at"`
+	// ApprovedByName is the approver's email — populated by the actions query.
+	ApprovedByName string `json:"approved_by_name,omitempty" db:"-"`
 }
 
 type Conversation struct {

@@ -34,7 +34,10 @@ type MessageHandler interface {
 type AuthFunc func(ctx context.Context, token, projectID string) (uuid.UUID, error)
 
 type client struct {
-	conn      *websocket.Conn
+	conn *websocket.Conn
+	// room is the broadcast key: a project ID for the chat/dashboard socket, or an
+	// incident ID for a war-room socket. Broadcast(room, msg) reaches all clients here.
+	room      string
 	projectID string
 	send      chan Message
 	ctx       context.Context
@@ -43,12 +46,16 @@ type client struct {
 	limiter *rate.Limiter
 }
 
-// Hub manages all active WebSocket connections, keyed by projectID.
+// Hub manages all active WebSocket connections, keyed by room (project ID or incident ID).
 type Hub struct {
 	mu            sync.RWMutex
 	clients       map[string][]*client
 	allowedOrigin string // FRONTEND_URL; empty = allow all (dev mode)
 }
+
+// RoomAuthFunc validates a bearer token for an arbitrary room ID (e.g. an incident ID)
+// and returns the platform user ID, erroring if the user may not access that room.
+type RoomAuthFunc func(ctx context.Context, token, roomID string) (uuid.UUID, error)
 
 func NewHub(allowedOrigin string) *Hub {
 	return &Hub{
@@ -121,6 +128,7 @@ func (h *Hub) HandleUpgrade(c *gin.Context, authFn AuthFunc, handler MessageHand
 	ctx, cancel := context.WithCancel(context.Background())
 	cl := &client{
 		conn:      conn,
+		room:      projectID,
 		projectID: projectID,
 		send:      make(chan Message, 64),
 		ctx:       ctx,
@@ -182,6 +190,77 @@ func (h *Hub) HandleUpgrade(c *gin.Context, authFn AuthFunc, handler MessageHand
 	}
 }
 
+// HandleIncidentUpgrade upgrades a war-room WebSocket keyed by incident ID. Auth is the
+// same first-message handshake as HandleUpgrade, but validated against the incident's org
+// (authFn). The room is broadcast-only — engineers post updates over HTTP, not the socket
+// — so the read loop only drains incoming frames to detect disconnect.
+func (h *Hub) HandleIncidentUpgrade(c *gin.Context, authFn RoomAuthFunc) {
+	incidentID := c.Param("incidentId")
+
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			return h.allowedOrigin == "" || r.Header.Get("Origin") == h.allowedOrigin
+		},
+	}
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		slog.Error(fmt.Sprintf("WebSocket upgrade error: %v", err))
+		return
+	}
+
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, raw, err := conn.ReadMessage()
+	conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		conn.Close()
+		return
+	}
+	var authMsg struct {
+		Type  string `json:"type"`
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &authMsg); err != nil || authMsg.Type != "auth" || authMsg.Token == "" {
+		conn.WriteMessage(websocket.TextMessage, mustMarshal(Message{Type: "error", Payload: "first message must be {type:auth,token:...}"}))
+		conn.Close()
+		return
+	}
+	if _, err := authFn(c.Request.Context(), authMsg.Token, incidentID); err != nil {
+		conn.WriteMessage(websocket.TextMessage, mustMarshal(Message{Type: "error", Payload: "unauthorized"}))
+		conn.Close()
+		return
+	}
+	conn.WriteMessage(websocket.TextMessage, mustMarshal(Message{Type: "auth_ok"}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cl := &client{
+		conn:    conn,
+		room:    incidentID,
+		send:    make(chan Message, 64),
+		ctx:     ctx,
+		cancel:  cancel,
+		limiter: rate.NewLimiter(rate.Every(6*time.Second), 5),
+	}
+	h.register(cl)
+	defer h.unregister(cl)
+
+	go func() {
+		for msg := range cl.send {
+			data, _ := json.Marshal(msg)
+			if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			break
+		}
+	}
+}
+
 func mustMarshal(m Message) []byte {
 	b, _ := json.Marshal(m)
 	return b
@@ -201,7 +280,7 @@ func (h *Hub) Broadcast(projectID string, msg Message) {
 func (h *Hub) register(cl *client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.clients[cl.projectID] = append(h.clients[cl.projectID], cl)
+	h.clients[cl.room] = append(h.clients[cl.room], cl)
 }
 
 func (h *Hub) unregister(cl *client) {
@@ -210,10 +289,10 @@ func (h *Hub) unregister(cl *client) {
 
 	cl.cancel()
 
-	clients := h.clients[cl.projectID]
+	clients := h.clients[cl.room]
 	for i, c := range clients {
 		if c == cl {
-			h.clients[cl.projectID] = append(clients[:i], clients[i+1:]...)
+			h.clients[cl.room] = append(clients[:i], clients[i+1:]...)
 			break
 		}
 	}

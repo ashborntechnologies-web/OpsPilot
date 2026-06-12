@@ -108,6 +108,20 @@ account/ARN for the bootstrap template + same-account AssumeRole.
 - **HTTP:** `HandleDiagnose`, `HandleSubmitFeedback`, `HandleFeedbackSummary`.
 - **Depends on:** `aws` (logs), `events`, `memory`, `llm`, `prompts`, `models`.
 
+## `internal/incidents` — incident war room
+- **Purpose:** first-class, lifecycle-tracked incidents with a shared real-time timeline
+  (AI + human) and an approval flow for proposed actions; AI postmortem on resolve. See
+  the ARCHITECTURE war-room flow.
+- **Files:** `service.go` (`CreateIncident` + dedup + first timeline entry + suggested
+  action; `GeneratePostmortem`; `postTimelineEntry`/`broadcast`), `handlers.go` (list/get/
+  timeline/acknowledge/resolve/postmortem/approve/reject + `requireIncidentRole`).
+- **Key type:** `Service` (deps: db, llm, ws hub); `CreateParams` (the diagnosis→incident
+  bridge). Consumed by `diagnosis` via the `diagnosis.IncidentCreator` interface
+  (`SetIncidentService`) so completed diagnoses open an incident instead of a bare row.
+- **Realtime:** broadcasts `incident_timeline`/`incident_update`/`incident_action` to the
+  war-room WebSocket (`pkg/ws` incident rooms, keyed by incident ID).
+- **Depends on:** `llm` (postmortem), `ws` (broadcast), `middleware` (auth/role), `models`.
+
 ## `internal/memory` — long-term project memory
 - **Purpose:** learn facts about each project and feed them into diagnosis prompts.
 - **Files:** `service.go`. **Methods:** `upsert` (dedup via normalized `contentKey`,
@@ -203,9 +217,10 @@ account/ARN for the bootstrap template + same-account AssumeRole.
 - **`pkg/models`** — `db.go` (pgxpool, `RunMigrations` = ordered idempotent migration
   strings, `UserOwnsProject`/`UserOwnsAccount` tenancy helpers), `types.go` (all entity
   structs + status/intent/event/alert/memory constants). See `DATABASE_SCHEMA.md`.
-- **`pkg/ws`** — `Hub`: per-project client registry, first-message `AuthFunc`,
-  `Broadcast(projectID, Message)`, `MessageHandler` seam (conversation engine).
-  `Message{Type, Payload}`.
+- **`pkg/ws`** — `Hub`: client registry keyed by **room** (project ID, or incident ID for
+  war rooms), first-message `AuthFunc`/`RoomAuthFunc`, `Broadcast(room, Message)`,
+  `MessageHandler` seam (conversation engine), `HandleUpgrade` (project/chat) +
+  `HandleIncidentUpgrade` (broadcast-only war room). `Message{Type, Payload}`.
 - **`pkg/middleware`** — `auth.go` (`RequireAuth`, `RequireProjectOwnership`,
   `ResolveToken`, user upsert), `ratelimit.go` (per-user token bucket), `cors.go`,
   `apikey.go` (admin), `proprietary.go` (IP/version headers), `requestid.go`

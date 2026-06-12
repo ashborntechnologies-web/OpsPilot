@@ -105,6 +105,9 @@ func RunMigrations(db *DB) error {
 		backfillPersonalOrgs,
 		createDiscoveredResourcesTable,
 		addLastScannedAtToAWSAccounts,
+		extendIncidentsForWarRoom,
+		createIncidentTimelineTable,
+		createIncidentActionsTable,
 	}
 
 	for _, m := range migrations {
@@ -528,6 +531,60 @@ CREATE INDEX IF NOT EXISTS idx_discovered_project ON discovered_resources(projec
 // an account (surfaced in the UI).
 const addLastScannedAtToAWSAccounts = `
 ALTER TABLE aws_accounts ADD COLUMN IF NOT EXISTS last_scanned_at TIMESTAMPTZ;`
+
+// extendIncidentsForWarRoom turns incidents into first-class, lifecycle-tracked objects
+// for the incident war room: a title, status (open→investigating→resolved), severity,
+// who acknowledged/resolved and when, and an AI-generated postmortem. org_id was already
+// added by addOrgIDColumns; included here idempotently. The status CHECK is added as a
+// named constraint so it is skipped if already present.
+const extendIncidentsForWarRoom = `
+ALTER TABLE incidents
+    ADD COLUMN IF NOT EXISTS title           TEXT,
+    ADD COLUMN IF NOT EXISTS status          TEXT NOT NULL DEFAULT 'open',
+    ADD COLUMN IF NOT EXISTS severity        TEXT NOT NULL DEFAULT 'warn',
+    ADD COLUMN IF NOT EXISTS acknowledged_by UUID REFERENCES users(id),
+    ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS resolved_by     UUID REFERENCES users(id),
+    ADD COLUMN IF NOT EXISTS resolved_at     TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS postmortem      TEXT,
+    ADD COLUMN IF NOT EXISTS org_id          UUID REFERENCES organizations(id) ON DELETE CASCADE;
+DO $$ BEGIN
+    ALTER TABLE incidents ADD CONSTRAINT incidents_status_check
+        CHECK (status IN ('open', 'investigating', 'resolved'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS idx_incidents_org    ON incidents(org_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(project_id, status, created_at DESC);`
+
+// createIncidentTimelineTable stores the war-room feed: AI and human entries posted as
+// an incident is investigated. author_id is NULL for AI entries.
+const createIncidentTimelineTable = `
+CREATE TABLE IF NOT EXISTS incident_timeline (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id UUID NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    author_type TEXT NOT NULL CHECK (author_type IN ('ai', 'human')),
+    author_id   UUID REFERENCES users(id),
+    content     TEXT NOT NULL,
+    entry_type  TEXT NOT NULL DEFAULT 'update', -- diagnosis | update | action_taken | resolution
+    metadata    JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_incident_timeline ON incident_timeline(incident_id, created_at);`
+
+// createIncidentActionsTable stores remediation actions proposed during an incident
+// (by the AI or a human) and their approval lifecycle.
+const createIncidentActionsTable = `
+CREATE TABLE IF NOT EXISTS incident_actions (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id UUID NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    proposed_by TEXT NOT NULL CHECK (proposed_by IN ('ai', 'human')),
+    action_type TEXT NOT NULL,
+    parameters  JSONB NOT NULL DEFAULT '{}',
+    status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'executed', 'rejected')),
+    approved_by UUID REFERENCES users(id),
+    executed_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_incident_actions ON incident_actions(incident_id, created_at);`
 
 // backfillPersonalOrgs migrates every existing user into a personal organization
 // (admin membership) and assigns all of their existing data to it. Idempotent:

@@ -16,6 +16,45 @@ Format:
 
 ---
 
+## 2026-06-12 — Incident war room (shared real-time investigation + AI postmortem)
+- **What:** Turned incidents into first-class, lifecycle-tracked objects with a shared
+  real-time war room where the team investigates alongside the AI.
+  - **Data model:** extended `incidents` (title, status open/investigating/resolved,
+    severity, acknowledged_by/at, resolved_by/at, postmortem, org_id) + new
+    `incident_timeline` and `incident_actions` tables. New structs/constants in models.
+  - **New `internal/incidents`:** `CreateIncident` (deduplicated per deployment / per env;
+    posts the AI diagnosis as the first timeline entry; surfaces the suggested fix as a
+    pending action), `GeneratePostmortem` (Claude → markdown with fixed sections, template
+    fallback), and handlers (list org/project, get full, post timeline, acknowledge,
+    resolve, save/publish postmortem, approve/reject actions) with per-incident org+role
+    checks.
+  - **WS hub:** generalized the client room key from project ID to any room;
+    `HandleIncidentUpgrade` + `RoomAuthFunc` add a broadcast-only war-room socket keyed by
+    incident ID. Timeline/status/action changes broadcast live.
+  - **Wiring:** diagnosis now opens incidents via the `IncidentCreator` interface
+    (`SetIncidentService`) for both deploy-failure and runtime paths; alert emails link to
+    `/incidents` (war room) instead of the project page.
+  - **Frontend:** `/incidents` list (open-first, severity-sorted), `/incidents/[id]` war
+    room (left metadata panel, center live timeline with AI/human styling + auto-scroll +
+    update composer, right AI-actions approve/reject panel, top-bar acknowledge/resolve +
+    live time-open), postmortem modal (editable, publish), navbar open-incident red badge,
+    a dependency-free `lib/markdown.tsx` renderer, incident types + API + WS client.
+- **Files:** `pkg/models/{db,types}.go`; `pkg/ws/hub.go`;
+  `internal/incidents/{service,handlers}.go` (new); `internal/diagnosis/service.go`;
+  `internal/monitor/alerts.go`; `cmd/api/main.go`; frontend `types/api.ts`,
+  `lib/{api.ts,markdown.tsx,incidents.ts}`, `components/layout/navbar.tsx`,
+  `app/incidents/page.tsx` + `app/incidents/[id]/page.tsx` (new).
+- **Why:** Incidents need a collaborative, real-time response surface (not just a row +
+  a project-page toast) — the war room is where humans and the AI converge on a fix and
+  capture the postmortem.
+- **Assumptions changed:** Incidents are now lifecycle objects with shared state and a
+  per-incident realtime channel; the WS hub is room-generic, not project-only; diagnosis
+  output flows into an incident timeline rather than a bare incidents row.
+- **Verification:** `go build ./...`, `go vet ./...`, `gofmt -l`, `tsc --noEmit` all clean.
+  LLM postmortem + live WS not exercised against running services here.
+- **Docs updated:** ARCHITECTURE (war-room flow), DATABASE_SCHEMA, API_CONTRACTS (+WS),
+  CURRENT_STATE, BACKEND.
+
 ## 2026-06-12 — AWS infrastructure discovery (onboard existing resources)
 - **What:** Scan connected AWS accounts for existing infrastructure so users onboard
   without migration.

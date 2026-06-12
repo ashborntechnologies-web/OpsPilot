@@ -5,13 +5,14 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import useSWR from "swr";
 import { UserButton, useAuth } from "@clerk/nextjs";
-import { Rocket, CheckCircle2, ChevronDown, Building2, Check } from "lucide-react";
+import { Rocket, CheckCircle2, ChevronDown, Building2, Check, Siren } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { getMe } from "@/lib/api";
+import { getMe, listOrgIncidents } from "@/lib/api";
 import { useActiveOrg } from "@/lib/use-org";
+import type { Incident } from "@/types/api";
 import { cn } from "@/lib/utils";
 
 const TIERS = [
@@ -33,6 +34,18 @@ export function Navbar() {
     if (!token) return null;
     return getMe(token);
   }, { refreshInterval: 120_000 });
+
+  // Open-incident count for the active workspace (drives the red navbar badge).
+  const { data: openIncidents } = useSWR<Incident[]>(
+    activeOrg ? ["navbar-incidents", activeOrg.id] : null,
+    async () => {
+      const token = await getToken();
+      if (!token || !activeOrg) return [];
+      return listOrgIncidents(token, activeOrg.id);
+    },
+    { refreshInterval: 30_000 }
+  );
+  const openCount = (openIncidents ?? []).filter((i) => i.status !== "resolved").length;
 
   const usageLabel = me
     ? me.plan === "free"
@@ -109,6 +122,18 @@ export function Navbar() {
             className={cn(path.startsWith("/aws-accounts") ? "text-foreground font-medium" : "hover:text-foreground")}
           >
             AWS Accounts
+          </Link>
+          <Link
+            href="/incidents"
+            className={cn("relative inline-flex items-center gap-1", path.startsWith("/incidents") ? "text-foreground font-medium" : "hover:text-foreground")}
+          >
+            <Siren className={cn("h-3.5 w-3.5", openCount > 0 && "text-red-600")} />
+            Incidents
+            {openCount > 0 && (
+              <span className="ml-0.5 inline-flex items-center justify-center h-4 min-w-4 px-1 rounded-full bg-red-600 text-white text-[10px] font-semibold">
+                {openCount}
+              </span>
+            )}
           </Link>
           <Link
             href="/settings/organization"

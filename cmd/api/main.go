@@ -24,6 +24,7 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/export"
 	githubsvc "github.com/ashborntechnologies-web/OpsPilot/internal/github"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/incidents"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/memory"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/monitor"
@@ -258,8 +259,13 @@ func main() {
 			slog.Error(fmt.Sprintf("failed to enqueue provision job for env %s: %v", environmentID, err))
 		}
 	})
+	// Incident war room — incidents service is injected into diagnosis so completed
+	// diagnoses open a shared, real-time incident with an AI+human timeline.
+	incidentsSvc := incidents.NewService(db, llm.New(os.Getenv("ANTHROPIC_API_KEY")), hub)
+
 	diagnosisSvc := diagnosis.NewService(db, awsSvc, eventSvc, os.Getenv("ANTHROPIC_API_KEY"))
 	diagnosisSvc.SetMemoryService(memorySvc)
+	diagnosisSvc.SetIncidentService(incidentsSvc)
 	conversationSvc := conversation.NewService(db, deploySvc, diagnosisSvc, os.Getenv("ANTHROPIC_API_KEY"), hub)
 	conversationSvc.SetBillingService(billingSvc)
 
@@ -387,6 +393,7 @@ func main() {
 	{
 		org.GET("/members", orgsSvc.HandleListMembers)
 		org.GET("/resources", discoverySvc.HandleListOrgResources) // discovered resource inventory
+		org.GET("/incidents", incidentsSvc.HandleListOrgIncidents) // war-room incident list
 		org.POST("/invites", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleCreateInvite)
 		org.PATCH("/members/:userId", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleUpdateMemberRole)
 		org.DELETE("/members/:userId", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleRemoveMember)
@@ -422,6 +429,7 @@ func main() {
 		proj.GET("/costs", deploySvc.HandleGetCosts)
 		proj.GET("/health-score", deploySvc.HandleGetHealthScore)
 		proj.GET("/resources", discoverySvc.HandleListProjectResources)
+		proj.GET("/incidents", incidentsSvc.HandleListProjectIncidents)
 		proj.GET("/conversation/history", conversationSvc.HandleHistory)
 
 		// Engineer actions — deploy, rollback, scale, env vars, alerts, chat, webhooks.
@@ -451,6 +459,21 @@ func main() {
 		proj.PATCH("", requireAdmin, deploySvc.HandleUpdateProject)
 	}
 
+	// Incident war room — single-incident routes. Auth is RequireAuth; org membership +
+	// role are checked inside each handler (the incident resolves its own org). Reads
+	// need any member; timeline/ack/resolve/actions need engineer+.
+	inc := v1.Group("/incidents/:incidentId")
+	inc.Use(middleware.RequireAuth(authSvc, db))
+	{
+		inc.GET("", incidentsSvc.HandleGetIncident)
+		inc.POST("/timeline", incidentsSvc.HandlePostTimeline)
+		inc.POST("/acknowledge", incidentsSvc.HandleAcknowledge)
+		inc.POST("/resolve", incidentsSvc.HandleResolve)
+		inc.POST("/postmortem", incidentsSvc.HandleSavePostmortem)
+		inc.POST("/actions/:actionId/approve", incidentsSvc.HandleApproveAction)
+		inc.POST("/actions/:actionId/reject", incidentsSvc.HandleRejectAction)
+	}
+
 	// Admin — training data exports (trade secret datasets). Protected by a static
 	// bearer key (ADMIN_API_KEY), not Clerk; 404s when no key is configured.
 	exportSvc := export.NewService(db)
@@ -471,6 +494,31 @@ func main() {
 
 	// Terminal WebSocket — auth via first-message token (browsers cannot set custom headers).
 	v1.GET("/ws/:projectId/terminal/:envId", terminalSvc.HandleTerminal)
+
+	// Incident war-room WebSocket — broadcast-only stream of timeline entries + status
+	// updates. Auth via first-message token; access requires membership of the incident's
+	// org (any role — viewers watch live).
+	incidentWsAuthFn := pkgws.RoomAuthFunc(func(ctx context.Context, token, incidentID string) (uuid.UUID, error) {
+		userID, err := middleware.ResolveToken(ctx, db, authSvc, token)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
+		iid, err := uuid.Parse(incidentID)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
+		var orgID *uuid.UUID
+		if err := db.Pool.QueryRow(ctx, `SELECT org_id FROM incidents WHERE id = $1`, iid).Scan(&orgID); err != nil || orgID == nil {
+			return uuid.UUID{}, errors.New("forbidden: incident not found")
+		}
+		if _, err := db.UserOrgRole(ctx, userID, *orgID); err != nil {
+			return uuid.UUID{}, errors.New("forbidden: not a member of this incident's workspace")
+		}
+		return userID, nil
+	})
+	v1.GET("/ws/incidents/:incidentId", func(c *gin.Context) {
+		hub.HandleIncidentUpgrade(c, incidentWsAuthFn)
+	})
 
 	// Start server
 	port := os.Getenv("PORT")

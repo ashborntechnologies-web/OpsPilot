@@ -28,6 +28,17 @@ Status is derived from the code on `main`, not from plans.
   near-duplicate merging.
 - Pre-deploy risk score (advisory, broadcast as `deploy_risk`) + deployment health score.
 
+**Incident war room**
+- Incidents are first-class, lifecycle-tracked (`open`→`investigating`→`resolved`) with
+  severity, acknowledgement, resolution, and an AI-generated postmortem.
+- Auto-created from completed diagnoses (deploy failure + runtime anomaly), deduplicated;
+  the AI diagnosis is the first timeline entry and the suggested fix becomes a pending
+  action.
+- Real-time war room (`/incidents/[id]`): shared timeline feed (AI + human, live over a
+  per-incident WebSocket), engineer update composer, AI-actions approve/reject panel,
+  acknowledge/resolve, and an editable AI postmortem on resolve. Org incident list
+  (`/incidents`) + navbar open-incident badge. Alert emails link to the war room.
+
 **Infrastructure discovery**
 - Scans connected AWS accounts for existing resources (ECS services/clusters, RDS,
   ElastiCache, Lambda, S3, ALBs, SQS) so users onboard without migration. Parallel,
@@ -113,6 +124,11 @@ Status is derived from the code on `main`, not from plans.
   defaulting to `us-east-1` for a fresh account. `cloudfront_distribution`/`ec2_instance`
   types are defined but have no dedicated scanner yet. Only discovered **ECS services**
   feed the monitor.
+- **Incident actions are advisory** — approving an AI-proposed action records the decision
+  (status + approver + timestamp) but there is no autonomous executor yet; the engineer
+  still performs the fix. Markdown in the war room uses a small built-in renderer (headings/
+  bold/code/lists), not a full markdown engine. Alert emails link to the incident **list**
+  (the specific incident is opened by the diagnosis job that runs after the alert).
 
 ## 🔭 Actively developing
 Continuous-operation intelligence (monitoring → alert → diagnosis → memory loop) and

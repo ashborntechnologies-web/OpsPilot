@@ -9,6 +9,7 @@ import (
 
 	"github.com/ashborntechnologies-web/OpsPilot/internal/aws"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/incidents"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/memory"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/prompts"
@@ -21,16 +22,28 @@ import (
 const maxLogChars = 6000
 
 type Service struct {
-	db     *models.DB
-	awsSvc *aws.Service
-	events *events.Service
-	llm    *llm.Client
-	memory *memory.Service
+	db        *models.DB
+	awsSvc    *aws.Service
+	events    *events.Service
+	llm       *llm.Client
+	memory    *memory.Service
+	incidents IncidentCreator
+}
+
+// IncidentCreator opens (or appends to) an incident from a completed diagnosis. The
+// concrete implementation is *incidents.Service, injected at startup to avoid a hard
+// dependency and keep diagnosis usable without the war-room subsystem.
+type IncidentCreator interface {
+	CreateIncident(ctx context.Context, p incidents.CreateParams) (uuid.UUID, error)
 }
 
 // SetMemoryService injects the project-memory service (set once at startup).
 // Diagnosis works without it; memory just makes prompts smarter over time.
 func (s *Service) SetMemoryService(m *memory.Service) { s.memory = m }
+
+// SetIncidentService wires incident creation. When set, completed diagnoses open a
+// war-room incident (deduplicated) instead of a bare incidents row.
+func (s *Service) SetIncidentService(c IncidentCreator) { s.incidents = c }
 
 func NewService(db *models.DB, awsSvc *aws.Service, eventSvc *events.Service, apiKey string) *Service {
 	return &Service{db: db, awsSvc: awsSvc, events: eventSvc, llm: llm.New(apiKey)}
@@ -336,10 +349,28 @@ func (s *Service) saveIncident(ctx context.Context, projectID, deploymentID uuid
 	}
 	resolution := extractDiagnosisField(diagnosis, "Fix")
 
+	// Preferred path: open a war-room incident (deduplicated, with the diagnosis as the
+	// first timeline entry).
+	if s.incidents != nil {
+		if id, err := s.incidents.CreateIncident(ctx, incidents.CreateParams{
+			ProjectID:         projectID,
+			DeploymentID:      &deploymentID,
+			Trigger:           trigger,
+			Severity:          models.SeverityError,
+			RootCause:         rootCause,
+			Resolution:        resolution,
+			RawLogs:           logs,
+			DiagnosisMarkdown: diagnosis,
+		}); err == nil {
+			return id
+		}
+	}
+
+	// Fallback (incident service not wired): bare incidents row.
 	var id uuid.UUID
 	s.db.Pool.QueryRow(ctx,
-		`INSERT INTO incidents (project_id, org_id, deployment_id, trigger, root_cause, resolution, raw_logs)
-		 VALUES ($1, (SELECT org_id FROM projects WHERE id = $1), $2, $3, $4, $5, $6) RETURNING id`,
+		`INSERT INTO incidents (project_id, org_id, deployment_id, trigger, root_cause, resolution, raw_logs, title, severity)
+		 VALUES ($1, (SELECT org_id FROM projects WHERE id = $1), $2, $3, $4, $5, $6, $4, 'error') RETURNING id`,
 		projectID, deploymentID, trigger, rootCause, resolution, logs,
 	).Scan(&id)
 	return id
@@ -427,11 +458,24 @@ func (s *Service) DiagnoseRuntime(ctx context.Context, projectID uuid.UUID) (str
 	}
 	resolution := extractDiagnosisField(diagnosis, "Fix")
 	var incidentID uuid.UUID
-	s.db.Pool.QueryRow(ctx,
-		`INSERT INTO incidents (project_id, org_id, environment_id, trigger, root_cause, resolution, raw_logs)
-		 VALUES ($1, (SELECT org_id FROM projects WHERE id = $1), $2, 'runtime_anomaly', $3, $4, $5) RETURNING id`,
-		projectID, envID, rootCause, resolution, rawForMemory,
-	).Scan(&incidentID)
+	if s.incidents != nil {
+		incidentID, _ = s.incidents.CreateIncident(ctx, incidents.CreateParams{
+			ProjectID:         projectID,
+			EnvironmentID:     &envID,
+			Trigger:           models.IncidentTriggerRuntimeAnomaly,
+			Severity:          models.SeverityError,
+			RootCause:         rootCause,
+			Resolution:        resolution,
+			RawLogs:           rawForMemory,
+			DiagnosisMarkdown: diagnosis,
+		})
+	} else {
+		s.db.Pool.QueryRow(ctx,
+			`INSERT INTO incidents (project_id, org_id, environment_id, trigger, root_cause, resolution, raw_logs, title, severity)
+			 VALUES ($1, (SELECT org_id FROM projects WHERE id = $1), $2, 'runtime_anomaly', $3, $4, $5, $3, 'error') RETURNING id`,
+			projectID, envID, rootCause, resolution, rawForMemory,
+		).Scan(&incidentID)
+	}
 
 	// Refresh the latest open alert with the diagnosis headline so the alert
 	// panel shows the root cause, not just the symptom.

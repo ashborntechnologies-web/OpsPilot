@@ -262,6 +262,43 @@ are flagged `is_managed`. Discovered ECS services **assigned to a project** are 
 into the monitor's worker set (health poll + log anomaly scan), so pre-existing services
 get the same alerting as OpsPilot-created ones.
 
+## Incident war room flow
+
+A shared, real-time space where the team investigates an incident alongside the AI.
+See `internal/incidents` and the war-room WebSocket below.
+
+```mermaid
+graph TB
+  DIAG["diagnosis completes\n(deploy failure / runtime anomaly)"] -->|CreateIncident (dedup)| INC[(incidents)]
+  INC -->|first entry = AI diagnosis| TL[(incident_timeline)]
+  INC -->|suggested fix| ACT[(incident_actions)]
+  subgraph WarRoom["/incidents/:id war room"]
+    HUMAN["engineer posts update"] -->|POST /timeline| TL
+    ACK["Acknowledge → investigating"] --> INC
+    APPROVE["Approve/Reject AI action"] --> ACT
+    RES["Mark Resolved"] -->|resolve| INC
+    RES -->|Claude| PM["postmortem (markdown)\nSummary/Timeline/Root Cause/\nContributing Factors/Action Items"]
+    PM --> INC
+  end
+  TL & INC & ACT -->|hub.Broadcast(incidentID)| WS["war-room WebSocket\n/ws/incidents/:id"]
+  WS --> SUB["all subscribers (live)"]
+```
+
+- **Incidents are first-class lifecycle objects:** `open → investigating → resolved`,
+  with severity, who acknowledged/resolved, and an AI postmortem. They are created by the
+  diagnosis pipeline via `incidents.CreateIncident` (deduplicated per deployment, or per
+  environment for runtime anomalies), which posts the AI diagnosis as the **first timeline
+  entry** and surfaces the suggested fix as a pending action.
+- **War-room WebSocket** (`pkg/ws` incident rooms): the hub's room key generalizes from
+  project ID to **any room ID**; `HandleIncidentUpgrade` registers a broadcast-only
+  socket keyed by incident ID (auth = org membership of the incident). Every timeline
+  entry / status / action change is broadcast to all subscribers. Engineers post updates
+  over HTTP (`POST /incidents/:id/timeline`), not the socket.
+- **Postmortem:** on resolve, Claude is given the full timeline + root cause + actions +
+  duration and returns markdown with fixed sections; it is stored on the incident and
+  shown editable before the engineer publishes it. Falls back to a template on AI outage.
+- Alert emails now link to the war room (`/incidents`) instead of the project page.
+
 ## Monitoring & alerting flow
 
 ```mermaid

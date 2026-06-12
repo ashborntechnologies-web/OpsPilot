@@ -135,6 +135,9 @@ export interface WsMessage {
     | "deploy_risk"
     | "build_log"
     | "runtime_event"
+    | "incident_timeline"
+    | "incident_update"
+    | "incident_action"
     | "error";
   payload: string;
 }
@@ -216,6 +219,64 @@ export interface DiscoveredResource {
   is_managed: boolean;
   first_seen_at: string;
   last_seen_at: string;
+}
+
+export type IncidentStatus = "open" | "investigating" | "resolved";
+export type IncidentSeverity = "info" | "warn" | "error";
+
+export interface Incident {
+  id: string;
+  project_id: string;
+  org_id: string | null;
+  deployment_id: string | null;
+  environment_id: string | null;
+  trigger: string;
+  root_cause?: string | null;
+  resolution?: string | null;
+  title: string | null;
+  status: IncidentStatus;
+  severity: IncidentSeverity;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+  resolved_by: string | null;
+  resolved_at: string | null;
+  postmortem?: string | null;
+  created_at: string;
+  // joined/derived
+  environment_name?: string;
+  project_name?: string;
+  acknowledged_by_name?: string;
+}
+
+export interface IncidentTimelineEntry {
+  id: string;
+  incident_id: string;
+  author_type: "ai" | "human";
+  author_id: string | null;
+  content: string;
+  entry_type: "diagnosis" | "update" | "action_taken" | "resolution";
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+  author_name?: string;
+}
+
+export interface IncidentAction {
+  id: string;
+  incident_id: string;
+  proposed_by: "ai" | "human";
+  action_type: string;
+  parameters: Record<string, unknown> | null;
+  status: "pending" | "approved" | "executed" | "rejected";
+  approved_by: string | null;
+  executed_at: string | null;
+  created_at: string;
+  approved_by_name?: string;
+}
+
+export interface IncidentDetail {
+  incident: Incident;
+  timeline: IncidentTimelineEntry[];
+  actions: IncidentAction[];
 }
 
 export interface ConversationMessage {

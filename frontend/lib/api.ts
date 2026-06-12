@@ -543,3 +543,53 @@ export function assignResource(token: string, resourceId: string, projectId: str
     { method: "PATCH", body: JSON.stringify({ project_id: projectId }) }
   );
 }
+
+// ---- Incident war room ---------------------------------------------------------
+
+import type { Incident, IncidentDetail, IncidentTimelineEntry } from "@/types/api";
+
+export function listOrgIncidents(token: string, orgId: string, limit = 100) {
+  return request<Incident[]>(`/orgs/${orgId}/incidents?limit=${limit}`, token);
+}
+
+export function listProjectIncidents(token: string, projectId: string) {
+  return request<Incident[]>(`/projects/${projectId}/incidents`, token);
+}
+
+export function getIncident(token: string, incidentId: string) {
+  return request<IncidentDetail>(`/incidents/${incidentId}`, token);
+}
+
+export function postIncidentTimeline(token: string, incidentId: string, content: string, entryType?: string) {
+  return request<IncidentTimelineEntry>(`/incidents/${incidentId}/timeline`, token, {
+    method: "POST", body: JSON.stringify({ content, entry_type: entryType }),
+  });
+}
+
+export function acknowledgeIncident(token: string, incidentId: string) {
+  return request<{ message: string; status: string }>(`/incidents/${incidentId}/acknowledge`, token, { method: "POST" });
+}
+
+export function resolveIncident(token: string, incidentId: string) {
+  return request<{ status: string; postmortem: string }>(`/incidents/${incidentId}/resolve`, token, { method: "POST" });
+}
+
+export function savePostmortem(token: string, incidentId: string, postmortem: string) {
+  return request<{ message: string }>(`/incidents/${incidentId}/postmortem`, token, {
+    method: "POST", body: JSON.stringify({ postmortem }),
+  });
+}
+
+export function approveIncidentAction(token: string, incidentId: string, actionId: string) {
+  return request<{ message: string; status: string }>(`/incidents/${incidentId}/actions/${actionId}/approve`, token, { method: "POST" });
+}
+
+export function rejectIncidentAction(token: string, incidentId: string, actionId: string) {
+  return request<{ message: string; status: string }>(`/incidents/${incidentId}/actions/${actionId}/reject`, token, { method: "POST" });
+}
+
+export function incidentWsURL(incidentId: string) {
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
+  const base = apiUrl.replace(/^http/, "ws");
+  return `${base}/api/v1/ws/incidents/${incidentId}`;
+}
