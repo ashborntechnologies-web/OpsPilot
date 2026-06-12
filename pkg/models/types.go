@@ -20,14 +20,16 @@ type AWSAccount struct {
 	UserID       uuid.UUID  `json:"user_id" db:"user_id"`
 	OrgID        *uuid.UUID `json:"org_id" db:"org_id"`
 	Label        string     `json:"label" db:"label"`
-	AWSAccountID string    `json:"aws_account_id" db:"aws_account_id"`
-	IAMRoleARN   string    `json:"iam_role_arn" db:"iam_role_arn"`
-	ExternalID   string    `json:"-" db:"external_id"` // STS external ID; per-tenant, not exposed in JSON
+	AWSAccountID string     `json:"aws_account_id" db:"aws_account_id"`
+	IAMRoleARN   string     `json:"iam_role_arn" db:"iam_role_arn"`
+	ExternalID   string     `json:"-" db:"external_id"` // STS external ID; per-tenant, not exposed in JSON
 	// CertificateARN is an optional ACM cert that enables HTTPS on the shared ALB
 	// for platform stacks provisioned in this account.
-	CertificateARN *string   `json:"certificate_arn,omitempty" db:"certificate_arn"`
-	CreatedAt      time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
+	CertificateARN *string `json:"certificate_arn,omitempty" db:"certificate_arn"`
+	// LastScannedAt is when the discovery scanner last ran for this account.
+	LastScannedAt *time.Time `json:"last_scanned_at" db:"last_scanned_at"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at" db:"updated_at"`
 }
 
 type Project struct {
@@ -527,6 +529,41 @@ func RoleRank(role string) int {
 // ValidRole reports whether the string is an assignable org role.
 func ValidRole(r string) bool {
 	return r == RoleAdmin || r == RoleEngineer || r == RoleViewer
+}
+
+// ─── Infrastructure discovery ────────────────────────────────────────────────
+
+// Discovered resource type constants.
+const (
+	ResourceECSService  = "ecs_service"
+	ResourceECSCluster  = "ecs_cluster"
+	ResourceRDSInstance = "rds_instance"
+	ResourceElastiCache = "elasticache_cluster"
+	ResourceLambda      = "lambda_function"
+	ResourceS3Bucket    = "s3_bucket"
+	ResourceALB         = "alb"
+	ResourceCloudFront  = "cloudfront_distribution"
+	ResourceSQSQueue    = "sqs_queue"
+	ResourceEC2Instance = "ec2_instance"
+)
+
+// DiscoveredResource is an AWS resource found in a connected account by the
+// discovery scanner. It may be OpsPilot-managed (is_managed, tagged ManagedBy=OpsPilot)
+// or pre-existing. project_id is nil until a user assigns it to a project.
+type DiscoveredResource struct {
+	ID           uuid.UUID      `json:"id" db:"id"`
+	OrgID        uuid.UUID      `json:"org_id" db:"org_id"`
+	AWSAccountID uuid.UUID      `json:"aws_account_id" db:"aws_account_id"`
+	ResourceType string         `json:"resource_type" db:"resource_type"`
+	ResourceID   string         `json:"resource_id" db:"resource_id"` // AWS ARN or native ID
+	ResourceName string         `json:"resource_name" db:"resource_name"`
+	Region       string         `json:"region" db:"region"`
+	Metadata     map[string]any `json:"metadata" db:"metadata"`
+	Tags         map[string]any `json:"tags" db:"tags"`
+	ProjectID    *uuid.UUID     `json:"project_id" db:"project_id"`
+	IsManaged    bool           `json:"is_managed" db:"is_managed"`
+	FirstSeenAt  time.Time      `json:"first_seen_at" db:"first_seen_at"`
+	LastSeenAt   time.Time      `json:"last_seen_at" db:"last_seen_at"`
 }
 
 // ValidFramework reports whether the string is a supported framework identifier.

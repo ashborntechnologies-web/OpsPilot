@@ -122,6 +122,23 @@ account/ARN for the bootstrap template + same-account AssumeRole.
   (for runtime failures) enqueues a diagnosis. `EmitAccount` for pre-project audit
   events. **HTTP:** `HandleGetDeploymentEvents`, `HandleGetProjectEvents`.
 
+## `internal/discovery` — AWS infrastructure discovery
+- **Purpose:** scan connected AWS accounts for existing resources so users onboard
+  without migration. See ADR-010 and the ARCHITECTURE discovery flow.
+- **Files:** `clients.go` (`ScanClients` — ECS/ELB/RDS/ElastiCache/Lambda/S3/SQS built
+  from an assumed-role config), `service.go` (scan orchestration + 7 scanners + upsert),
+  `handlers.go` (HTTP + `ScanEnqueuer` seam).
+- **Key methods:** `ScanAccountByID` (resolve regions → assume role per region →
+  `ScanAccount`), `ScanAccount` (run scanners in parallel, isolated, then idempotent
+  `upsert`), `ScanAllAccounts` (daily fan-out), scanners `ScanECSServices`/`ScanRDSInstances`/
+  `ScanElastiCache`/`ScanLambda`/`ScanS3`/`ScanALBs`/`ScanSQS`.
+- **Handlers:** `HandleScanAccount` (POST /aws-accounts/:id/scan, engineer+),
+  `HandleListOrgResources` (GET /orgs/:orgId/resources + filters), `HandleListProjectResources`
+  (GET /projects/:id/resources), `HandleAssignResource` (PATCH /resources/:id/assign).
+- **Depends on:** `aws` (assumed-role config + region enumeration), `awstags` (ManagedBy
+  detection), `models`, AWS SDK v2 (rds/elasticache/lambda/s3/sqs/ecs/elbv2). Consumed by
+  `queue` (scan jobs) and `monitor` (discovered ECS services).
+
 ## `internal/monitor` — continuous monitoring + alerts
 - **Files:** `poller.go`, `logscanner.go`, `alerts.go`, `handlers.go`, `monitor_test.go`.
 - **`Poller`** (every 60s, one worker per ready env): ECS `ServiceHealth` + `ALBMetrics`

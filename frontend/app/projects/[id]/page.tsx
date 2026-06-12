@@ -26,11 +26,13 @@ import {
   terminalWsURL, getProjectCosts, enablePreviews, disablePreviews,
   getHealthScore, listAlerts, snoozeAlert, resolveAlert, cancelDeployment,
   updateProject, getMe, updateNotificationPrefs, deleteProject,
+  listProjectResources,
 } from "@/lib/api";
 import { StatusSidebar } from "@/components/project/status-sidebar";
 import { AlertsPanel } from "@/components/project/alerts-panel";
 import { useActiveOrg } from "@/lib/use-org";
-import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar, Webhook, CostSummary, Alert, RiskScore, UserMe } from "@/types/api";
+import { RESOURCE_ICONS, resourceLabel, resourceStatus } from "@/lib/resources";
+import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar, Webhook, CostSummary, Alert, RiskScore, UserMe, DiscoveredResource } from "@/types/api";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
@@ -233,6 +235,9 @@ export default function ProjectPage() {
 
   // cost intelligence
   const [costs, setCosts] = useState<CostSummary | null>(null);
+  // infrastructure (assigned discovered + managed resources)
+  const [resources, setResources] = useState<DiscoveredResource[] | null>(null);
+  const [loadingResources, setLoadingResources] = useState(false);
   const [loadingCosts, setLoadingCosts] = useState(false);
 
   // PR previews
@@ -884,6 +889,19 @@ export default function ProjectPage() {
     }
   }
 
+  async function loadResources() {
+    const token = await getToken();
+    if (!token) return;
+    setLoadingResources(true);
+    try {
+      setResources(await listProjectResources(token, id));
+    } catch {
+      toast.error("Failed to load infrastructure");
+    } finally {
+      setLoadingResources(false);
+    }
+  }
+
   async function handleTogglePreviews() {
     if (blockIfViewer()) return;
     const token = await getToken();
@@ -1192,6 +1210,7 @@ export default function ProjectPage() {
             <TabsTrigger value="env-vars" onClick={() => fetchEnvVars()}>Env Vars</TabsTrigger>
             <TabsTrigger value="terminal">Terminal</TabsTrigger>
             <TabsTrigger value="webhooks" onClick={() => loadHooks()}>Webhooks</TabsTrigger>
+            <TabsTrigger value="infrastructure" onClick={() => loadResources()}>Infrastructure</TabsTrigger>
             <TabsTrigger value="costs" onClick={() => loadCosts()}>Costs</TabsTrigger>
             <TabsTrigger value="settings">Settings</TabsTrigger>
           </TabsList>
@@ -2080,6 +2099,66 @@ export default function ProjectPage() {
               )}
             </div>
           </TabsContent>
+
+          {/* ── Infrastructure (assigned managed + discovered resources) ── */}
+          <TabsContent value="infrastructure">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-medium">Infrastructure</p>
+                  <p className="text-xs text-muted-foreground">
+                    AWS resources assigned to this project — OpsPilot-managed and discovered.
+                    Assign more from the{" "}
+                    <Link href="/orgs/resources" className="text-indigo-600 hover:underline">inventory</Link>.
+                  </p>
+                </div>
+                <Button size="sm" variant="outline" onClick={loadResources} disabled={loadingResources}>
+                  {loadingResources ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5 mr-1" />}
+                  Refresh
+                </Button>
+              </div>
+
+              {loadingResources && resources === null ? (
+                <div className="flex items-center justify-center py-12">
+                  <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+                </div>
+              ) : (resources ?? []).length === 0 ? (
+                <Card className="border-dashed">
+                  <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+                    <Cloud className="h-10 w-10 text-zinc-300 mb-3" />
+                    <p className="font-medium text-sm">No infrastructure assigned</p>
+                    <p className="text-muted-foreground text-xs mt-1">
+                      Discovered AWS resources you assign to this project will show here.
+                    </p>
+                  </CardContent>
+                </Card>
+              ) : (
+                <div className="rounded-lg border bg-white divide-y">
+                  {(resources ?? []).map((r) => {
+                    const Icon = RESOURCE_ICONS[r.resource_type] ?? Cloud;
+                    return (
+                      <div key={r.id} className="flex items-center gap-3 px-4 py-2.5">
+                        <Icon className="h-4 w-4 text-zinc-500 shrink-0" />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium truncate">{r.resource_name || r.resource_id}</span>
+                            {r.is_managed && (
+                              <span className="rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700">OpsPilot</span>
+                            )}
+                          </div>
+                          <p className="text-xs text-muted-foreground">
+                            {resourceLabel(r.resource_type)} · {r.region || "global"}
+                          </p>
+                        </div>
+                        <Badge variant="outline" className="text-xs capitalize shrink-0">{resourceStatus(r)}</Badge>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </TabsContent>
+
           {/* ── Costs ── */}
           <TabsContent value="costs">
             <div className="space-y-5">

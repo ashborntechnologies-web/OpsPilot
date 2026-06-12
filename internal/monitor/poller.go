@@ -87,31 +87,69 @@ func (p *Poller) Stop() {
 	p.cancel()
 }
 
+// monitoredEnv is a single target a monitor worker watches. It is either an OpsPilot
+// environment (discovered=false; runtime refs loaded from the environments table) or a
+// discovered ECS service assigned to a project (discovered=true; cluster/service/region/
+// account carried inline from discovered_resources).
 type monitoredEnv struct {
-	id        uuid.UUID
+	id        uuid.UUID // environment id, or discovered_resources id when discovered
 	projectID uuid.UUID
 	name      string
+
+	discovered  bool
+	accountID   *uuid.UUID
+	region      string
+	clusterName string
+	serviceName string
+	logGroup    string
 }
 
-// readyEnvironments lists non-preview environments eligible for monitoring.
+// readyEnvironments lists monitoring targets: ready non-preview environments plus
+// discovered ECS services that a user has assigned to a project (so alerts have a home).
 func (p *Poller) readyEnvironments(ctx context.Context) ([]monitoredEnv, error) {
+	var envs []monitoredEnv
+
 	rows, err := p.db.Pool.Query(ctx,
 		`SELECT id, project_id, name FROM environments
 		 WHERE stack_status = 'ready' AND is_preview = false`)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var envs []monitoredEnv
 	for rows.Next() {
 		var e monitoredEnv
-		if err := rows.Scan(&e.id, &e.projectID, &e.name); err != nil {
+		if err := rows.Scan(&e.id, &e.projectID, &e.name); err == nil {
+			envs = append(envs, e)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Discovered ECS services assigned to a project.
+	drows, err := p.db.Pool.Query(ctx,
+		`SELECT id, project_id, resource_name, aws_account_id, region,
+		        COALESCE(metadata->>'cluster_name',''), COALESCE(metadata->>'service_name','')
+		 FROM discovered_resources
+		 WHERE resource_type = 'ecs_service' AND project_id IS NOT NULL`)
+	if err != nil {
+		return envs, nil // environments still monitored even if discovery query fails
+	}
+	defer drows.Close()
+	for drows.Next() {
+		var e monitoredEnv
+		var acct uuid.UUID
+		if err := drows.Scan(&e.id, &e.projectID, &e.name, &acct, &e.region, &e.clusterName, &e.serviceName); err != nil {
 			continue
 		}
+		if e.clusterName == "" || e.serviceName == "" {
+			continue
+		}
+		e.discovered = true
+		e.accountID = &acct
 		envs = append(envs, e)
 	}
-	return envs, rows.Err()
+	return envs, nil
 }
 
 // syncWorkers reconciles running workers with the current set of ready
@@ -184,6 +222,25 @@ func (p *Poller) safePoll(ctx context.Context, env monitoredEnv) {
 func (p *Poller) pollOnce(ctx context.Context, env monitoredEnv) error {
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
+
+	// Discovered ECS service: assume the account role for its region and check health
+	// directly. No ALB metrics (we don't know the load balancer), so only task
+	// up/degraded/recovered transitions are evaluated.
+	if env.discovered {
+		if env.accountID == nil || env.clusterName == "" || env.serviceName == "" {
+			return nil
+		}
+		clients, err := p.awsSvc.AssumeRoleForAccountAndRegion(ctx, *env.accountID, env.region)
+		if err != nil {
+			return err
+		}
+		health, err := p.awsSvc.DescribeECSService(ctx, clients, env.clusterName, env.serviceName)
+		if err != nil {
+			return err
+		}
+		p.evaluate(ctx, env, health, &awssvc.ALBMetrics{})
+		return nil
+	}
 
 	// Load runtime references (cluster from platform stack, ALB/TG ARNs).
 	var (

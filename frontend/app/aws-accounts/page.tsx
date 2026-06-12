@@ -8,15 +8,25 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ConnectAWSModal } from "@/components/project/connect-aws-modal";
-import { listAWSAccounts, deleteAWSAccount } from "@/lib/api";
-
+import { listAWSAccounts, deleteAWSAccount, scanAccount } from "@/lib/api";
+import Link from "next/link";
 import { toast } from "sonner";
-import { Plus, Trash2, Cloud, Loader2 } from "lucide-react";
+import { Plus, Trash2, Cloud, Loader2, RefreshCw, Boxes } from "lucide-react";
+
+function timeAgo(iso: string | null): string {
+  if (!iso) return "never scanned";
+  const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return "scanned just now";
+  if (s < 3600) return `scanned ${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `scanned ${Math.floor(s / 3600)}h ago`;
+  return `scanned ${Math.floor(s / 86400)}d ago`;
+}
 
 export default function AWSAccountsPage() {
   const { getToken } = useAuth();
   const [connectOpen, setConnectOpen] = useState(false);
   const [deleting, setDeleting] = useState<string | null>(null);
+  const [scanning, setScanning] = useState<string | null>(null);
 
   const {
     data: accounts = [],
@@ -29,6 +39,20 @@ export default function AWSAccountsPage() {
   }, {
     onError: () => toast.error("Failed to load AWS accounts"),
   });
+
+  async function handleScan(id: string) {
+    const token = await getToken();
+    if (!token) return;
+    setScanning(id);
+    try {
+      await scanAccount(token, id);
+      toast.success("Scan started — discovered resources will appear shortly.");
+    } catch (e: unknown) {
+      toast.error((e as Error).message ?? "Failed to start scan");
+    } finally {
+      setScanning(null);
+    }
+  }
 
   async function handleDelete(id: string) {
     const account = accounts.find((a) => a.id === id);
@@ -128,6 +152,28 @@ export default function AWSAccountsPage() {
                   <p className="text-xs text-muted-foreground font-mono truncate">
                     {account.iam_role_arn}
                   </p>
+                  <div className="mt-3 flex items-center justify-between gap-2 flex-wrap">
+                    <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                      <Link href="/orgs/resources" className="inline-flex items-center gap-1 hover:text-foreground">
+                        <Boxes className="h-3.5 w-3.5" />
+                        {account.resource_count ?? 0} resource{(account.resource_count ?? 0) === 1 ? "" : "s"}
+                      </Link>
+                      <span>·</span>
+                      <span>{timeAgo(account.last_scanned_at)}</span>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs"
+                      disabled={scanning === account.id}
+                      onClick={() => handleScan(account.id)}
+                    >
+                      {scanning === account.id
+                        ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+                        : <RefreshCw className="h-3.5 w-3.5 mr-1" />}
+                      Scan now
+                    </Button>
+                  </div>
                 </CardContent>
               </Card>
             ))}

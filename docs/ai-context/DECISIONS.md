@@ -204,6 +204,45 @@ UI. The WS layer authenticates on membership; viewer action-intents are blocked 
 
 ---
 
+## ADR-010 — Infrastructure discovery: scan-on-connect + daily refresh
+**Date:** 2026-06-12 · **Status:** Accepted
+
+**Decision.** Discover existing AWS infrastructure by **scanning a connected account
+immediately on connect**, on demand via a button, and on a **24-hour scheduled refresh**.
+Results are upserted into `discovered_resources` (idempotent), scanners run in parallel
+and independently, and discovered ECS services assigned to a project join the monitor.
+
+**Context.** Users have existing AWS workloads. Requiring migration into OpsPilot-created
+environments is a hard adoption blocker; they need to *see and operate* what they already
+run. Discovery must be cheap, safe (read-only), and never block the connect flow.
+
+**Alternatives.**
+- *Continuous/streaming discovery (CloudTrail/EventBridge)* — rejected for v1: heavy to
+  set up in the customer account, more IAM surface; a periodic pull is far simpler and
+  good enough for an inventory that changes slowly.
+- *Scan only on demand* — rejected: users expect to see resources right after connecting;
+  scan-on-connect powers that first-run "aha".
+- *Scan all ~30 AWS regions every time* — rejected: slow and wasteful. We scan the regions
+  the account is actually used in (envs + platform stacks), defaulting to us-east-1.
+- *One giant scheduled job* — rejected: the daily `scan_all` fans out to one async job
+  per account so a slow/failing account doesn't block the rest.
+
+**Rationale.** Scan-on-connect maximizes first-run value; the daily refresh keeps the
+inventory current without user effort; idempotent upserts (keyed by
+`org_id, resource_type, resource_id`) make re-scans safe and preserve the user's
+`project_id` assignments. Parallel, isolated scanners mean a single missing IAM
+permission degrades to "that resource type is missing", not a failed scan.
+
+**Impact.** New `internal/discovery` package (clients + 7 scanners + handlers); AWS
+service gains `AssumeRoleConfigForAccount`/`AssumeRoleForAccountAndRegion`/`AccountRegions`/
+`onAccountConnected`; queue gains `TaskScan`/`TaskScanAll` + daily schedule; monitor
+poller/log-scanner include assigned discovered ECS services; frontend inventory +
+per-project Infrastructure tab + account scan controls. **Dependency:** discovery needs
+read-only Describe/List IAM permissions the bootstrap role may not yet grant (tracked in
+CURRENT_STATE).
+
+---
+
 ## ADR-008 — Tenant isolation via one ownership middleware
 **Date:** 2025-Q4 · **Status:** Superseded by ADR-009 (RBAC/org membership replaces
 single-user ownership; the "one middleware guard" principle carries forward)

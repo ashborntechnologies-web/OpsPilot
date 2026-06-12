@@ -41,11 +41,12 @@ import (
 )
 
 type Service struct {
-	db                *models.DB
-	platformAccountID string          // AWS account ID of the entity running ConvDeploy
-	platformCallerARN string          // full ARN of the entity running ConvDeploy (user or role)
-	events            *events.Service // optional; set via SetEvents for audit events
-	onEnvCreated      func(projectID, environmentID uuid.UUID)
+	db                 *models.DB
+	platformAccountID  string          // AWS account ID of the entity running ConvDeploy
+	platformCallerARN  string          // full ARN of the entity running ConvDeploy (user or role)
+	events             *events.Service // optional; set via SetEvents for audit events
+	onEnvCreated       func(projectID, environmentID uuid.UUID)
+	onAccountConnected func(orgID, accountID uuid.UUID) // optional; triggers initial discovery scan
 }
 
 // SetEvents injects the operational-event service so account-level actions
@@ -601,25 +602,33 @@ func (s *Service) HandleListAWSAccounts(c *gin.Context) {
 	}
 
 	rows, err := s.db.Pool.Query(c.Request.Context(),
-		`SELECT id, user_id, org_id, label, aws_account_id, iam_role_arn, created_at, updated_at
-		 FROM aws_accounts WHERE org_id = $1 ORDER BY created_at ASC`, orgID)
+		`SELECT a.id, a.user_id, a.org_id, a.label, a.aws_account_id, a.iam_role_arn,
+		        a.last_scanned_at, a.created_at, a.updated_at,
+		        COALESCE(r.cnt, 0) AS resource_count
+		 FROM aws_accounts a
+		 LEFT JOIN (
+		     SELECT aws_account_id, COUNT(*) AS cnt FROM discovered_resources GROUP BY aws_account_id
+		 ) r ON r.aws_account_id = a.id
+		 WHERE a.org_id = $1 ORDER BY a.created_at ASC`, orgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch AWS accounts"})
 		return
 	}
 	defer rows.Close()
 
-	var accounts []models.AWSAccount
+	// Response embeds the account plus discovery-related UI fields.
+	type accountWithDiscovery struct {
+		models.AWSAccount
+		ResourceCount int `json:"resource_count"`
+	}
+	accounts := []accountWithDiscovery{}
 	for rows.Next() {
-		var a models.AWSAccount
-		if err := rows.Scan(&a.ID, &a.UserID, &a.OrgID, &a.Label, &a.AWSAccountID, &a.IAMRoleARN, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		var a accountWithDiscovery
+		if err := rows.Scan(&a.ID, &a.UserID, &a.OrgID, &a.Label, &a.AWSAccountID, &a.IAMRoleARN,
+			&a.LastScannedAt, &a.CreatedAt, &a.UpdatedAt, &a.ResourceCount); err != nil {
 			continue
 		}
 		accounts = append(accounts, a)
-	}
-
-	if accounts == nil {
-		accounts = []models.AWSAccount{}
 	}
 	c.JSON(http.StatusOK, accounts)
 }
@@ -723,6 +732,12 @@ func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 		s.events.EmitAccount(c.Request.Context(), account.ID, models.EventExternalIDGenerated,
 			models.SeverityInfo, models.SourceDeployer,
 			map[string]any{"per_tenant": perTenant, "aws_account_id": req.AWSAccountID})
+	}
+
+	// Kick off an initial discovery scan so the user immediately sees their existing
+	// infrastructure (best-effort; runs async).
+	if s.onAccountConnected != nil {
+		s.onAccountConnected(orgID, account.ID)
 	}
 
 	c.JSON(http.StatusCreated, account)
@@ -1356,6 +1371,98 @@ func (s *Service) AssumeRoleForAccount(ctx context.Context, iamRoleARN, external
 		externalID = LegacyExternalID
 	}
 	return s.assumeRole(ctx, iamRoleARN, region, "cleanup", externalID)
+}
+
+// accountCreds loads the IAM role ARN and external ID for an AWS account.
+func (s *Service) accountCreds(ctx context.Context, accountID uuid.UUID) (iamRoleARN, externalID string, err error) {
+	err = s.db.Pool.QueryRow(ctx,
+		`SELECT iam_role_arn, external_id FROM aws_accounts WHERE id = $1`, accountID,
+	).Scan(&iamRoleARN, &externalID)
+	if externalID == "" {
+		externalID = LegacyExternalID
+	}
+	return iamRoleARN, externalID, err
+}
+
+// AssumeRoleForAccountAndRegion returns a full ClientBundle for an account in a
+// specific region. Used by the monitor to poll discovered ECS services that are not
+// tied to an OpsPilot environment.
+func (s *Service) AssumeRoleForAccountAndRegion(ctx context.Context, accountID uuid.UUID, region string) (*ClientBundle, error) {
+	iamRoleARN, externalID, err := s.accountCreds(ctx, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS account %s: %w", accountID, err)
+	}
+	return s.assumeRole(ctx, iamRoleARN, region, "monitor", externalID)
+}
+
+// AssumeRoleConfigForAccount returns the assumed-role aws.Config for an account in a
+// region, so callers (the discovery scanner) can build their own SDK clients for
+// services not present in ClientBundle (RDS, ElastiCache, Lambda, S3, SQS).
+func (s *Service) AssumeRoleConfigForAccount(ctx context.Context, accountID uuid.UUID, region string) (aws.Config, error) {
+	iamRoleARN, externalID, err := s.accountCreds(ctx, accountID)
+	if err != nil {
+		return aws.Config{}, fmt.Errorf("load AWS account %s: %w", accountID, err)
+	}
+	return s.assumeRoleConfig(ctx, iamRoleARN, region, "discovery", externalID)
+}
+
+// assumeRoleConfig mirrors assumeRole but returns the raw assumed-role config instead
+// of a ClientBundle. It verifies the role can be assumed up front (eager Retrieve).
+func (s *Service) assumeRoleConfig(ctx context.Context, iamRoleARN, region, sessionSuffix, externalID string) (aws.Config, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		return aws.Config{}, fmt.Errorf("failed to load AWS config: %w", err)
+	}
+	provider := stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), iamRoleARN, func(o *stscreds.AssumeRoleOptions) {
+		o.RoleSessionName = fmt.Sprintf("convdeploy-%s", sessionSuffix)
+		o.ExternalID = aws.String(externalID)
+	})
+	if _, err := provider.Retrieve(ctx); err != nil {
+		return aws.Config{}, s.explainAssumeRoleError(err, iamRoleARN)
+	}
+	return config.LoadDefaultConfig(ctx,
+		config.WithRegion(region),
+		config.WithCredentialsProvider(aws.NewCredentialsCache(provider)),
+	)
+}
+
+// AccountRegions returns the distinct AWS regions an account is used in (its
+// environments and platform stacks), defaulting to us-east-1 when the account has no
+// resources yet (e.g. freshly connected). This bounds the discovery scan to regions
+// the customer actually uses rather than all ~30 AWS regions.
+func (s *Service) AccountRegions(ctx context.Context, accountID uuid.UUID) ([]string, error) {
+	rows, err := s.db.Pool.Query(ctx, `
+		SELECT DISTINCT region FROM (
+			SELECT e.aws_region AS region FROM environments e WHERE e.account_id = $1
+			UNION
+			SELECT ps.aws_region AS region FROM platform_stacks ps WHERE ps.account_id = $1
+		) r WHERE region IS NOT NULL AND region <> ''`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var regions []string
+	for rows.Next() {
+		var r string
+		if rows.Scan(&r) == nil && r != "" {
+			regions = append(regions, r)
+		}
+	}
+	if len(regions) == 0 {
+		regions = []string{"us-east-1"}
+	}
+	return regions, rows.Err()
+}
+
+// MarkAccountScanned records that the discovery scanner just completed for an account.
+func (s *Service) MarkAccountScanned(ctx context.Context, accountID uuid.UUID) {
+	_, _ = s.db.Pool.Exec(ctx, `UPDATE aws_accounts SET last_scanned_at = NOW() WHERE id = $1`, accountID)
+}
+
+// SetOnAccountConnected registers a callback invoked after an AWS account is
+// successfully connected — used to enqueue an initial discovery scan. Non-blocking.
+func (s *Service) SetOnAccountConnected(fn func(orgID, accountID uuid.UUID)) {
+	s.onAccountConnected = fn
 }
 
 // ServiceHealth is a point-in-time snapshot of an ECS service's runtime state.

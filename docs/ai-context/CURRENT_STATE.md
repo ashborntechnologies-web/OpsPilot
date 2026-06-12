@@ -28,6 +28,18 @@ Status is derived from the code on `main`, not from plans.
   near-duplicate merging.
 - Pre-deploy risk score (advisory, broadcast as `deploy_risk`) + deployment health score.
 
+**Infrastructure discovery**
+- Scans connected AWS accounts for existing resources (ECS services/clusters, RDS,
+  ElastiCache, Lambda, S3, ALBs, SQS) so users onboard without migration. Parallel,
+  isolated scanners; idempotent upsert into `discovered_resources`; `ManagedBy=OpsPilot`
+  → `is_managed`.
+- Triggered automatically on AWS-account connect, on demand (`POST /aws-accounts/:id/scan`),
+  and daily via the scheduler. Inventory view (`/orgs/resources`) with type/region
+  filters + assign-to-project; per-project Infrastructure tab; scan status on the
+  AWS-accounts page.
+- Discovered ECS services **assigned to a project** are monitored (health poll + log
+  anomaly scan) like OpsPilot-created environments.
+
 **Continuous monitoring**
 - Poller (ECS/ALB health, 60s) + LogScanner (CloudWatch anomaly patterns, 5m) →
   `runtime.*` operational events.
@@ -92,6 +104,15 @@ Status is derived from the code on `main`, not from plans.
 - Role-aware dashboard guards the action **handlers** + shows a view-only banner;
   per-button `disabled` styling across every control is a follow-up (backend enforces
   regardless, so viewers always get 403).
+- **Discovery scan depends on IAM permissions:** the assumed bootstrap role must allow
+  the read-only `Describe*`/`List*` calls (RDS, ElastiCache, Lambda, S3, SQS, ELBv2,
+  ECS). The current bootstrap template may not grant all of these — missing permissions
+  cause individual scanners to log + skip (no crash). Updating the template's policy is
+  a follow-up.
+- Discovery scans only the regions an account is already used in (env + platform stacks),
+  defaulting to `us-east-1` for a fresh account. `cloudfront_distribution`/`ec2_instance`
+  types are defined but have no dedicated scanner yet. Only discovered **ECS services**
+  feed the monitor.
 
 ## 🔭 Actively developing
 Continuous-operation intelligence (monitoring → alert → diagnosis → memory loop) and

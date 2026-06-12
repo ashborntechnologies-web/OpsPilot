@@ -234,6 +234,34 @@ project-specific over time. This is the system's learning loop.
 
 ---
 
+## Infrastructure discovery flow
+
+Lets users onboard **existing** AWS infrastructure (not created by OpsPilot) without
+migration. See `internal/discovery` and ADR-010.
+
+```mermaid
+graph TB
+  CONNECT["AWS account connected"] -->|onAccountConnected| ENQ1["queue: EnqueueScan"]
+  SCHED["Scheduler @every 24h → scan_all"] -->|per account| ENQ1
+  BTN["POST /aws-accounts/:id/scan (engineer+)"] --> ENQ1
+  ENQ1 --> WORKER["Asynq handleScan"]
+  WORKER --> SAI["discovery.ScanAccountByID"]
+  SAI -->|AccountRegions + AssumeRoleConfigForAccount| SCAN["ScanAccount (per region)"]
+  SCAN -->|parallel, isolated| SC["ScanECSServices / RDS / ElastiCache /\nLambda / S3 / ALBs / SQS"]
+  SC -->|upsert org_id,type,resource_id| DR[(discovered_resources)]
+  DR -->|GET /orgs/:orgId/resources| INV["inventory UI"]
+  DR -->|PATCH /resources/:id/assign| ASSIGN["assign to project"]
+  ASSIGN --> MON["monitor poller + logscanner include\nassigned discovered ECS services"]
+```
+
+Scanners run in parallel and are independent — one failing (missing IAM permission,
+throttling) does not stop the others. Re-scans are idempotent (upsert keyed by
+`org_id, resource_type, resource_id`), refreshing `last_seen_at`/metadata/tags without
+disturbing the user's `project_id` assignment. Resources tagged `ManagedBy=OpsPilot`
+are flagged `is_managed`. Discovered ECS services **assigned to a project** are pulled
+into the monitor's worker set (health poll + log anomaly scan), so pre-existing services
+get the same alerting as OpsPilot-created ones.
+
 ## Monitoring & alerting flow
 
 ```mermaid

@@ -9,6 +9,7 @@ import (
 
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/discovery"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
@@ -22,6 +23,8 @@ const (
 	TaskRollback      = "rollback:run"
 	TaskWatchdog      = "watchdog:run"
 	TaskDeleteProject = "project:delete"
+	TaskScan          = "discovery:scan"     // scan one AWS account
+	TaskScanAll       = "discovery:scan_all" // enqueue a scan for every account (daily)
 )
 
 type DeployPayload struct {
@@ -55,15 +58,20 @@ type ProvisionPayload struct {
 	EnvironmentID string `json:"environment_id"`
 }
 
+type ScanPayload struct {
+	AccountID string `json:"account_id"`
+}
+
 // Server runs Asynq workers that process background jobs.
 type Server struct {
 	server       *asynq.Server
 	mux          *asynq.ServeMux
 	deploySvc    *deploy.Service
 	diagnosisSvc *diagnosis.Service
+	discoverySvc *discovery.Service
 }
 
-func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnosis.Service) *Server {
+func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnosis.Service, discoverySvc *discovery.Service) *Server {
 	srv := asynq.NewServer(
 		asynq.RedisClientOpt{Addr: redisURL},
 		asynq.Config{
@@ -80,6 +88,7 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 		mux:          asynq.NewServeMux(),
 		deploySvc:    deploySvc,
 		diagnosisSvc: diagnosisSvc,
+		discoverySvc: discoverySvc,
 	}
 
 	s.mux.HandleFunc(TaskDeploy, s.handleDeploy)
@@ -88,6 +97,8 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 	s.mux.HandleFunc(TaskRollback, s.handleRollback)
 	s.mux.HandleFunc(TaskWatchdog, s.handleWatchdog)
 	s.mux.HandleFunc(TaskDeleteProject, s.handleDeleteProject)
+	s.mux.HandleFunc(TaskScan, s.handleScan)
+	s.mux.HandleFunc(TaskScanAll, s.handleScanAll)
 
 	return s
 }
@@ -221,6 +232,26 @@ func (s *Server) handleWatchdog(ctx context.Context, _ *asynq.Task) error {
 	return s.deploySvc.ReconcileStuckResources(ctx)
 }
 
+// handleScan runs a full discovery scan of one AWS account.
+func (s *Server) handleScan(ctx context.Context, t *asynq.Task) error {
+	var p ScanPayload
+	if err := json.Unmarshal(t.Payload(), &p); err != nil {
+		return fmt.Errorf("%w: unmarshal scan payload: %w", asynq.SkipRetry, err)
+	}
+	accountID, err := uuid.Parse(p.AccountID)
+	if err != nil {
+		return fmt.Errorf("%w: invalid account ID: %w", asynq.SkipRetry, err)
+	}
+	slog.Info(fmt.Sprintf("[discovery] scanning account=%s", p.AccountID[:8]))
+	return s.discoverySvc.ScanAccountByID(ctx, accountID)
+}
+
+// handleScanAll fans out a per-account scan for every connected account. Enqueued daily
+// by the Scheduler.
+func (s *Server) handleScanAll(ctx context.Context, _ *asynq.Task) error {
+	return s.discoverySvc.ScanAllAccounts(ctx)
+}
+
 func (s *Server) handleDiagnose(ctx context.Context, t *asynq.Task) error {
 	var p DiagnosePayload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
@@ -299,6 +330,21 @@ func NewWatchdogTask() *asynq.Task {
 	return asynq.NewTask(TaskWatchdog, nil, asynq.Queue("default"), asynq.MaxRetry(0))
 }
 
+func NewScanTask(accountID string) (*asynq.Task, error) {
+	payload, err := json.Marshal(ScanPayload{AccountID: accountID})
+	if err != nil {
+		return nil, err
+	}
+	// One retry — a scan is idempotent (upserts), so a transient AWS/throttle error
+	// is worth retrying once, but not looping.
+	return asynq.NewTask(TaskScan, payload, asynq.Queue("default"), asynq.MaxRetry(1)), nil
+}
+
+func NewScanAllTask() *asynq.Task {
+	// Fan-out task — idempotent; the next daily tick covers any miss.
+	return asynq.NewTask(TaskScanAll, nil, asynq.Queue("default"), asynq.MaxRetry(0))
+}
+
 func NewDiagnoseTask(projectID, deploymentID string) (*asynq.Task, error) {
 	payload, err := json.Marshal(DiagnosePayload{
 		ProjectID:    projectID,
@@ -325,9 +371,13 @@ func NewScheduler(redisURL string) *Scheduler {
 	return &Scheduler{s: asynq.NewScheduler(asynq.RedisClientOpt{Addr: redisURL}, nil)}
 }
 
-// Start registers the watchdog schedule and starts the scheduler in the background.
+// Start registers the periodic schedules (stuck-resource watchdog every 5m; discovery
+// scan-all every 24h) and starts the scheduler in the background.
 func (sc *Scheduler) Start() error {
 	if _, err := sc.s.Register("@every 5m", NewWatchdogTask()); err != nil {
+		return err
+	}
+	if _, err := sc.s.Register("@every 24h", NewScanAllTask()); err != nil {
 		return err
 	}
 	return sc.s.Start()
@@ -432,6 +482,20 @@ func (c *Client) EnqueueRollback(projectID, environmentID, deploymentID, previou
 	}
 	_, err = c.c.Enqueue(task)
 	return err
+}
+
+// EnqueueScan implements discovery.ScanEnqueuer — enqueues a scan of one AWS account
+// and returns the Asynq job ID.
+func (c *Client) EnqueueScan(accountID string) (string, error) {
+	task, err := NewScanTask(accountID)
+	if err != nil {
+		return "", err
+	}
+	info, err := c.c.Enqueue(task)
+	if err != nil {
+		return "", err
+	}
+	return info.ID, nil
 }
 
 // EnqueueDiagnose implements events.DiagnosisEnqueuer. Empty deploymentID means

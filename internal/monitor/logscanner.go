@@ -181,15 +181,34 @@ func (l *LogScanner) syncWorkers() {
 		slog.Error("logscanner: failed to list environments", "component", "monitor.logscanner", "error", err)
 		return
 	}
-	defer rows.Close()
 
 	current := make(map[uuid.UUID]monitoredEnv)
 	for rows.Next() {
 		var e monitoredEnv
-		if err := rows.Scan(&e.id, &e.projectID, &e.name); err != nil {
-			continue
+		if err := rows.Scan(&e.id, &e.projectID, &e.name); err == nil {
+			current[e.id] = e
 		}
-		current[e.id] = e
+	}
+	rows.Close()
+
+	// Discovered ECS services assigned to a project that expose a log group in metadata.
+	drows, err := l.db.Pool.Query(ctx,
+		`SELECT id, project_id, resource_name, aws_account_id, region, metadata->>'log_group_name'
+		 FROM discovered_resources
+		 WHERE resource_type = 'ecs_service' AND project_id IS NOT NULL
+		   AND metadata->>'log_group_name' IS NOT NULL AND metadata->>'log_group_name' <> ''`)
+	if err == nil {
+		for drows.Next() {
+			var e monitoredEnv
+			var acct uuid.UUID
+			if err := drows.Scan(&e.id, &e.projectID, &e.name, &acct, &e.region, &e.logGroup); err != nil {
+				continue
+			}
+			e.discovered = true
+			e.accountID = &acct
+			current[e.id] = e
+		}
+		drows.Close()
 	}
 
 	l.mu.Lock()
@@ -240,23 +259,38 @@ func (l *LogScanner) scanOnce(ctx context.Context, env monitoredEnv) error {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
-	var fullEnv models.Environment
-	err := l.db.Pool.QueryRow(ctx,
-		`SELECT id, project_id, account_id, aws_region, log_group_name
-		 FROM environments WHERE id = $1`, env.id,
-	).Scan(&fullEnv.ID, &fullEnv.ProjectID, &fullEnv.AccountID, &fullEnv.AWSRegion, &fullEnv.LogGroupName)
-	if err != nil {
-		return err
-	}
-	if fullEnv.LogGroupName == nil || fullEnv.AccountID == nil {
-		return nil
+	var logGroup string
+	var clients *awssvc.ClientBundle
+
+	if env.discovered {
+		if env.accountID == nil || env.logGroup == "" {
+			return nil
+		}
+		c, err := l.awsSvc.AssumeRoleForAccountAndRegion(ctx, *env.accountID, env.region)
+		if err != nil {
+			return err
+		}
+		clients, logGroup = c, env.logGroup
+	} else {
+		var fullEnv models.Environment
+		err := l.db.Pool.QueryRow(ctx,
+			`SELECT id, project_id, account_id, aws_region, log_group_name
+			 FROM environments WHERE id = $1`, env.id,
+		).Scan(&fullEnv.ID, &fullEnv.ProjectID, &fullEnv.AccountID, &fullEnv.AWSRegion, &fullEnv.LogGroupName)
+		if err != nil {
+			return err
+		}
+		if fullEnv.LogGroupName == nil || fullEnv.AccountID == nil {
+			return nil
+		}
+		c, err := l.awsSvc.AssumeRoleForEnvironment(ctx, &fullEnv)
+		if err != nil {
+			return err
+		}
+		clients, logGroup = c, *fullEnv.LogGroupName
 	}
 
-	clients, err := l.awsSvc.AssumeRoleForEnvironment(ctx, &fullEnv)
-	if err != nil {
-		return err
-	}
-	lines, err := l.awsSvc.FetchRecentECSLogs(ctx, clients, *fullEnv.LogGroupName, scanLogLines)
+	lines, err := l.awsSvc.FetchRecentECSLogs(ctx, clients, logGroup, scanLogLines)
 	if err != nil {
 		return err
 	}

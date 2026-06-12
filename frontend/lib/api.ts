@@ -509,3 +509,37 @@ export function acceptInvite(token: string, inviteToken: string) {
     `/invites/${inviteToken}`, token
   );
 }
+
+// ---- Infrastructure discovery --------------------------------------------------
+
+import type { DiscoveredResource, ResourceType } from "@/types/api";
+
+export function scanAccount(token: string, accountId: string) {
+  return request<{ job_id: string; message: string }>(
+    `/aws-accounts/${accountId}/scan`, token, { method: "POST" }
+  );
+}
+
+export function listOrgResources(
+  token: string,
+  orgId: string,
+  filters?: { resource_type?: ResourceType | ""; region?: string; project_id?: string }
+) {
+  const qs = new URLSearchParams();
+  if (filters?.resource_type) qs.set("resource_type", filters.resource_type);
+  if (filters?.region) qs.set("region", filters.region);
+  if (filters?.project_id) qs.set("project_id", filters.project_id);
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return request<DiscoveredResource[]>(`/orgs/${orgId}/resources${suffix}`, token);
+}
+
+export function listProjectResources(token: string, projectId: string) {
+  return request<DiscoveredResource[]>(`/projects/${projectId}/resources`, token);
+}
+
+export function assignResource(token: string, resourceId: string, projectId: string | null) {
+  return request<{ message: string; project_id: string | null }>(
+    `/resources/${resourceId}/assign`, token,
+    { method: "PATCH", body: JSON.stringify({ project_id: projectId }) }
+  );
+}

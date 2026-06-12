@@ -19,6 +19,7 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/conversation"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/discovery"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/envvars"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/export"
@@ -235,6 +236,17 @@ func main() {
 	// Organizations (team workspaces) + RBAC.
 	orgsSvc := orgs.NewService(db, emailSvc, os.Getenv("FRONTEND_URL"))
 
+	// Infrastructure discovery — scans connected AWS accounts for existing resources.
+	discoverySvc := discovery.NewService(db, awsSvc)
+	discoverySvc.SetEnqueuer(queueClient)
+
+	// When an AWS account is connected, kick off an initial discovery scan.
+	awsSvc.SetOnAccountConnected(func(orgID, accountID uuid.UUID) {
+		if _, err := queueClient.EnqueueScan(accountID.String()); err != nil {
+			slog.Error(fmt.Sprintf("failed to enqueue initial scan for account %s: %v", accountID, err))
+		}
+	})
+
 	deploySvc.SetEmailService(emailSvc)
 	deploySvc.SetMemoryService(memorySvc)
 	deploySvc.SetRiskLLM(llm.New(os.Getenv("ANTHROPIC_API_KEY")))
@@ -256,6 +268,7 @@ func main() {
 		os.Getenv("REDIS_URL"),
 		deploySvc,
 		diagnosisSvc,
+		discoverySvc,
 	)
 	go queueServer.Start()
 	defer queueServer.Stop()
@@ -354,6 +367,10 @@ func main() {
 		protected.POST("/aws-accounts", awsSvc.HandleConnectAWSAccount)
 		protected.DELETE("/aws-accounts/:id", awsSvc.HandleDeleteAWSAccount)
 
+		// Infrastructure discovery (org/role enforced inside the handlers).
+		protected.POST("/aws-accounts/:id/scan", discoverySvc.HandleScanAccount)
+		protected.PATCH("/resources/:resourceId/assign", discoverySvc.HandleAssignResource)
+
 		// Organizations (team workspaces)
 		protected.POST("/orgs", orgsSvc.HandleCreateOrg)
 		protected.GET("/orgs/me", orgsSvc.HandleListMyOrgs)
@@ -369,6 +386,7 @@ func main() {
 	org.Use(middleware.RequireOrgMembership(db)) // any member; per-route role below
 	{
 		org.GET("/members", orgsSvc.HandleListMembers)
+		org.GET("/resources", discoverySvc.HandleListOrgResources) // discovered resource inventory
 		org.POST("/invites", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleCreateInvite)
 		org.PATCH("/members/:userId", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleUpdateMemberRole)
 		org.DELETE("/members/:userId", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleRemoveMember)
@@ -403,6 +421,7 @@ func main() {
 		proj.GET("/diagnose/feedback-summary", diagnosisSvc.HandleFeedbackSummary)
 		proj.GET("/costs", deploySvc.HandleGetCosts)
 		proj.GET("/health-score", deploySvc.HandleGetHealthScore)
+		proj.GET("/resources", discoverySvc.HandleListProjectResources)
 		proj.GET("/conversation/history", conversationSvc.HandleHistory)
 
 		// Engineer actions — deploy, rollback, scale, env vars, alerts, chat, webhooks.

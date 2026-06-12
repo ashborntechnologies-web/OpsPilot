@@ -12,6 +12,8 @@ export interface AWSAccount {
   label: string;
   aws_account_id: string;
   iam_role_arn: string;
+  last_scanned_at: string | null;
+  resource_count?: number;
   created_at: string;
   updated_at: string;
 }
@@ -193,6 +195,27 @@ export interface OrganizationMember {
   invited_by: string | null;
   joined_at: string;
   email: string;
+}
+
+export type ResourceType =
+  | "ecs_service" | "ecs_cluster" | "rds_instance" | "elasticache_cluster"
+  | "lambda_function" | "s3_bucket" | "alb" | "cloudfront_distribution"
+  | "sqs_queue" | "ec2_instance";
+
+export interface DiscoveredResource {
+  id: string;
+  org_id: string;
+  aws_account_id: string;
+  resource_type: ResourceType;
+  resource_id: string;
+  resource_name: string;
+  region: string;
+  metadata: Record<string, unknown> | null;
+  tags: Record<string, unknown> | null;
+  project_id: string | null;
+  is_managed: boolean;
+  first_seen_at: string;
+  last_seen_at: string;
 }
 
 export interface ConversationMessage {

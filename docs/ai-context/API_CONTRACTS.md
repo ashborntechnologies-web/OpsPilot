@@ -49,6 +49,8 @@ Frontend client: [`frontend/lib/api.ts`](../../frontend/lib/api.ts). Errors are
 | GET | `/aws-accounts` | — | `AWSAccount[]` (active org) | accounts page |
 | POST | `/aws-accounts` | `{label,aws_account_id,iam_role_arn,external_id?,certificate_arn?}` | `AWSAccount` | accounts page — **admin** of active org; validates AssumeRole |
 | DELETE | `/aws-accounts/:id` | — | `{message}` | accounts page — **admin** |
+| POST | `/aws-accounts/:id/scan` | — | `{job_id, message}` (202) | accounts page — async discovery scan; **engineer+** in the account's org |
+| PATCH | `/resources/:resourceId/assign` | `{project_id}` (null unassigns) | `{message, project_id}` | inventory — **engineer+**; project must be in the resource's org |
 
 ## Organizations (RequireAuth)
 | Method | Path | Request | Response | Auth |
@@ -57,6 +59,7 @@ Frontend client: [`frontend/lib/api.ts`](../../frontend/lib/api.ts). Errors are
 | GET | `/orgs/me` | — | `Organization[]` (with caller's `role`) | any user |
 | GET | `/invites/:token` | — | `{message, organization}` (redeems invite, adds caller) | any user |
 | GET | `/orgs/:orgId/members` | — | `OrganizationMember[]` (with email) | member |
+| GET | `/orgs/:orgId/resources?resource_type=&region=&project_id=(uuid\|null)` | — | `DiscoveredResource[]` (discovery inventory) | member |
 | POST | `/orgs/:orgId/invites` | `{email, role}` | `{invite, accept_url, email_sent}` | **admin** |
 | PATCH | `/orgs/:orgId/members/:userId` | `{role}` | `{message, role}` | **admin** (can't demote last admin) |
 | DELETE | `/orgs/:orgId/members/:userId` | — | `{message}` | **admin** (can't remove last admin) |
@@ -98,6 +101,7 @@ intents.
 | POST | `/alerts/:alertId/resolve` | — | `{message}` |
 | GET | `/costs` | — | `CostSummary` (30-day, Cost Explorer) |
 | GET | `/health-score` | — | `HealthScore{score,grade,components,insights}` |
+| GET | `/resources` | — | `DiscoveredResource[]` (assigned to this project; managed + discovered) |
 | POST | `/previews/enable` | — | `{message,webhook_id}` (installs GitHub webhook) |
 | POST | `/previews/disable` | — | `{message}` |
 | GET/POST/PATCH/DELETE | `/webhooks[/:webhookId]` | `{url,secret?,events,active?}` | `Webhook` / `{message}` |

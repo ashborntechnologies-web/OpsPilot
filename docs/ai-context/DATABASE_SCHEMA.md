@@ -163,6 +163,20 @@ alert_type)`. The alert engine suppresses muted types.
 `pattern_detected`), `reference_count` + `last_referenced_at` (near-duplicates merge by
 normalized content key, incrementing the count instead of inserting).
 
+### `discovered_resources`
+AWS resources found by the discovery scanner (`internal/discovery`) in connected
+accounts. Belongs to an `org_id` + `aws_account_id`. `resource_type` ∈ {`ecs_service`,
+`ecs_cluster`, `rds_instance`, `elasticache_cluster`, `lambda_function`, `s3_bucket`,
+`alb`, `cloudfront_distribution`, `sqs_queue`, `ec2_instance`}. `resource_id` is the AWS
+ARN/native ID; `metadata` + `tags` are JSONB. `is_managed` = the resource carries the
+`ManagedBy=OpsPilot` tag. `project_id` is NULL until a user assigns the resource to a
+project (`ON DELETE SET NULL`). `first_seen_at`/`last_seen_at` bound its observation
+window. **`UNIQUE(org_id, resource_type, resource_id)`** makes re-scans idempotent
+(upsert). `aws_accounts` also gained **`last_scanned_at`** (UI "scanned Xm ago").
+
+> ECS-service rows store `cluster_name`/`service_name`/`log_group_name` in `metadata`;
+> the monitor reads those to poll + log-scan discovered services assigned to a project.
+
 ### `conversations`
 Chat history per project. `role` (`user`/`assistant`), `message`, classified `intent`,
 `metadata` (JSONB). Source for the intent-classifier training export.

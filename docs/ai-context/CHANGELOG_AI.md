@@ -16,6 +16,45 @@ Format:
 
 ---
 
+## 2026-06-12 — AWS infrastructure discovery (onboard existing resources)
+- **What:** Scan connected AWS accounts for existing infrastructure so users onboard
+  without migration.
+  - **Data model:** new `discovered_resources` table (org/account scoped, JSONB
+    metadata+tags, nullable `project_id`, `is_managed`, unique
+    `org_id+resource_type+resource_id`); `aws_accounts.last_scanned_at`.
+  - **New `internal/discovery` package:** `ScanClients` (ECS/ELB/RDS/ElastiCache/Lambda/
+    S3/SQS), `ScanAccountByID`→`ScanAccount` running 7 parallel, isolated scanners
+    (`ScanECSServices` incl. clusters + task-def log group, `ScanRDSInstances`,
+    `ScanElastiCache`, `ScanLambda`, `ScanS3`, `ScanALBs`, `ScanSQS`), idempotent upsert,
+    and HTTP handlers (scan, list org/project resources, assign).
+  - **AWS service:** `AssumeRoleConfigForAccount`, `AssumeRoleForAccountAndRegion`,
+    `AccountRegions`, `MarkAccountScanned`, `SetOnAccountConnected`; account-list now
+    returns `last_scanned_at` + `resource_count`.
+  - **Queue/scheduler:** `TaskScan`/`TaskScanAll` + handlers, `EnqueueScan`, daily
+    `@every 24h` scan-all fan-out; `NewServer` takes the discovery service.
+  - **Triggers:** scan-on-connect (`onAccountConnected`→`EnqueueScan`), on-demand
+    endpoint, daily refresh.
+  - **Monitor:** poller + log scanner now include discovered ECS services assigned to a
+    project (assume role per account+region; health-only, no ALB metrics).
+  - **Frontend:** `/orgs/resources` inventory (type/region filters + assign), per-project
+    Infrastructure tab, AWS-accounts "Scan now" + last-scan + resource count; shared
+    `lib/resources.tsx`; new discovery types + API functions.
+  - **Deps:** added AWS SDK v2 modules rds, elasticache, lambda, s3, sqs.
+- **Files:** `pkg/models/{db,types}.go`; `internal/discovery/{clients,service,handlers}.go`
+  (new); `internal/aws/service.go`; `internal/queue/server.go`;
+  `internal/monitor/{poller,logscanner}.go`; `cmd/api/main.go`; frontend
+  `lib/{api.ts,resources.tsx}`, `types/api.ts`, `app/orgs/resources/page.tsx` (new),
+  `app/aws-accounts/page.tsx`, `app/projects/[id]/page.tsx`; `go.mod`/`go.sum`.
+- **Why:** Removing the "migrate everything first" barrier is the top onboarding blocker
+  for teams with existing AWS workloads (see PRODUCT_VISION onboarding goal).
+- **Assumptions changed:** OpsPilot now reasons about resources it did **not** create;
+  monitoring is no longer limited to OpsPilot-provisioned environments. Tenant scope for
+  resources is the org. Scan is read-only and best-effort (per-scanner isolation).
+- **Verification:** `go build ./...`, `go vet ./...`, `gofmt -l`, and `tsc --noEmit` all
+  clean. AWS scanners not exercised against a live account here.
+- **Docs updated:** ARCHITECTURE (discovery flow), DATABASE_SCHEMA, API_CONTRACTS,
+  CURRENT_STATE, DECISIONS (ADR-010), BACKEND.
+
 ## 2026-06-11 — Team workspaces (organizations) + role-based access control
 - **What:** Introduced multi-tenancy. Tenant ownership moved from per-user to
   **organizations** with roles **admin > engineer > viewer**.

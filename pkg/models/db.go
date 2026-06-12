@@ -103,6 +103,8 @@ func RunMigrations(db *DB) error {
 		createOrganizationInvitesTable,
 		addOrgIDColumns,
 		backfillPersonalOrgs,
+		createDiscoveredResourcesTable,
+		addLastScannedAtToAWSAccounts,
 	}
 
 	for _, m := range migrations {
@@ -496,6 +498,36 @@ ALTER TABLE incidents    ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES organiz
 CREATE INDEX IF NOT EXISTS idx_projects_org     ON projects(org_id);
 CREATE INDEX IF NOT EXISTS idx_aws_accounts_org ON aws_accounts(org_id);
 CREATE INDEX IF NOT EXISTS idx_alerts_org       ON alerts(org_id);`
+
+// createDiscoveredResourcesTable stores AWS resources found by the discovery scanner
+// in connected accounts. is_managed marks OpsPilot-created resources (ManagedBy tag);
+// project_id is NULL until a user assigns the resource to a project. The unique key
+// (org_id, resource_type, resource_id) makes scans idempotent (upsert on re-scan).
+const createDiscoveredResourcesTable = `
+CREATE TABLE IF NOT EXISTS discovered_resources (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id         UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    aws_account_id UUID NOT NULL REFERENCES aws_accounts(id) ON DELETE CASCADE,
+    resource_type  TEXT NOT NULL,
+    resource_id    TEXT NOT NULL,
+    resource_name  TEXT NOT NULL DEFAULT '',
+    region         TEXT NOT NULL DEFAULT '',
+    metadata       JSONB NOT NULL DEFAULT '{}',
+    tags           JSONB NOT NULL DEFAULT '{}',
+    project_id     UUID REFERENCES projects(id) ON DELETE SET NULL,
+    is_managed     BOOLEAN NOT NULL DEFAULT false,
+    first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (org_id, resource_type, resource_id)
+);
+CREATE INDEX IF NOT EXISTS idx_discovered_org     ON discovered_resources(org_id, resource_type);
+CREATE INDEX IF NOT EXISTS idx_discovered_account ON discovered_resources(aws_account_id);
+CREATE INDEX IF NOT EXISTS idx_discovered_project ON discovered_resources(project_id);`
+
+// addLastScannedAtToAWSAccounts records when the discovery scanner last completed for
+// an account (surfaced in the UI).
+const addLastScannedAtToAWSAccounts = `
+ALTER TABLE aws_accounts ADD COLUMN IF NOT EXISTS last_scanned_at TIMESTAMPTZ;`
 
 // backfillPersonalOrgs migrates every existing user into a personal organization
 // (admin membership) and assigns all of their existing data to it. Idempotent:
