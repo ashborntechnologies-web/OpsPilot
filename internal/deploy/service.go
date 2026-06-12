@@ -232,6 +232,17 @@ func (s *Service) HandleCreateProject(c *gin.Context) {
 		return
 	}
 
+	// Resolve the active workspace and enforce that the caller can create projects
+	// in it (engineer or admin — viewers are read-only).
+	orgID, role, ok := middleware.ActiveOrg(c, s.db)
+	if !ok {
+		return // ActiveOrg already wrote the error
+	}
+	if models.RoleRank(role) < models.RoleRank(models.RoleEngineer) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "creating a project requires the engineer or admin role in this workspace"})
+		return
+	}
+
 	if s.billingSvc != nil {
 		if err := s.billingSvc.CheckProjectLimit(c.Request.Context(), userID); err != nil {
 			var limitErr *billing.ErrLimitReached
@@ -256,6 +267,7 @@ func (s *Service) HandleCreateProject(c *gin.Context) {
 
 	project := &models.Project{
 		UserID:       userID,
+		OrgID:        &orgID,
 		Name:         req.Name,
 		RepoURL:      req.RepoURL,
 		RepoOwner:    req.RepoOwner,
@@ -267,10 +279,10 @@ func (s *Service) HandleCreateProject(c *gin.Context) {
 	}
 
 	err := s.db.Pool.QueryRow(c.Request.Context(),
-		`INSERT INTO projects (user_id, name, repo_url, repo_owner, repo_name, framework, branch, start_command, account_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		`INSERT INTO projects (user_id, org_id, name, repo_url, repo_owner, repo_name, framework, branch, start_command, account_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		 RETURNING id, created_at, updated_at`,
-		project.UserID, project.Name, project.RepoURL, project.RepoOwner,
+		project.UserID, project.OrgID, project.Name, project.RepoURL, project.RepoOwner,
 		project.RepoName, project.Framework, project.Branch, project.StartCommand, project.AccountID,
 	).Scan(&project.ID, &project.CreatedAt, &project.UpdatedAt)
 	if err != nil {
@@ -282,15 +294,16 @@ func (s *Service) HandleCreateProject(c *gin.Context) {
 }
 
 func (s *Service) HandleListProjects(c *gin.Context) {
-	userID, ok := middleware.GetUserID(c)
+	// Projects are listed for the active workspace (X-Org-Id header, default
+	// personal org). Membership is validated by ActiveOrg.
+	orgID, _, ok := middleware.ActiveOrg(c, s.db)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "user not authenticated"})
 		return
 	}
 
 	rows, err := s.db.Pool.Query(c.Request.Context(),
-		`SELECT id, user_id, name, repo_url, repo_owner, repo_name, framework, branch, start_command, account_id, created_at, updated_at
-		 FROM projects WHERE user_id = $1 ORDER BY created_at DESC`, userID,
+		`SELECT id, user_id, org_id, name, repo_url, repo_owner, repo_name, framework, branch, start_command, account_id, created_at, updated_at
+		 FROM projects WHERE org_id = $1 ORDER BY created_at DESC`, orgID,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch projects"})
@@ -302,7 +315,7 @@ func (s *Service) HandleListProjects(c *gin.Context) {
 	for rows.Next() {
 		var p models.Project
 		if err := rows.Scan(
-			&p.ID, &p.UserID, &p.Name, &p.RepoURL, &p.RepoOwner,
+			&p.ID, &p.UserID, &p.OrgID, &p.Name, &p.RepoURL, &p.RepoOwner,
 			&p.RepoName, &p.Framework, &p.Branch, &p.StartCommand, &p.AccountID, &p.CreatedAt, &p.UpdatedAt,
 		); err != nil {
 			continue

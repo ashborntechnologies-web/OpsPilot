@@ -1,0 +1,98 @@
+# Current State — OpsPilot
+
+Snapshot as of **2026-06-11**. Update whenever a feature's status changes.
+Status is derived from the code on `main`, not from plans.
+
+## ✅ Working (implemented & wired)
+
+**Core deploy loop**
+- Project creation from a GitHub repo (18 frameworks; AI framework detection).
+- BYOC AWS connection via bootstrap CloudFormation + assumed IAM role (per-tenant
+  external ID); AssumeRole validated at connect time.
+- Shared platform stack (VPC/ECS/ALB) per account×region; per-env project provisioning.
+- Deploy: CodeBuild image build (generated Dockerfile/buildspec) → ECR → ECS rollout →
+  health check → live, with **live build-log + stage-progress streaming over WebSocket**.
+- Rollback, redeploy, cancel (stops CodeBuild), delete (async AWS cleanup).
+- Per-environment env vars (secrets redacted/reveal), injected into the task def.
+
+**Conversational interface**
+- Chat over WebSocket: intent classification (Claude) → Go execution for deploy,
+  rollback, logs, health, scale, diagnose, cost, resource-change. Graceful fallback on
+  AI outage. Persisted history. Context-aware suggested prompts.
+- Browser terminal into a running ECS task (SSM exec proxied to xterm).
+
+**AI / intelligence**
+- Failure diagnosis (root cause + fix) from logs + structured event timeline + history,
+  with **project memory injected into the prompt**; diagnosis feedback capture (👍/👎).
+- Long-term project memory (recurring failures, successful fixes, deploy patterns) with
+  near-duplicate merging.
+- Pre-deploy risk score (advisory, broadcast as `deploy_risk`) + deployment health score.
+
+**Continuous monitoring**
+- Poller (ECS/ALB health, 60s) + LogScanner (CloudWatch anomaly patterns, 5m) →
+  `runtime.*` operational events.
+- Alert engine: dedup, AI summaries, snooze, auto-resolve on recovery; delivered via
+  WebSocket + email; alerts panel + status sidebar in the UI.
+- Auto-diagnosis enqueued on runtime failures (events → diagnosis job).
+- Watchdog reconciles stuck deploys every 5m.
+
+**Team workspaces & RBAC**
+- Organizations (team workspaces) own all tenant data (`projects`, `aws_accounts`,
+  `alerts`, `incidents` via `org_id`); every user gets a personal org on first login;
+  existing data migrated by `backfillPersonalOrgs`.
+- Roles **admin > engineer > viewer** enforced at the middleware layer
+  (`LoadProjectMembership` + `RequireRole`, `RequireOrgMembership`); viewers are
+  read-only (chat action intents also blocked). Active workspace via `X-Org-Id` header.
+- Invite by email (token link, 7-day expiry, emailed via `notify.SendOrgInvite`),
+  accept page, member list with role badges, role changes + removal (admin; last-admin
+  protected). Navbar workspace switcher + role-aware dashboard (view-only banner +
+  guarded actions).
+
+**Platform**
+- Billing: plan tiers (free/pro/team), project limit, monthly AI-action metering;
+  usage meter in navbar; notification preferences in settings.
+- Outbound webhooks (deploy events, HMAC-signed, SSRF-guarded).
+- PR preview environments (GitHub webhook → ephemeral `pr-N` env + PR comment).
+- Cost intelligence (30-day Cost Explorer summary).
+- Proprietary posture: trade-secret prompts external; `Proprietary()` headers; admin
+  training-data exports behind `ADMIN_API_KEY`; legal pages; `robots.txt` on API host.
+- Security: Clerk auth, tenant-isolation middleware, encrypted GitHub tokens, request IDs.
+
+## 🟡 Partial / thin
+
+- **Onboarding:** functional but minimal — `/projects` shows an empty-state CTA, not a
+  live multi-step GitHub→AWS→project checklist. New users can dead-end if GitHub/AWS
+  isn't connected first.
+- **HTTPS:** plumbed end-to-end (`certificate_arn` field, CF 443 listener,
+  `https_enabled`, URL scheme) but optional and depends on the user supplying an ACM cert.
+- **Landing-page trust signals:** present but in the "how it works" section rather than
+  the hero / above the fold.
+- **Resource mutations / autonomy:** CPU/memory changes are *proposed then confirmed*;
+  there is no autonomous remediation yet.
+- **Platform deployment:** no committed platform Dockerfile / CI manifest; runs via
+  `make run` against docker-compose-provided Postgres/Redis.
+
+## 🧪 Experimental / proprietary-in-progress
+
+- Training-data export pipeline (intents + diagnoses) — datasets exist; no model
+  fine-tuning loop in-repo.
+- Runtime auto-diagnosis quality depends on prompt + memory maturity.
+
+## ⚠️ Known limitations
+
+- **AWS-only**, single-region per environment, Fargate-only.
+- **Single binary** — API, worker, and monitors share a process; no horizontal split yet.
+- Platform stack is **not** torn down on project deletion (intended; shared).
+- `internal/deploy/service.go` is ~2700 lines (maintainability risk; see ROADMAP #refactor).
+- Secret env-var values stored plaintext in Postgres (encrypted at rest; no per-secret
+  audit / SSM-backed secret store yet).
+- Email requires SMTP config; without it, notifications are logged no-ops.
+- **Billing is still per-user** (`CheckProjectLimit`/AI metering key off `user_id`), not
+  per-org — a known seam now that projects are org-owned.
+- Role-aware dashboard guards the action **handlers** + shows a view-only banner;
+  per-button `disabled` styling across every control is a follow-up (backend enforces
+  regardless, so viewers always get 403).
+
+## 🔭 Actively developing
+Continuous-operation intelligence (monitoring → alert → diagnosis → memory loop) and
+the proprietary AI moat (prompt + training pipeline). See `ROADMAP.md`.

@@ -1,16 +1,34 @@
 import type { Project, Environment, Deployment, GithubRepo, ConversationMessage, AWSAccount, OperationalEvent, CostSummary } from "@/types/api";
 
+// ACTIVE_ORG_KEY stores the workspace the user has selected in the navbar switcher.
+// It is sent as X-Org-Id on every request so org-scoped endpoints (list/create
+// projects, AWS accounts) target the right workspace. Absent → backend defaults to
+// the user's personal org.
+export const ACTIVE_ORG_KEY = "opspilot.activeOrgId";
+
+export function getActiveOrgId(): string | null {
+  if (typeof window === "undefined") return null;
+  return window.localStorage.getItem(ACTIVE_ORG_KEY);
+}
+
+export function setActiveOrgId(orgId: string) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(ACTIVE_ORG_KEY, orgId);
+}
+
 // HTTP requests use relative paths — Next.js rewrites /api/v1/* → backend, so no CORS needed.
 async function request<T>(
   path: string,
   token: string,
   options: RequestInit = {}
 ): Promise<T> {
+  const activeOrg = getActiveOrgId();
   const res = await fetch(`/api/v1${path}`, {
     ...options,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
+      ...(activeOrg ? { "X-Org-Id": activeOrg } : {}),
       ...(options.headers ?? {}),
     },
   });
@@ -443,4 +461,51 @@ export function submitDiagnosisFeedback(
 
 export function getProjectEvents(token: string, projectId: string, limit = 5) {
   return request<OperationalEvent[]>(`/projects/${projectId}/events?limit=${limit}`, token);
+}
+
+// ---- Organizations (team workspaces) -------------------------------------------
+
+import type { Organization, OrganizationMember, OrgRole } from "@/types/api";
+
+export function listMyOrgs(token: string) {
+  return request<Organization[]>("/orgs/me", token);
+}
+
+export function createOrg(token: string, body: { name: string; slug?: string }) {
+  return request<Organization>("/orgs", token, { method: "POST", body: JSON.stringify(body) });
+}
+
+export function listOrgMembers(token: string, orgId: string) {
+  return request<OrganizationMember[]>(`/orgs/${orgId}/members`, token);
+}
+
+export function createOrgInvite(
+  token: string,
+  orgId: string,
+  body: { email: string; role: OrgRole }
+) {
+  return request<{ accept_url: string; email_sent: boolean }>(
+    `/orgs/${orgId}/invites`, token,
+    { method: "POST", body: JSON.stringify(body) }
+  );
+}
+
+export function updateMemberRole(token: string, orgId: string, userId: string, role: OrgRole) {
+  return request<{ message: string; role: OrgRole }>(
+    `/orgs/${orgId}/members/${userId}`, token,
+    { method: "PATCH", body: JSON.stringify({ role }) }
+  );
+}
+
+export function removeMember(token: string, orgId: string, userId: string) {
+  return request<{ message: string }>(
+    `/orgs/${orgId}/members/${userId}`, token,
+    { method: "DELETE" }
+  );
+}
+
+export function acceptInvite(token: string, inviteToken: string) {
+  return request<{ message: string; organization: Organization }>(
+    `/invites/${inviteToken}`, token
+  );
 }

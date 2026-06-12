@@ -84,6 +84,20 @@ func (e *EmailService) SendDeployResult(ctx context.Context, toEmail, projectNam
 	return e.send(ctx, toEmail, subject, body)
 }
 
+// SendOrgInvite emails an invitation to join a team workspace.
+func (e *EmailService) SendOrgInvite(ctx context.Context, toEmail, orgName, role, acceptURL string) error {
+	subject := fmt.Sprintf("You've been invited to %s on OpsPilot", orgName)
+	body := e.renderBody(
+		"#4f46e5", // indigo-600
+		"Workspace invitation",
+		fmt.Sprintf("You've been invited to join <strong>%s</strong> as <strong>%s</strong>.",
+			html.EscapeString(orgName), html.EscapeString(role)),
+		"Click below to accept. This invite expires in 7 days.",
+		acceptURL, "Accept invitation",
+	)
+	return e.send(ctx, toEmail, subject, body)
+}
+
 // renderBody produces a minimal HTML email in the OpsPilot zinc/indigo theme.
 func (e *EmailService) renderBody(accentColor, headline, detail, summary, linkURL, linkLabel string) string {
 	var b strings.Builder

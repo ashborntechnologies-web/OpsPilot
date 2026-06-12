@@ -178,6 +178,18 @@ func (s *Service) ProcessMessage(ctx context.Context, projectID uuid.UUID, userI
 		return fallback, nil
 	}
 
+	// RBAC: viewers may read/ask but cannot trigger actions over chat. The WS layer
+	// only verifies membership, so action enforcement happens here.
+	if isActionIntent(intent.Intent) {
+		if _, role, rerr := s.db.ProjectOrgRole(ctx, userID, projectID); rerr == nil &&
+			models.RoleRank(role) < models.RoleRank(models.RoleEngineer) {
+			msg := "You have view-only (viewer) access to this workspace, so I can't run that action. " +
+				"I can still show you logs, health, costs, or diagnose issues. Ask an admin to grant you the engineer role to deploy, roll back, or scale."
+			s.saveMessage(ctx, projectID, userID, "assistant", msg, &intent.Intent)
+			return msg, nil
+		}
+	}
+
 	// Route to the matching workflow — Go code executes, Claude never touches AWS
 	var response string
 	switch intent.Intent {
@@ -247,6 +259,17 @@ func (s *Service) recentContext(ctx context.Context, projectID uuid.UUID, limit 
 		fmt.Fprintf(&b, "[%s]: %s\n", role, msg)
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// isActionIntent reports whether an intent triggers an infrastructure action
+// (forbidden for viewers). Read-only intents (logs/health/diagnose/cost) are allowed.
+func isActionIntent(intent string) bool {
+	switch intent {
+	case models.IntentDeploy, models.IntentRedeploy, models.IntentRollback,
+		models.IntentScale, models.IntentChangeResources, models.IntentConfirm:
+		return true
+	}
+	return false
 }
 
 // targetEnv returns the environment named in the intent params, defaulting to

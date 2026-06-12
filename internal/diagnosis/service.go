@@ -338,8 +338,8 @@ func (s *Service) saveIncident(ctx context.Context, projectID, deploymentID uuid
 
 	var id uuid.UUID
 	s.db.Pool.QueryRow(ctx,
-		`INSERT INTO incidents (project_id, deployment_id, trigger, root_cause, resolution, raw_logs)
-		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		`INSERT INTO incidents (project_id, org_id, deployment_id, trigger, root_cause, resolution, raw_logs)
+		 VALUES ($1, (SELECT org_id FROM projects WHERE id = $1), $2, $3, $4, $5, $6) RETURNING id`,
 		projectID, deploymentID, trigger, rootCause, resolution, logs,
 	).Scan(&id)
 	return id
@@ -428,8 +428,8 @@ func (s *Service) DiagnoseRuntime(ctx context.Context, projectID uuid.UUID) (str
 	resolution := extractDiagnosisField(diagnosis, "Fix")
 	var incidentID uuid.UUID
 	s.db.Pool.QueryRow(ctx,
-		`INSERT INTO incidents (project_id, environment_id, trigger, root_cause, resolution, raw_logs)
-		 VALUES ($1, $2, 'runtime_anomaly', $3, $4, $5) RETURNING id`,
+		`INSERT INTO incidents (project_id, org_id, environment_id, trigger, root_cause, resolution, raw_logs)
+		 VALUES ($1, (SELECT org_id FROM projects WHERE id = $1), $2, 'runtime_anomaly', $3, $4, $5) RETURNING id`,
 		projectID, envID, rootCause, resolution, rawForMemory,
 	).Scan(&incidentID)
 

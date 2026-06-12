@@ -156,8 +156,8 @@ func (a *AlertEngine) EvaluateEvent(ctx context.Context, ev models.OperationalEv
 	}
 
 	err = a.db.Pool.QueryRow(ctx, `
-		INSERT INTO alerts (project_id, environment_id, alert_type, severity, title, summary, source_event_ids)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO alerts (project_id, org_id, environment_id, alert_type, severity, title, summary, source_event_ids)
+		VALUES ($1, (SELECT org_id FROM projects WHERE id = $1), $2, $3, $4, $5, $6, $7)
 		RETURNING id, triggered_at, created_at`,
 		alert.ProjectID, alert.EnvironmentID, alert.AlertType, alert.Severity,
 		alert.Title, alert.Summary, sourceIDs,

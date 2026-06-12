@@ -27,6 +27,7 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/memory"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/monitor"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/notify"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/orgs"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/prompts"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/queue"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/terminal"
@@ -181,12 +182,11 @@ func main() {
 		if err != nil {
 			return uuid.UUID{}, err
 		}
-		owned, err := db.UserOwnsProject(ctx, userID, pid)
-		if err != nil {
-			return uuid.UUID{}, err
-		}
-		if !owned {
-			return uuid.UUID{}, errors.New("forbidden: user does not own project")
+		// Any member of the project's org may open the socket (viewers receive live
+		// deploy/alert broadcasts). Action enforcement happens per-message in the
+		// conversation engine, which blocks viewers from triggering actions.
+		if _, _, err := db.ProjectOrgRole(ctx, userID, pid); err != nil {
+			return uuid.UUID{}, errors.New("forbidden: not a member of this project's workspace")
 		}
 		return userID, nil
 	})
@@ -231,6 +231,9 @@ func main() {
 	// Billing limits + users endpoints.
 	billingSvc := billing.NewService(db)
 	usersSvc := users.NewService(db, billingSvc)
+
+	// Organizations (team workspaces) + RBAC.
+	orgsSvc := orgs.NewService(db, emailSvc, os.Getenv("FRONTEND_URL"))
 
 	deploySvc.SetEmailService(emailSvc)
 	deploySvc.SetMemoryService(memorySvc)
@@ -337,94 +340,96 @@ func main() {
 		protected.GET("/github/repos/:owner/:repo/branches", githubSvc.HandleListBranches)
 		protected.GET("/github/repos/:owner/:repo/detect", githubSvc.HandleDetectFramework)
 
-		// Projects (collection — ownership enforced inside the handlers)
+		// Projects (collection — org-scoped via the X-Org-Id header inside the handlers)
 		protected.POST("/projects", deploySvc.HandleCreateProject)
 		protected.GET("/projects", deploySvc.HandleListProjects)
 
-		// AWS Accounts (user-level — ownership enforced inside the handlers)
 		// Account (plan, usage, notification preferences)
 		protected.GET("/users/me", usersSvc.HandleGetMe)
 		protected.PATCH("/users/me/notifications", usersSvc.HandleUpdateNotifications)
 
+		// AWS Accounts (active-workspace-scoped; connect/delete are admin-only,
+		// enforced inside the handlers via the active org role).
 		protected.GET("/aws-accounts", awsSvc.HandleListAWSAccounts)
 		protected.POST("/aws-accounts", awsSvc.HandleConnectAWSAccount)
 		protected.DELETE("/aws-accounts/:id", awsSvc.HandleDeleteAWSAccount)
+
+		// Organizations (team workspaces)
+		protected.POST("/orgs", orgsSvc.HandleCreateOrg)
+		protected.GET("/orgs/me", orgsSvc.HandleListMyOrgs)
+		// Invite acceptance — any authenticated user with the token can redeem it.
+		protected.GET("/invites/:token", orgsSvc.HandleAcceptInvite)
 	}
 
-	// Project-scoped routes — every handler here operates on a single project the
-	// caller must own. RequireProjectOwnership is the single tenant-isolation guard
-	// so individual handlers no longer need to re-check ownership of ":id".
+	// Organization management — scoped to a single org the caller belongs to.
+	// RequireOrgMembership loads the caller's role and stores org context; member
+	// management is admin-only, listing is open to any member.
+	org := v1.Group("/orgs/:orgId")
+	org.Use(middleware.RequireAuth(authSvc, db))
+	org.Use(middleware.RequireOrgMembership(db)) // any member; per-route role below
+	{
+		org.GET("/members", orgsSvc.HandleListMembers)
+		org.POST("/invites", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleCreateInvite)
+		org.PATCH("/members/:userId", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleUpdateMemberRole)
+		org.DELETE("/members/:userId", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleRemoveMember)
+	}
+
+	// Project-scoped routes — every handler operates on a single project owned by an
+	// org the caller belongs to. LoadProjectMembership resolves project→org→role and
+	// is the tenant-isolation guard (404 for non-members). RequireRole then enforces
+	// the role hierarchy per action:
+	//   viewer   — all reads (no extra guard)
+	//   engineer — deploy, rollback, scale, env-var writes, alert ack, chat, webhooks
+	//   admin    — create/delete environment, delete project, settings, AWS-linked ops
+	requireEngineer := middleware.RequireRole(models.RoleEngineer)
+	requireAdmin := middleware.RequireRole(models.RoleAdmin)
+
 	proj := v1.Group("/projects/:id")
 	proj.Use(middleware.RequireAuth(authSvc, db))
-	proj.Use(middleware.RequireProjectOwnership(db))
+	proj.Use(middleware.LoadProjectMembership(db))
 	{
+		// Reads — any member (viewer+).
 		proj.GET("", deploySvc.HandleGetProject)
-		proj.DELETE("", deploySvc.HandleDeleteProject)
-
-		// Environments
-		proj.POST("/environments", awsSvc.HandleCreateEnvironment)
 		proj.GET("/environments", awsSvc.HandleListEnvironments)
-		proj.POST("/environments/:envId/retry-provision", awsSvc.HandleRetryProvision)
 		proj.GET("/environments/:envId/logs", deploySvc.HandleGetLogs)
-
-		// Env vars (injected into the ECS task definition at deploy time)
 		proj.GET("/environments/:envId/env-vars", envVarSvc.HandleList)
-		proj.PUT("/environments/:envId/env-vars", envVarSvc.HandleUpsert)
-		proj.DELETE("/environments/:envId/env-vars/:varId", envVarSvc.HandleDelete)
-		proj.GET("/environments/:envId/env-vars/:varId/reveal", envVarSvc.HandleReveal)
-
-		// Health check + scaling
 		proj.GET("/environments/:envId/health", deploySvc.HandleCheckHealth)
-		proj.POST("/environments/:envId/scale", deploySvc.HandleScaleService)
-
-		// Webhooks
 		proj.GET("/webhooks", webhookSvc.HandleList)
-		proj.POST("/webhooks", webhookSvc.HandleCreate)
-		proj.PATCH("/webhooks/:webhookId", webhookSvc.HandleUpdate)
-		proj.DELETE("/webhooks/:webhookId", webhookSvc.HandleDelete)
-
-		// Deployments
-		proj.POST("/environments/:envId/deploy", deployRL.Middleware(), deploySvc.HandleDeploy)
 		proj.GET("/deployments", deploySvc.HandleListDeployments)
-		proj.POST("/deployments/:deployId/rollback", deploySvc.HandleRollback)
-		proj.POST("/deployments/:deployId/redeploy", deploySvc.HandleRedeploy)
-		proj.DELETE("/deployments/:deployId", deploySvc.HandleDeleteDeployment)
-
-		// Deployment events (operational timeline)
 		proj.GET("/deployments/:deployId/events", eventSvc.HandleGetDeploymentEvents)
-
-		// Project-wide recent events (sidebar activity feed)
 		proj.GET("/events", eventSvc.HandleGetProjectEvents)
-
-		// Alerts
 		proj.GET("/alerts", alertEngine.HandleListAlerts)
-		proj.POST("/alerts/:alertId/snooze", alertEngine.HandleSnooze)
-		proj.POST("/alerts/:alertId/resolve", alertEngine.HandleResolve)
-
-		// Deploy cancellation
-		proj.POST("/deployments/:deployId/cancel", deploySvc.HandleCancelDeployment)
-
-		// Project settings
-		proj.PATCH("", deploySvc.HandleUpdateProject)
-
-		// Diagnosis
 		proj.GET("/deployments/:deployId/diagnose", diagnosisSvc.HandleDiagnose)
-		proj.POST("/deployments/:deployId/diagnose/feedback", diagnosisSvc.HandleSubmitFeedback)
 		proj.GET("/diagnose/feedback-summary", diagnosisSvc.HandleFeedbackSummary)
-
-		// Cost intelligence
 		proj.GET("/costs", deploySvc.HandleGetCosts)
-
-		// Deployment health score (computed from platform data, no AWS calls)
 		proj.GET("/health-score", deploySvc.HandleGetHealthScore)
-
-		// PR Preview Environments
-		proj.POST("/previews/enable", deploySvc.HandleEnablePreviews)
-		proj.POST("/previews/disable", deploySvc.HandleDisablePreviews)
-
-		// Conversation (REST fallback — primary is WebSocket)
-		proj.POST("/conversation", conversationRL.Middleware(), conversationSvc.HandleMessage)
 		proj.GET("/conversation/history", conversationSvc.HandleHistory)
+
+		// Engineer actions — deploy, rollback, scale, env vars, alerts, chat, webhooks.
+		proj.POST("/environments/:envId/deploy", requireEngineer, deployRL.Middleware(), deploySvc.HandleDeploy)
+		proj.POST("/deployments/:deployId/rollback", requireEngineer, deploySvc.HandleRollback)
+		proj.POST("/deployments/:deployId/redeploy", requireEngineer, deploySvc.HandleRedeploy)
+		proj.POST("/deployments/:deployId/cancel", requireEngineer, deploySvc.HandleCancelDeployment)
+		proj.DELETE("/deployments/:deployId", requireEngineer, deploySvc.HandleDeleteDeployment)
+		proj.POST("/environments/:envId/scale", requireEngineer, deploySvc.HandleScaleService)
+		proj.PUT("/environments/:envId/env-vars", requireEngineer, envVarSvc.HandleUpsert)
+		proj.DELETE("/environments/:envId/env-vars/:varId", requireEngineer, envVarSvc.HandleDelete)
+		proj.GET("/environments/:envId/env-vars/:varId/reveal", requireEngineer, envVarSvc.HandleReveal)
+		proj.POST("/alerts/:alertId/snooze", requireEngineer, alertEngine.HandleSnooze)
+		proj.POST("/alerts/:alertId/resolve", requireEngineer, alertEngine.HandleResolve)
+		proj.POST("/deployments/:deployId/diagnose/feedback", requireEngineer, diagnosisSvc.HandleSubmitFeedback)
+		proj.POST("/conversation", requireEngineer, conversationRL.Middleware(), conversationSvc.HandleMessage)
+		proj.POST("/webhooks", requireEngineer, webhookSvc.HandleCreate)
+		proj.PATCH("/webhooks/:webhookId", requireEngineer, webhookSvc.HandleUpdate)
+		proj.DELETE("/webhooks/:webhookId", requireEngineer, webhookSvc.HandleDelete)
+		proj.POST("/previews/enable", requireEngineer, deploySvc.HandleEnablePreviews)
+		proj.POST("/previews/disable", requireEngineer, deploySvc.HandleDisablePreviews)
+
+		// Admin actions — provisioning, deletion, settings.
+		proj.POST("/environments", requireAdmin, awsSvc.HandleCreateEnvironment)
+		proj.POST("/environments/:envId/retry-provision", requireAdmin, awsSvc.HandleRetryProvision)
+		proj.DELETE("", requireAdmin, deploySvc.HandleDeleteProject)
+		proj.PATCH("", requireAdmin, deploySvc.HandleUpdateProject)
 	}
 
 	// Admin — training data exports (trade secret datasets). Protected by a static

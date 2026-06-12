@@ -16,9 +16,10 @@ type User struct {
 }
 
 type AWSAccount struct {
-	ID           uuid.UUID `json:"id" db:"id"`
-	UserID       uuid.UUID `json:"user_id" db:"user_id"`
-	Label        string    `json:"label" db:"label"`
+	ID           uuid.UUID  `json:"id" db:"id"`
+	UserID       uuid.UUID  `json:"user_id" db:"user_id"`
+	OrgID        *uuid.UUID `json:"org_id" db:"org_id"`
+	Label        string     `json:"label" db:"label"`
 	AWSAccountID string    `json:"aws_account_id" db:"aws_account_id"`
 	IAMRoleARN   string    `json:"iam_role_arn" db:"iam_role_arn"`
 	ExternalID   string    `json:"-" db:"external_id"` // STS external ID; per-tenant, not exposed in JSON
@@ -32,6 +33,7 @@ type AWSAccount struct {
 type Project struct {
 	ID                  uuid.UUID  `json:"id" db:"id"`
 	UserID              uuid.UUID  `json:"user_id" db:"user_id"`
+	OrgID               *uuid.UUID `json:"org_id" db:"org_id"`
 	Name                string     `json:"name" db:"name"`
 	RepoURL             string     `json:"repo_url" db:"repo_url"`
 	RepoOwner           string     `json:"repo_owner" db:"repo_owner"`
@@ -127,6 +129,7 @@ type Deployment struct {
 type Incident struct {
 	ID            uuid.UUID  `json:"id" db:"id"`
 	ProjectID     uuid.UUID  `json:"project_id" db:"project_id"`
+	OrgID         *uuid.UUID `json:"org_id" db:"org_id"`
 	DeploymentID  *uuid.UUID `json:"deployment_id" db:"deployment_id"`
 	EnvironmentID *uuid.UUID `json:"environment_id" db:"environment_id"`
 	Trigger       string     `json:"trigger" db:"trigger"` // deploy_failure | runtime_anomaly | user_request
@@ -404,6 +407,7 @@ const (
 type Alert struct {
 	ID             uuid.UUID   `json:"id" db:"id"`
 	ProjectID      uuid.UUID   `json:"project_id" db:"project_id"`
+	OrgID          *uuid.UUID  `json:"org_id" db:"org_id"`
 	EnvironmentID  *uuid.UUID  `json:"environment_id" db:"environment_id"`
 	AlertType      string      `json:"alert_type" db:"alert_type"`
 	Severity       string      `json:"severity" db:"severity"`
@@ -454,6 +458,76 @@ const (
 	PlanPro  = "pro"
 	PlanTeam = "team"
 )
+
+// ─── Organizations & RBAC ────────────────────────────────────────────────────
+
+// Organization is a team workspace. All projects, AWS accounts, alerts, and
+// incidents belong to an organization; users access them via membership + role.
+// Every user gets a personal organization on first login (created_by themselves).
+type Organization struct {
+	ID        uuid.UUID `json:"id" db:"id"`
+	Name      string    `json:"name" db:"name"`
+	Slug      string    `json:"slug" db:"slug"`
+	CreatedBy uuid.UUID `json:"created_by" db:"created_by"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
+	// Role is the requesting user's role in this org — populated by list queries,
+	// not a column.
+	Role string `json:"role,omitempty" db:"-"`
+}
+
+// OrganizationMember links a user to an organization with a role.
+type OrganizationMember struct {
+	ID        uuid.UUID  `json:"id" db:"id"`
+	OrgID     uuid.UUID  `json:"org_id" db:"org_id"`
+	UserID    uuid.UUID  `json:"user_id" db:"user_id"`
+	Role      string     `json:"role" db:"role"`
+	InvitedBy *uuid.UUID `json:"invited_by" db:"invited_by"`
+	JoinedAt  time.Time  `json:"joined_at" db:"joined_at"`
+	CreatedAt time.Time  `json:"created_at" db:"created_at"`
+	// Email is the member's email — populated by the members-list join, not a column.
+	Email string `json:"email,omitempty" db:"-"`
+}
+
+// OrganizationInvite is a pending invitation to join an org, redeemable via token.
+type OrganizationInvite struct {
+	ID         uuid.UUID  `json:"id" db:"id"`
+	OrgID      uuid.UUID  `json:"org_id" db:"org_id"`
+	Email      string     `json:"email" db:"email"`
+	Role       string     `json:"role" db:"role"`
+	Token      uuid.UUID  `json:"-" db:"token"` // never exposed in list responses
+	InvitedBy  uuid.UUID  `json:"invited_by" db:"invited_by"`
+	ExpiresAt  time.Time  `json:"expires_at" db:"expires_at"`
+	AcceptedAt *time.Time `json:"accepted_at" db:"accepted_at"`
+	CreatedAt  time.Time  `json:"created_at" db:"created_at"`
+}
+
+// Organization role constants. Hierarchical: admin > engineer > viewer.
+const (
+	RoleAdmin    = "admin"    // invite/remove members, connect AWS, delete projects, change settings
+	RoleEngineer = "engineer" // deploy, rollback, scale, terminal, env vars, ack alerts, resolve incidents
+	RoleViewer   = "viewer"   // read-only; cannot trigger any action
+)
+
+// RoleRank maps a role to a privilege level; a higher rank satisfies any lower
+// requirement. Unknown roles rank 0 (no access).
+func RoleRank(role string) int {
+	switch role {
+	case RoleAdmin:
+		return 3
+	case RoleEngineer:
+		return 2
+	case RoleViewer:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// ValidRole reports whether the string is an assignable org role.
+func ValidRole(r string) bool {
+	return r == RoleAdmin || r == RoleEngineer || r == RoleViewer
+}
 
 // ValidFramework reports whether the string is a supported framework identifier.
 func ValidFramework(f string) bool {

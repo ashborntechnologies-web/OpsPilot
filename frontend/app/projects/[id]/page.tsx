@@ -29,6 +29,7 @@ import {
 } from "@/lib/api";
 import { StatusSidebar } from "@/components/project/status-sidebar";
 import { AlertsPanel } from "@/components/project/alerts-panel";
+import { useActiveOrg } from "@/lib/use-org";
 import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar, Webhook, CostSummary, Alert, RiskScore, UserMe } from "@/types/api";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -125,6 +126,15 @@ function timeAgo(iso: string) {
 export default function ProjectPage() {
   const { id } = useParams<{ id: string }>();
   const { getToken } = useAuth();
+
+  // Role in the active workspace. Viewers get read-only UI; the backend enforces
+  // this regardless, so these guards are UX (clear messaging), not the security boundary.
+  const { isViewer } = useActiveOrg();
+  const VIEW_ONLY_MSG = "You have view-only (viewer) access to this workspace. Ask an admin for the engineer role to perform this action.";
+  function blockIfViewer(): boolean {
+    if (isViewer) { toast.error(VIEW_ONLY_MSG); return true; }
+    return false;
+  }
 
   const [project, setProject] = useState<Project | null>(null);
   const [environments, setEnvironments] = useState<Environment[]>([]);
@@ -432,6 +442,7 @@ export default function ProjectPage() {
   );
 
   async function handleSnoozeAlert(alertId: string) {
+    if (blockIfViewer()) return;
     const token = await getToken();
     if (!token) return;
     try {
@@ -445,6 +456,7 @@ export default function ProjectPage() {
   }
 
   async function handleResolveAlert(alertId: string) {
+    if (blockIfViewer()) return;
     const token = await getToken();
     if (!token) return;
     try {
@@ -458,6 +470,7 @@ export default function ProjectPage() {
   }
 
   async function handleCancelDeployment(dep: Deployment) {
+    if (blockIfViewer()) return;
     if (!window.confirm(`Cancel the in-progress deployment of ${dep.commit_sha.slice(0, 8)}?`)) return;
     const token = await getToken();
     if (!token) return;
@@ -527,6 +540,7 @@ export default function ProjectPage() {
   }
 
   async function handleCreateEnv() {
+    if (blockIfViewer()) return;
     if (!envDialog) return;
     const token = await getToken();
     if (!token) return;
@@ -544,6 +558,7 @@ export default function ProjectPage() {
   }
 
   async function handleDeploy(env: Environment) {
+    if (blockIfViewer()) return;
     const branch = project?.branch || "default branch";
     if (!window.confirm(`Deploy the latest commit on ${branch} to ${env.name}?`)) {
       return;
@@ -578,6 +593,7 @@ export default function ProjectPage() {
   }
 
   async function handleRollback(dep: Deployment) {
+    if (blockIfViewer()) return;
     const token = await getToken();
     if (!token) return;
     try {
@@ -606,6 +622,7 @@ export default function ProjectPage() {
   }
 
   async function handleRedeploy(dep: Deployment) {
+    if (blockIfViewer()) return;
     const token = await getToken();
     if (!token) return;
     setRedeploying(dep.id);
@@ -709,6 +726,7 @@ export default function ProjectPage() {
   }
 
   async function handleSaveEnvVar() {
+    if (blockIfViewer()) return;
     if (!newKey.trim() || !newValue.trim() || !envVarEnvId) return;
     const token = await getToken();
     if (!token) return;
@@ -732,6 +750,7 @@ export default function ProjectPage() {
   }
 
   async function handleDeleteEnvVar(v: EnvVar) {
+    if (blockIfViewer()) return;
     const token = await getToken();
     if (!token) return;
     try {
@@ -775,6 +794,7 @@ export default function ProjectPage() {
 
   // ── Scale ────────────────────────────────────────────────────────────────────
   async function handleScale() {
+    if (blockIfViewer()) return;
     if (!scaleTarget) return;
     const token = await getToken();
     if (!token) return;
@@ -865,6 +885,7 @@ export default function ProjectPage() {
   }
 
   async function handleTogglePreviews() {
+    if (blockIfViewer()) return;
     const token = await getToken();
     if (!token) return;
     setTogglingPreviews(true);
@@ -1126,6 +1147,14 @@ export default function ProjectPage() {
             </Button>
           </div>
         </div>
+
+        {/* View-only banner — shown to viewers; action buttons are disabled. */}
+        {isViewer && (
+          <div className="mb-6 rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-3 flex items-center gap-2 text-sm text-zinc-600">
+            <EyeOff className="h-4 w-4 shrink-0" />
+            <span>You have <strong>view-only</strong> access to this workspace. Deploy, rollback, scale, and other actions are disabled — ask an admin for the engineer role.</span>
+          </div>
+        )}
 
         {/* No AWS account banner */}
         {!project.account_id && (

@@ -1,6 +1,7 @@
 // handlers.go exposes the alert lifecycle over HTTP: list alerts for a project,
 // snooze an alert type, and manually resolve an alert. All routes sit under
-// /projects/:id behind RequireAuth + RequireProjectOwnership.
+// /projects/:id behind RequireAuth + LoadProjectMembership (org membership). Listing
+// is viewer-readable; snooze/resolve require the engineer role (gated in main.go).
 package monitor
 
 import (

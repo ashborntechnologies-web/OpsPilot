@@ -2,9 +2,11 @@ package models
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -12,26 +14,40 @@ type DB struct {
 	Pool *pgxpool.Pool
 }
 
-// UserOwnsProject reports whether the given project belongs to the given user.
-// Used as the tenant-isolation guard on every /projects/:id/... handler so a user
-// cannot read or mutate another tenant's project by guessing its UUID.
-func (db *DB) UserOwnsProject(ctx context.Context, userID, projectID uuid.UUID) (bool, error) {
-	var exists bool
+// ErrNoMembership signals that a user is not a member of the relevant organization
+// (or the resource doesn't exist). Callers should map it to 404, not 403, so org
+// and resource existence is not leaked across tenants.
+var ErrNoMembership = errors.New("no organization membership")
+
+// UserOrgRole returns the user's role in the org, or ErrNoMembership if they are
+// not a member. This is the tenant-isolation primitive for /orgs/:orgId routes.
+func (db *DB) UserOrgRole(ctx context.Context, userID, orgID uuid.UUID) (string, error) {
+	var role string
 	err := db.Pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1 AND user_id = $2)`,
-		projectID, userID,
-	).Scan(&exists)
-	return exists, err
+		`SELECT role FROM organization_members WHERE org_id = $1 AND user_id = $2`,
+		orgID, userID,
+	).Scan(&role)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNoMembership
+	}
+	return role, err
 }
 
-// UserOwnsAccount reports whether the given AWS account belongs to the given user.
-func (db *DB) UserOwnsAccount(ctx context.Context, userID, accountID uuid.UUID) (bool, error) {
-	var exists bool
-	err := db.Pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM aws_accounts WHERE id = $1 AND user_id = $2)`,
-		accountID, userID,
-	).Scan(&exists)
-	return exists, err
+// ProjectOrgRole resolves the org that owns a project and the requesting user's
+// role in that org. Returns ErrNoMembership when the project doesn't exist, has no
+// org, or the user isn't a member — the tenant-isolation guard for /projects/:id.
+func (db *DB) ProjectOrgRole(ctx context.Context, userID, projectID uuid.UUID) (orgID uuid.UUID, role string, err error) {
+	err = db.Pool.QueryRow(ctx,
+		`SELECT p.org_id, m.role
+		   FROM projects p
+		   JOIN organization_members m ON m.org_id = p.org_id AND m.user_id = $2
+		  WHERE p.id = $1`,
+		projectID, userID,
+	).Scan(&orgID, &role)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.UUID{}, "", ErrNoMembership
+	}
+	return orgID, role, err
 }
 
 func NewDB(databaseURL string) (*DB, error) {
@@ -82,6 +98,11 @@ func RunMigrations(db *DB) error {
 		createProjectMemoryTable,
 		addNotificationAndPlanToUsers,
 		addBuildIDToDeployments,
+		createOrganizationsTable,
+		createOrganizationMembersTable,
+		createOrganizationInvitesTable,
+		addOrgIDColumns,
+		backfillPersonalOrgs,
 	}
 
 	for _, m := range migrations {
@@ -419,3 +440,95 @@ CREATE TABLE IF NOT EXISTS webhooks (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_webhooks_project ON webhooks(project_id);`
+
+// ─── Organizations & RBAC ────────────────────────────────────────────────────
+
+// createOrganizationsTable: a team workspace. slug is URL-safe and unique.
+const createOrganizationsTable = `
+CREATE TABLE IF NOT EXISTS organizations (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name       TEXT NOT NULL,
+    slug       TEXT UNIQUE NOT NULL,
+    created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);`
+
+// createOrganizationMembersTable: a user's role in an org. One row per (org,user).
+const createOrganizationMembersTable = `
+CREATE TABLE IF NOT EXISTS organization_members (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id     UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role       TEXT NOT NULL CHECK (role IN ('admin', 'engineer', 'viewer')),
+    invited_by UUID REFERENCES users(id),
+    joined_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (org_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_org_members_org  ON organization_members(org_id);`
+
+// createOrganizationInvitesTable: pending invitations redeemable by token.
+const createOrganizationInvitesTable = `
+CREATE TABLE IF NOT EXISTS organization_invites (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id      UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    email       TEXT NOT NULL,
+    role        TEXT NOT NULL CHECK (role IN ('admin', 'engineer', 'viewer')),
+    token       UUID NOT NULL DEFAULT gen_random_uuid(),
+    invited_by  UUID NOT NULL REFERENCES users(id),
+    expires_at  TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '7 days'),
+    accepted_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_org_invites_token ON organization_invites(token);
+CREATE INDEX IF NOT EXISTS idx_org_invites_org ON organization_invites(org_id);`
+
+// addOrgIDColumns: tenant ownership moves from user_id to org_id. Columns are
+// nullable here and backfilled by backfillPersonalOrgs below; the application
+// always sets org_id on new rows.
+const addOrgIDColumns = `
+ALTER TABLE projects     ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE aws_accounts ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE alerts       ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE incidents    ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_projects_org     ON projects(org_id);
+CREATE INDEX IF NOT EXISTS idx_aws_accounts_org ON aws_accounts(org_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_org       ON alerts(org_id);`
+
+// backfillPersonalOrgs migrates every existing user into a personal organization
+// (admin membership) and assigns all of their existing data to it. Idempotent:
+// users who already have a membership are skipped; only NULL org_id rows are
+// backfilled. New users (post-migration) get their personal org created in the
+// auth-middleware user-upsert path.
+const backfillPersonalOrgs = `
+DO $$
+DECLARE
+    u RECORD;
+    new_org UUID;
+    base TEXT;
+BEGIN
+    FOR u IN SELECT id, email FROM users LOOP
+        IF EXISTS (SELECT 1 FROM organization_members WHERE user_id = u.id) THEN
+            CONTINUE;
+        END IF;
+        base := NULLIF(regexp_replace(lower(split_part(u.email, '@', 1)), '[^a-z0-9]+', '-', 'g'), '');
+        INSERT INTO organizations (name, slug, created_by)
+        VALUES (
+            COALESCE(initcap(base), 'Personal') || ' (personal)',
+            'u-' || replace(u.id::text, '-', '')
+        , u.id)
+        RETURNING id INTO new_org;
+
+        INSERT INTO organization_members (org_id, user_id, role, invited_by)
+        VALUES (new_org, u.id, 'admin', u.id);
+
+        UPDATE projects     SET org_id = new_org WHERE user_id = u.id AND org_id IS NULL;
+        UPDATE aws_accounts SET org_id = new_org WHERE user_id = u.id AND org_id IS NULL;
+    END LOOP;
+
+    -- alerts / incidents inherit their project's org.
+    UPDATE alerts a    SET org_id = p.org_id FROM projects p WHERE a.project_id = p.id AND a.org_id IS NULL;
+    UPDATE incidents i SET org_id = p.org_id FROM projects p WHERE i.project_id = p.id AND i.org_id IS NULL;
+END $$;`

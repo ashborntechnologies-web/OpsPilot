@@ -32,7 +32,7 @@ func newWebhookRouter(t *testing.T, db *models.DB, userID uuid.UUID) (*gin.Engin
 	})
 
 	proj := r.Group("/projects/:id")
-	proj.Use(middleware.RequireProjectOwnership(db))
+	proj.Use(middleware.LoadProjectMembership(db))
 	{
 		proj.GET("/webhooks", svc.HandleList)
 		proj.POST("/webhooks", svc.HandleCreate)

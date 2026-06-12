@@ -594,15 +594,15 @@ func (s *Service) HandleListEnvironments(c *gin.Context) {
 
 // HandleListAWSAccounts returns all AWS accounts belonging to the current user.
 func (s *Service) HandleListAWSAccounts(c *gin.Context) {
-	userID, ok := getUserID(c)
+	// AWS accounts belong to the active workspace; any member can list them.
+	orgID, _, ok := middleware.ActiveOrg(c, s.db)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "user not authenticated"})
 		return
 	}
 
 	rows, err := s.db.Pool.Query(c.Request.Context(),
-		`SELECT id, user_id, label, aws_account_id, iam_role_arn, created_at, updated_at
-		 FROM aws_accounts WHERE user_id = $1 ORDER BY created_at ASC`, userID)
+		`SELECT id, user_id, org_id, label, aws_account_id, iam_role_arn, created_at, updated_at
+		 FROM aws_accounts WHERE org_id = $1 ORDER BY created_at ASC`, orgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch AWS accounts"})
 		return
@@ -612,7 +612,7 @@ func (s *Service) HandleListAWSAccounts(c *gin.Context) {
 	var accounts []models.AWSAccount
 	for rows.Next() {
 		var a models.AWSAccount
-		if err := rows.Scan(&a.ID, &a.UserID, &a.Label, &a.AWSAccountID, &a.IAMRoleARN, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.UserID, &a.OrgID, &a.Label, &a.AWSAccountID, &a.IAMRoleARN, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			continue
 		}
 		accounts = append(accounts, a)
@@ -624,11 +624,20 @@ func (s *Service) HandleListAWSAccounts(c *gin.Context) {
 	c.JSON(http.StatusOK, accounts)
 }
 
-// HandleConnectAWSAccount saves a new AWS account record for the current user.
+// HandleConnectAWSAccount saves a new AWS account record for the active workspace.
+// Connecting AWS is an admin-only action.
 func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 	userID, ok := getUserID(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user not authenticated"})
+		return
+	}
+	orgID, role, ok := middleware.ActiveOrg(c, s.db)
+	if !ok {
+		return
+	}
+	if role != models.RoleAdmin {
+		c.JSON(http.StatusForbidden, gin.H{"error": "connecting an AWS account requires the admin role in this workspace"})
 		return
 	}
 
@@ -690,6 +699,7 @@ func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 
 	account := &models.AWSAccount{
 		UserID:         userID,
+		OrgID:          &orgID,
 		Label:          req.Label,
 		AWSAccountID:   req.AWSAccountID,
 		IAMRoleARN:     req.IAMRoleARN,
@@ -698,10 +708,10 @@ func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 	}
 
 	err := s.db.Pool.QueryRow(c.Request.Context(),
-		`INSERT INTO aws_accounts (user_id, label, aws_account_id, iam_role_arn, external_id, certificate_arn)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO aws_accounts (user_id, org_id, label, aws_account_id, iam_role_arn, external_id, certificate_arn)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 RETURNING id, created_at, updated_at`,
-		account.UserID, account.Label, account.AWSAccountID, account.IAMRoleARN, account.ExternalID, account.CertificateARN,
+		account.UserID, account.OrgID, account.Label, account.AWSAccountID, account.IAMRoleARN, account.ExternalID, account.CertificateARN,
 	).Scan(&account.ID, &account.CreatedAt, &account.UpdatedAt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save AWS account"})
@@ -718,11 +728,15 @@ func (s *Service) HandleConnectAWSAccount(c *gin.Context) {
 	c.JSON(http.StatusCreated, account)
 }
 
-// HandleDeleteAWSAccount deletes an AWS account record owned by the current user.
+// HandleDeleteAWSAccount disconnects an AWS account from the active workspace.
+// Admin-only.
 func (s *Service) HandleDeleteAWSAccount(c *gin.Context) {
-	userID, ok := getUserID(c)
+	orgID, role, ok := middleware.ActiveOrg(c, s.db)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "user not authenticated"})
+		return
+	}
+	if role != models.RoleAdmin {
+		c.JSON(http.StatusForbidden, gin.H{"error": "disconnecting an AWS account requires the admin role in this workspace"})
 		return
 	}
 
@@ -733,8 +747,8 @@ func (s *Service) HandleDeleteAWSAccount(c *gin.Context) {
 	}
 
 	result, err := s.db.Pool.Exec(c.Request.Context(),
-		`DELETE FROM aws_accounts WHERE id = $1 AND user_id = $2`,
-		accountID, userID,
+		`DELETE FROM aws_accounts WHERE id = $1 AND org_id = $2`,
+		accountID, orgID,
 	)
 	if err != nil {
 		// Foreign-key violation (23503): the account is still linked to projects or
