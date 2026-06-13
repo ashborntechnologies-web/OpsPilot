@@ -593,3 +593,37 @@ export function incidentWsURL(incidentId: string) {
   const base = apiUrl.replace(/^http/, "ws");
   return `${base}/api/v1/ws/incidents/${incidentId}`;
 }
+
+// ---- Slack integration ---------------------------------------------------------
+
+import type { SlackStatus, SlackChannel } from "@/types/api";
+
+export function getSlackStatus(token: string, orgId: string) {
+  return request<SlackStatus>(`/orgs/${orgId}/slack`, token);
+}
+
+export function getSlackInstallURL(token: string, orgId: string) {
+  return request<{ url: string }>(`/orgs/${orgId}/slack/install`, token);
+}
+
+export function listSlackChannels(token: string, orgId: string) {
+  return request<SlackChannel[]>(`/orgs/${orgId}/slack/channels`, token);
+}
+
+export function updateSlackChannels(
+  token: string,
+  orgId: string,
+  body: {
+    alert_channel_id?: string | null; alert_channel_name?: string | null;
+    deploy_channel_id?: string | null; deploy_channel_name?: string | null;
+    summary_channel_id?: string | null; summary_channel_name?: string | null;
+  }
+) {
+  return request<{ message: string }>(`/orgs/${orgId}/slack`, token, {
+    method: "PATCH", body: JSON.stringify(body),
+  });
+}
+
+export function disconnectSlack(token: string, orgId: string) {
+  return request<{ message: string }>(`/orgs/${orgId}/slack`, token, { method: "DELETE" });
+}

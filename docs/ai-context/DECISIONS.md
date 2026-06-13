@@ -243,6 +243,38 @@ CURRENT_STATE).
 
 ---
 
+## ADR-011 — Slack via raw HTTP (no SDK)
+**Date:** 2026-06-13 · **Status:** Accepted
+
+**Decision.** Integrate Slack by calling the Slack Web API directly over HTTP
+(`chat.postMessage`, `oauth.v2.access`, `conversations.list`) with Bearer-token auth,
+rather than adding the official Slack Go SDK.
+
+**Context.** OpsPilot needs a small, well-defined slice of Slack: post messages, run
+OAuth v2, list channels, and verify slash-command/interactivity signatures. The codebase
+already favors thin, dependency-light HTTP clients (see `internal/llm`, the AWS calls).
+
+**Alternatives.**
+- *`slack-go/slack` SDK* — rejected: a large dependency (events API, sockets, RTM, dozens
+  of methods) for the ~4 endpoints we use; more surface to vet and keep updated, and it
+  pulls its own transitive deps. The proprietary-platform posture favors minimal deps.
+- *Incoming webhooks only* — rejected: webhooks can't list channels, run slash commands,
+  or post to multiple configurable channels with one bot token.
+
+**Rationale.** Raw HTTP keeps the dependency footprint flat, matches the existing `llm`
+client pattern, and the surface we need is tiny and stable. Signature verification
+(HMAC-SHA256) and OAuth are a few lines each. The base `SendMessage` + Block Kit helpers
+are reused by every notification type.
+
+**Impact.** New `internal/slack` package (service/oauth/commands) with no third-party
+Slack dependency; `pkg/crypto` extracted for the encrypted bot token; interface seams
+(`deploy.SlackNotifier`, `monitor.SlackAlertNotifier`, `slack.Deployer`) avoid import
+cycles. **Limitations** (CURRENT_STATE): slash commands aren't mapped to a platform
+user/role; the alert "Acknowledge" button is a war-room link (no incident exists at alert
+time). Added `/slack/interactivity` (beyond the spec) for the Approve-button deploy flow.
+
+---
+
 ## ADR-008 — Tenant isolation via one ownership middleware
 **Date:** 2025-Q4 · **Status:** Superseded by ADR-009 (RBAC/org membership replaces
 single-user ownership; the "one middleware guard" principle carries forward)

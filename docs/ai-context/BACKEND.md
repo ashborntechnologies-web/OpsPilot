@@ -164,6 +164,18 @@ account/ARN for the bootstrap template + same-account AssumeRole.
   emails owner. **HTTP:** `HandleListAlerts`, `HandleSnooze`, `HandleResolve`.
 - **Depends on:** `aws`, `events`, `llm`, `notify`, `ws`, `models`.
 
+## `internal/slack` — Slack integration
+- **Purpose:** per-org Slack notifications (alerts, deploys, daily digest) + `/opspilot`
+  slash commands. Raw HTTP to the Slack Web API (no SDK). See ADR-011.
+- **Files:** `service.go` (`SendMessage` base + `PostAlert`/`PostDeployResult`/
+  `PostDailySummary`/`PostDailySummaries`, `loadIntegration`, Block Kit helpers),
+  `oauth.go` (signed-state install URL, callback, channels list, get/update/disconnect),
+  `commands.go` (`HandleCommand` + signature verify + `HandleInteractivity`).
+- **Key type:** `Service` (db, httpClient, encryption keys, Slack app creds);
+  `Deployer` interface (injected `*deploy.Service`) for slash deploy/rollback.
+- **Consumed by:** `deploy` (via `SlackNotifier`), `monitor` (via `SlackAlertNotifier`),
+  `queue` (daily summary task). Tokens encrypted via `pkg/crypto`.
+
 ## `internal/notify` — email
 - `EmailService` over SMTP+STARTTLS. `SendAlert`, `SendDeployResult`. A logging no-op
   when SMTP env is unset (rest of platform never nil-checks).
@@ -221,6 +233,9 @@ account/ARN for the bootstrap template + same-account AssumeRole.
   war rooms), first-message `AuthFunc`/`RoomAuthFunc`, `Broadcast(room, Message)`,
   `MessageHandler` seam (conversation engine), `HandleUpgrade` (project/chat) +
   `HandleIncidentUpgrade` (broadcast-only war room). `Message{Type, Payload}`.
+- **`pkg/crypto`** — `Encrypt`/`Decrypt` (AES-256-GCM, key derived from ENCRYPTION_KEY,
+  `v1:` version prefix + legacy/rotation fallback). Shared secret-at-rest scheme used for
+  Slack bot tokens (and mirrored by `internal/github`'s token crypto).
 - **`pkg/middleware`** — `auth.go` (`RequireAuth`, `RequireProjectOwnership`,
   `ResolveToken`, user upsert), `ratelimit.go` (per-user token bucket), `cors.go`,
   `apikey.go` (admin), `proprietary.go` (IP/version headers), `requestid.go`

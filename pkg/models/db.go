@@ -108,6 +108,7 @@ func RunMigrations(db *DB) error {
 		extendIncidentsForWarRoom,
 		createIncidentTimelineTable,
 		createIncidentActionsTable,
+		createSlackIntegrationsTable,
 	}
 
 	for _, m := range migrations {
@@ -569,6 +570,28 @@ CREATE TABLE IF NOT EXISTS incident_timeline (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_incident_timeline ON incident_timeline(incident_id, created_at);`
+
+// createSlackIntegrationsTable stores one Slack workspace connection per org. The bot
+// token is encrypted at rest with ENCRYPTION_KEY (pkg/crypto). Channel IDs/names for
+// alerts, deploy notifications, and the daily summary are configurable.
+const createSlackIntegrationsTable = `
+CREATE TABLE IF NOT EXISTS slack_integrations (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id               UUID NOT NULL UNIQUE REFERENCES organizations(id) ON DELETE CASCADE,
+    team_id              TEXT NOT NULL DEFAULT '', -- Slack workspace ID (maps slash commands → org)
+    workspace_name       TEXT NOT NULL DEFAULT '',
+    bot_token            TEXT NOT NULL, -- encrypted
+    alert_channel_id     TEXT,
+    alert_channel_name   TEXT,
+    deploy_channel_id    TEXT,
+    deploy_channel_name  TEXT,
+    summary_channel_id   TEXT,
+    summary_channel_name TEXT,
+    installed_by         UUID REFERENCES users(id),
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_slack_team ON slack_integrations(team_id);`
 
 // createIncidentActionsTable stores remediation actions proposed during an incident
 // (by the AI or a human) and their approval lifecycle.

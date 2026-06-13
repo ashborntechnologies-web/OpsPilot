@@ -88,6 +88,8 @@ type Service struct {
 	riskLLM *llm.Client
 	// billingSvc enforces plan limits on project creation.
 	billingSvc *billing.Service
+	// slackNotifier posts deploy results to Slack (best-effort).
+	slackNotifier SlackNotifier
 
 	// seenDeliveries dedupes GitHub webhook deliveries by X-GitHub-Delivery GUID so a
 	// replayed request with a valid signature is not processed twice. Entries expire
@@ -136,6 +138,15 @@ func NewService(db *models.DB, awsSvc awssvc.AWSProvider, githubSvc githubsvc.Gi
 
 // SetEmailService injects the deploy-result email sender (set once at startup).
 func (s *Service) SetEmailService(e *notify.EmailService) { s.emailSvc = e }
+
+// SlackNotifier posts deploy results to Slack. Implemented by *slack.Service; injected to
+// avoid a deploy↔slack import cycle. All calls are best-effort.
+type SlackNotifier interface {
+	PostDeployResult(ctx context.Context, orgID uuid.UUID, projectName, envName, status, commitSHA, commitMessage, deployURL string) error
+}
+
+// SetSlackNotifier wires Slack deploy notifications (optional).
+func (s *Service) SetSlackNotifier(n SlackNotifier) { s.slackNotifier = n }
 
 // SetMemoryService injects the project-memory recorder (set once at startup).
 func (s *Service) SetMemoryService(m *memory.Service) { s.memorySvc = m }
@@ -2620,6 +2631,26 @@ func (s *Service) sendDeployResultEmail(ctx context.Context, project *models.Pro
 	url := strings.TrimRight(os.Getenv("FRONTEND_URL"), "/") + "/projects/" + project.ID.String()
 	if err := s.emailSvc.SendDeployResult(ctx, email, project.Name, env.Name, status, commitSHA, url); err != nil {
 		slog.Error(fmt.Sprintf("[deploy] result email failed: %v", err))
+	}
+
+	s.postDeploySlack(ctx, project, env, deploymentID, status, commitSHA, url)
+}
+
+// postDeploySlack posts the deploy result to the org's Slack deploy channel (best-effort:
+// errors are logged, never returned). Independent of email notification preferences.
+func (s *Service) postDeploySlack(ctx context.Context, project *models.Project, env *models.Environment, deploymentID uuid.UUID, status, commitSHA, url string) {
+	if s.slackNotifier == nil {
+		return
+	}
+	var orgID *uuid.UUID
+	var commitMsg *string
+	_ = s.db.Pool.QueryRow(ctx, `SELECT org_id FROM projects WHERE id = $1`, project.ID).Scan(&orgID)
+	_ = s.db.Pool.QueryRow(ctx, `SELECT commit_message FROM deployments WHERE id = $1`, deploymentID).Scan(&commitMsg)
+	if orgID == nil {
+		return
+	}
+	if err := s.slackNotifier.PostDeployResult(ctx, *orgID, project.Name, env.Name, status, commitSHA, deref(commitMsg), url); err != nil {
+		slog.Warn(fmt.Sprintf("[deploy] slack notify failed: %v", err))
 	}
 }
 

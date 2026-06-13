@@ -279,6 +279,33 @@ export interface IncidentDetail {
   actions: IncidentAction[];
 }
 
+export interface SlackChannel {
+  id: string;
+  name: string;
+}
+
+export interface SlackIntegration {
+  id: string;
+  org_id: string;
+  team_id: string;
+  workspace_name: string;
+  alert_channel_id: string | null;
+  alert_channel_name: string | null;
+  deploy_channel_id: string | null;
+  deploy_channel_name: string | null;
+  summary_channel_id: string | null;
+  summary_channel_name: string | null;
+  installed_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SlackStatus {
+  connected: boolean;
+  configured: boolean;
+  integration?: SlackIntegration;
+}
+
 export interface ConversationMessage {
   id: string;
   role: "user" | "assistant";

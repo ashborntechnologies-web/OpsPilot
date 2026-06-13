@@ -34,6 +34,9 @@ Frontend client: [`frontend/lib/api.ts`](../../frontend/lib/api.ts). Errors are
 | GET | `/api/v1/github/callback` | redirect | GitHub OAuth callback. |
 | GET | `/api/v1/cloudformation/bootstrap-template?region=` | `{template,script,external_id}` | BYOC setup template; consumed pre-auth by `/aws-accounts`. |
 | POST | `/api/v1/github/webhook` | `200` | GitHub PR events (HMAC-verified) → preview envs. Consumer: GitHub. |
+| GET | `/api/v1/slack/callback?code=&state=` | redirect | Slack OAuth callback (trust = HMAC-signed state) → store encrypted bot token. Consumer: Slack. |
+| POST | `/api/v1/slack/commands` | ephemeral/in-channel JSON | `/opspilot` slash command (trust = `X-Slack-Signature`). Consumer: Slack. |
+| POST | `/api/v1/slack/interactivity` | JSON | Block Kit button actions — deploy/rollback approval (signature-verified). Consumer: Slack. |
 
 ## User-scoped (RequireAuth)
 | Method | Path | Request | Response | Consumer |
@@ -61,6 +64,11 @@ Frontend client: [`frontend/lib/api.ts`](../../frontend/lib/api.ts). Errors are
 | GET | `/orgs/:orgId/members` | — | `OrganizationMember[]` (with email) | member |
 | GET | `/orgs/:orgId/resources?resource_type=&region=&project_id=(uuid\|null)` | — | `DiscoveredResource[]` (discovery inventory) | member |
 | GET | `/orgs/:orgId/incidents?limit=&offset=` | — | `Incident[]` (open first, then severity, then recency) | member |
+| GET | `/orgs/:orgId/slack` | — | `{connected, configured, integration?}` | member |
+| GET | `/orgs/:orgId/slack/channels` | — | `SlackChannel[]` (Slack conversations.list) | member |
+| GET | `/orgs/:orgId/slack/install` | — | `{url}` (signed-state OAuth URL) | **admin** |
+| PATCH | `/orgs/:orgId/slack` | `{alert/deploy/summary_channel_id+name}` | `{message}` | **admin** |
+| DELETE | `/orgs/:orgId/slack` | — | `{message}` (disconnect) | **admin** |
 
 ## Incident war room (RequireAuth; org membership + role checked per handler)
 `:incidentId` resolves its own org. Reads need any member; mutations need engineer+.

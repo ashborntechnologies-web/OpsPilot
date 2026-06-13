@@ -196,6 +196,14 @@ window. **`UNIQUE(org_id, resource_type, resource_id)`** makes re-scans idempote
 > ECS-service rows store `cluster_name`/`service_name`/`log_group_name` in `metadata`;
 > the monitor reads those to poll + log-scan discovered services assigned to a project.
 
+### `slack_integrations`
+One Slack workspace connection per org (`UNIQUE(org_id)`). `team_id` maps incoming slash
+commands back to the org; `bot_token` is **encrypted at rest** with ENCRYPTION_KEY
+(`pkg/crypto`, never exposed in JSON). Per-purpose channel routing: `alert_channel_*`,
+`deploy_channel_*`, `summary_channel_*` (id + name). `installed_by` records the admin who
+connected it. Managed by `internal/slack` (OAuth callback writes it; the integrations UI
+updates channels; disconnect deletes it).
+
 ### `conversations`
 Chat history per project. `role` (`user`/`assistant`), `message`, classified `intent`,
 `metadata` (JSONB). Source for the intent-classifier training export.

@@ -16,6 +16,41 @@ Format:
 
 ---
 
+## 2026-06-13 — Slack integration (notifications, daily summary, slash commands)
+- **What:** Per-org Slack integration for alert/deploy notifications, a daily digest, and
+  `/opspilot` slash commands.
+  - **Data model:** new `slack_integrations` table (one per org; `team_id`, encrypted
+    `bot_token`, per-purpose channel routing) + `SlackIntegration`/`DailySummary` models.
+  - **New `pkg/crypto`:** shared AES-256-GCM `Encrypt`/`Decrypt` (the scheme previously
+    inlined in `internal/github`); used for the Slack bot token.
+  - **New `internal/slack`:** raw-HTTP Slack Web API client — `SendMessage` base +
+    `PostAlert`/`PostDeployResult`/`PostDailySummary(+ies)`; OAuth v2 (signed-state
+    install URL + callback storing the encrypted token, channel list, get/update/
+    disconnect); `/opspilot` slash commands (`status`/`incidents`/`deploy`/`rollback`/
+    `help`) with `X-Slack-Signature` verification + `/slack/interactivity` for the
+    deploy/rollback Approve buttons.
+  - **Wiring:** alerts (`monitor.notifyOwner` → `SlackAlertNotifier`) and deploy results
+    (`deploy` → `SlackNotifier`) post to Slack best-effort; daily summary via a new
+    scheduler task (`TaskSlackSummary`, 14:00 UTC); `slack.Deployer` injected for slash
+    deploy/rollback. `validateEnv` warns when Slack env is unset; `.env.example` updated.
+  - **Frontend:** `/settings/integrations` (connect via OAuth, channel dropdowns from
+    `conversations.list`, disconnect) + settings sub-nav linking Members ↔ Integrations;
+    Slack types + API client.
+- **Files:** `pkg/crypto/crypto.go` (new); `pkg/models/{db,types}.go`;
+  `internal/slack/{service,oauth,commands}.go` (new); `internal/deploy/service.go`,
+  `internal/monitor/alerts.go`, `internal/queue/server.go`, `cmd/api/main.go`,
+  `.env.example`; frontend `types/api.ts`, `lib/api.ts`,
+  `app/settings/integrations/page.tsx` (new), `app/settings/organization/page.tsx`.
+- **Why:** Teams live in Slack — surfacing alerts/deploys and allowing deploy/rollback
+  from chat meets them where they are and shortens incident response.
+- **Assumptions changed:** notifications are now multi-channel (email + Slack);
+  secret-at-rest crypto is shared (`pkg/crypto`); deploys can be triggered from Slack
+  (via a confirmation), expanding the action surface beyond the web app.
+- **Verification:** `go build ./...`, `go vet ./...`, `gofmt -l`, `tsc --noEmit` all
+  clean. Slack API calls + OAuth not exercised against a live workspace here.
+- **Docs updated:** ARCHITECTURE (Slack flow), DATABASE_SCHEMA, API_CONTRACTS,
+  CURRENT_STATE, BACKEND, DECISIONS (ADR-011).
+
 ## 2026-06-12 — Incident war room (shared real-time investigation + AI postmortem)
 - **What:** Turned incidents into first-class, lifecycle-tracked objects with a shared
   real-time war room where the team investigates alongside the AI.

@@ -28,11 +28,21 @@ type AlertEngine struct {
 	llm      *llm.Client
 	hub      *ws.Hub
 	emailSvc *notify.EmailService
+	slack    SlackAlertNotifier
+}
+
+// SlackAlertNotifier posts alerts to an org's Slack channel. Implemented by
+// *slack.Service; injected to avoid a monitor↔slack import cycle. Best-effort.
+type SlackAlertNotifier interface {
+	PostAlert(ctx context.Context, orgID uuid.UUID, alert models.Alert, projectName, envName, incidentURL string) error
 }
 
 func NewAlertEngine(db *models.DB, llmClient *llm.Client, hub *ws.Hub, emailSvc *notify.EmailService) *AlertEngine {
 	return &AlertEngine{db: db, llm: llmClient, hub: hub, emailSvc: emailSvc}
 }
+
+// SetSlackNotifier wires Slack alert notifications (optional).
+func (a *AlertEngine) SetSlackNotifier(n SlackAlertNotifier) { a.slack = n }
 
 // MapEventToAlert returns the alert type for an operational event, or "" when
 // the event does not produce an alert. Pure function — unit tested.
@@ -255,25 +265,38 @@ func (a *AlertEngine) generateSummary(ctx context.Context, ev models.Operational
 	return summary
 }
 
-// notifyOwner emails the project owner if their notification preferences allow it.
+// notifyOwner emails the project owner (if their preferences allow) and posts to the
+// org's Slack alert channel (if connected). Both are best-effort.
 func (a *AlertEngine) notifyOwner(ctx context.Context, alert models.Alert, projectName, envName string) {
-	var email string
-	var enabled bool
-	err := a.db.Pool.QueryRow(ctx, `
-		SELECT u.email, u.notifications_enabled AND u.notify_alert_fired
-		FROM users u JOIN projects p ON p.user_id = u.id
-		WHERE p.id = $1`, alert.ProjectID,
-	).Scan(&email, &enabled)
-	if err != nil || !enabled {
-		return
-	}
-
 	// Link to the incident war room. The specific incident is opened by the auto-
 	// diagnosis job that follows this alert, so we link to the org incident list where
 	// the in-progress incident appears (open incidents are surfaced first).
 	alertURL := strings.TrimRight(os.Getenv("FRONTEND_URL"), "/") + "/incidents"
-	if err := a.emailSvc.SendAlert(ctx, email, projectName, envName, alert.Title, alert.Summary, alertURL); err != nil {
-		slog.Warn("alert engine: email failed", "component", "monitor.alerts",
-			"project_id", alert.ProjectID, "error", err)
+
+	var email string
+	var enabled bool
+	var orgID *uuid.UUID
+	err := a.db.Pool.QueryRow(ctx, `
+		SELECT u.email, u.notifications_enabled AND u.notify_alert_fired, p.org_id
+		FROM users u JOIN projects p ON p.user_id = u.id
+		WHERE p.id = $1`, alert.ProjectID,
+	).Scan(&email, &enabled, &orgID)
+	if err != nil {
+		return
+	}
+
+	if enabled {
+		if err := a.emailSvc.SendAlert(ctx, email, projectName, envName, alert.Title, alert.Summary, alertURL); err != nil {
+			slog.Warn("alert engine: email failed", "component", "monitor.alerts",
+				"project_id", alert.ProjectID, "error", err)
+		}
+	}
+
+	// Slack — independent of email preferences (channel-level opt-in via connecting Slack).
+	if a.slack != nil && orgID != nil {
+		if err := a.slack.PostAlert(ctx, *orgID, alert, projectName, envName, alertURL); err != nil {
+			slog.Warn("alert engine: slack notify failed", "component", "monitor.alerts",
+				"project_id", alert.ProjectID, "error", err)
+		}
 	}
 }

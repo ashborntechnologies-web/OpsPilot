@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import useSWR from "swr";
 import { useAuth } from "@clerk/nextjs";
 import { Navbar } from "@/components/layout/navbar";
@@ -110,6 +111,14 @@ export default function OrganizationSettingsPage() {
         <div className="flex items-center gap-2">
           <Building2 className="h-5 w-5 text-indigo-600" />
           <h1 className="text-2xl font-bold tracking-tight">{activeOrg?.name ?? "Workspace"}</h1>
+        </div>
+
+        {/* Settings sub-navigation */}
+        <div className="flex gap-1">
+          <span className="px-3 py-1.5 text-sm rounded-md bg-zinc-900 text-white">Members</span>
+          <Link href="/settings/integrations" className="px-3 py-1.5 text-sm rounded-md hover:bg-zinc-100">
+            Integrations
+          </Link>
         </div>
 
         {orgLoading ? (

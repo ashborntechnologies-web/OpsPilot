@@ -10,6 +10,7 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/discovery"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/slack"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
@@ -23,8 +24,9 @@ const (
 	TaskRollback      = "rollback:run"
 	TaskWatchdog      = "watchdog:run"
 	TaskDeleteProject = "project:delete"
-	TaskScan          = "discovery:scan"     // scan one AWS account
-	TaskScanAll       = "discovery:scan_all" // enqueue a scan for every account (daily)
+	TaskScan          = "discovery:scan"      // scan one AWS account
+	TaskScanAll       = "discovery:scan_all"  // enqueue a scan for every account (daily)
+	TaskSlackSummary  = "slack:daily_summary" // post the daily digest to each org's Slack (daily)
 )
 
 type DeployPayload struct {
@@ -69,9 +71,10 @@ type Server struct {
 	deploySvc    *deploy.Service
 	diagnosisSvc *diagnosis.Service
 	discoverySvc *discovery.Service
+	slackSvc     *slack.Service
 }
 
-func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnosis.Service, discoverySvc *discovery.Service) *Server {
+func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnosis.Service, discoverySvc *discovery.Service, slackSvc *slack.Service) *Server {
 	srv := asynq.NewServer(
 		asynq.RedisClientOpt{Addr: redisURL},
 		asynq.Config{
@@ -89,6 +92,7 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 		deploySvc:    deploySvc,
 		diagnosisSvc: diagnosisSvc,
 		discoverySvc: discoverySvc,
+		slackSvc:     slackSvc,
 	}
 
 	s.mux.HandleFunc(TaskDeploy, s.handleDeploy)
@@ -99,6 +103,7 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 	s.mux.HandleFunc(TaskDeleteProject, s.handleDeleteProject)
 	s.mux.HandleFunc(TaskScan, s.handleScan)
 	s.mux.HandleFunc(TaskScanAll, s.handleScanAll)
+	s.mux.HandleFunc(TaskSlackSummary, s.handleSlackSummary)
 
 	return s
 }
@@ -252,6 +257,14 @@ func (s *Server) handleScanAll(ctx context.Context, _ *asynq.Task) error {
 	return s.discoverySvc.ScanAllAccounts(ctx)
 }
 
+// handleSlackSummary posts the daily digest to each org's Slack summary channel.
+func (s *Server) handleSlackSummary(ctx context.Context, _ *asynq.Task) error {
+	if s.slackSvc == nil {
+		return nil
+	}
+	return s.slackSvc.PostDailySummaries(ctx)
+}
+
 func (s *Server) handleDiagnose(ctx context.Context, t *asynq.Task) error {
 	var p DiagnosePayload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
@@ -345,6 +358,10 @@ func NewScanAllTask() *asynq.Task {
 	return asynq.NewTask(TaskScanAll, nil, asynq.Queue("default"), asynq.MaxRetry(0))
 }
 
+func NewSlackSummaryTask() *asynq.Task {
+	return asynq.NewTask(TaskSlackSummary, nil, asynq.Queue("default"), asynq.MaxRetry(0))
+}
+
 func NewDiagnoseTask(projectID, deploymentID string) (*asynq.Task, error) {
 	payload, err := json.Marshal(DiagnosePayload{
 		ProjectID:    projectID,
@@ -378,6 +395,10 @@ func (sc *Scheduler) Start() error {
 		return err
 	}
 	if _, err := sc.s.Register("@every 24h", NewScanAllTask()); err != nil {
+		return err
+	}
+	// Daily Slack digest at 14:00 UTC (~morning in the Americas).
+	if _, err := sc.s.Register("0 14 * * *", NewSlackSummaryTask()); err != nil {
 		return err
 	}
 	return sc.s.Start()

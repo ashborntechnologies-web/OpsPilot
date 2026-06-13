@@ -323,11 +323,46 @@ user via WebSocket and email (`internal/notify`, a no-op without SMTP).
 
 ---
 
+## Slack integration
+
+Per-org Slack workspace connection (`internal/slack`, ADR-011) for notifications and
+slash commands. Talks to the Slack Web API over **raw HTTP** (no SDK).
+
+```mermaid
+graph TB
+  subgraph Connect
+    INSTALL["GET /orgs/:id/slack/install (admin)\n→ signed-state OAuth URL"] --> SLACKOAUTH["Slack OAuth consent"]
+    SLACKOAUTH --> CB["GET /slack/callback\n(verify state) → store bot_token (encrypted)"]
+    CB --> SI[(slack_integrations)]
+  end
+  ALERTS["monitor.notifyOwner"] -->|PostAlert| SI
+  DEPLOY["deploy result"] -->|PostDeployResult| SI
+  DAILY["scheduler 14:00 UTC"] -->|PostDailySummaries| SI
+  SI -->|chat.postMessage (Bearer)| SLACK["Slack workspace"]
+  SLACK -->|/opspilot| CMD["POST /slack/commands\n(verify X-Slack-Signature)"]
+  CMD -->|status/incidents/help| SLACK
+  CMD -->|deploy/rollback confirm| BTN["Approve button"]
+  BTN --> INT["POST /slack/interactivity\n(verify signature) → deploySvc.TriggerDeploy"]
+```
+
+- **Notifications** (best-effort, never block the caller): alerts → `PostAlert`
+  (color-coded, links to the war room); deploy results → `PostDeployResult`;
+  morning digest → `PostDailySummary` (daily scheduler). All resolve the org's
+  connected workspace + channel and no-op if absent.
+- **Slash commands** (`/opspilot status|incidents|deploy|rollback|help`): the workspace
+  maps to an org via `team_id`; responses are ephemeral except deploy/rollback
+  **confirmations** (in-channel, Approve button → `/slack/interactivity` → deploy).
+- **Trust:** OAuth uses an HMAC-signed `state` (org+user); commands/interactivity verify
+  the `X-Slack-Signature` HMAC. Bot tokens are encrypted at rest (`pkg/crypto`).
+- **Injection seams** (no import cycles): `deploy.SlackNotifier`,
+  `monitor.SlackAlertNotifier`, `slack.Deployer`.
+
 ## External integrations
 
 | Integration | Used for | Where |
 |---|---|---|
 | **Clerk** | User auth (JWT + JWKS), user profile (email) | `internal/auth`, `pkg/middleware/auth.go` |
+| **Slack** | Per-org alert/deploy notifications, daily digest, `/opspilot` slash commands | `internal/slack` |
 | **Anthropic (Claude)** | Intent classification, diagnosis, summaries | `internal/llm` |
 | **GitHub** | OAuth, repo/branch list, framework detection, PR webhooks (previews) | `internal/github`, `deploy.HandleGithubWebhook` |
 | **AWS (STS, CloudFormation, ECS, ECR, CodeBuild, ELBv2, SSM, CloudWatch, Cost Explorer)** | All infra in the user's account | `internal/aws` |

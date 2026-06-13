@@ -32,6 +32,7 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/orgs"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/prompts"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/queue"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/slack"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/terminal"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/users"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/webhooks"
@@ -127,6 +128,9 @@ func validateEnv() {
 	}
 	if os.Getenv("ADMIN_API_KEY") == "" {
 		log.Println("WARNING: ADMIN_API_KEY not set — admin training-data export endpoints are disabled")
+	}
+	if os.Getenv("SLACK_CLIENT_ID") == "" || os.Getenv("SLACK_CLIENT_SECRET") == "" || os.Getenv("SLACK_SIGNING_SECRET") == "" {
+		log.Println("WARNING: SLACK_CLIENT_ID/SLACK_CLIENT_SECRET/SLACK_SIGNING_SECRET not all set — Slack integration (notifications, slash commands) is disabled")
 	}
 }
 
@@ -269,12 +273,24 @@ func main() {
 	conversationSvc := conversation.NewService(db, deploySvc, diagnosisSvc, os.Getenv("ANTHROPIC_API_KEY"), hub)
 	conversationSvc.SetBillingService(billingSvc)
 
+	// Slack integration — alert/deploy notifications, daily summary, slash commands.
+	slackSvc := slack.NewService(
+		db,
+		os.Getenv("ENCRYPTION_KEY"), os.Getenv("ENCRYPTION_KEY_PREV"),
+		os.Getenv("SLACK_CLIENT_ID"), os.Getenv("SLACK_CLIENT_SECRET"), os.Getenv("SLACK_SIGNING_SECRET"),
+		os.Getenv("PUBLIC_API_URL"), os.Getenv("FRONTEND_URL"),
+	)
+	slackSvc.SetDeployer(deploySvc)
+	deploySvc.SetSlackNotifier(slackSvc)
+	alertEngine.SetSlackNotifier(slackSvc)
+
 	// Init job queue server
 	queueServer := queue.NewServer(
 		os.Getenv("REDIS_URL"),
 		deploySvc,
 		diagnosisSvc,
 		discoverySvc,
+		slackSvc,
 	)
 	go queueServer.Start()
 	defer queueServer.Stop()
@@ -394,6 +410,14 @@ func main() {
 		org.GET("/members", orgsSvc.HandleListMembers)
 		org.GET("/resources", discoverySvc.HandleListOrgResources) // discovered resource inventory
 		org.GET("/incidents", incidentsSvc.HandleListOrgIncidents) // war-room incident list
+
+		// Slack integration — read for any member; install/config/disconnect are admin.
+		org.GET("/slack", slackSvc.HandleGetIntegration)
+		org.GET("/slack/channels", slackSvc.HandleListChannels)
+		org.GET("/slack/install", middleware.RequireRole(models.RoleAdmin), slackSvc.HandleInstallURL)
+		org.PATCH("/slack", middleware.RequireRole(models.RoleAdmin), slackSvc.HandleUpdateChannels)
+		org.DELETE("/slack", middleware.RequireRole(models.RoleAdmin), slackSvc.HandleDisconnect)
+
 		org.POST("/invites", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleCreateInvite)
 		org.PATCH("/members/:userId", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleUpdateMemberRole)
 		org.DELETE("/members/:userId", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleRemoveMember)
@@ -485,6 +509,12 @@ func main() {
 
 	// GitHub webhook — public; authentication via HMAC-SHA256 signature.
 	v1.POST("/github/webhook", deploySvc.HandleGithubWebhook)
+
+	// Slack — public endpoints. OAuth callback (trust = signed state); slash commands and
+	// interactive components (trust = X-Slack-Signature HMAC).
+	v1.GET("/slack/callback", slackSvc.HandleCallback)
+	v1.POST("/slack/commands", slackSvc.HandleCommand)
+	v1.POST("/slack/interactivity", slackSvc.HandleInteractivity)
 
 	// WebSocket — outside the auth middleware; auth + project-ownership are verified
 	// via the first-message token (see wsAuthFn).

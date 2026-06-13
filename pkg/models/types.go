@@ -642,6 +642,39 @@ type DiscoveredResource struct {
 	LastSeenAt   time.Time      `json:"last_seen_at" db:"last_seen_at"`
 }
 
+// ─── Slack integration ───────────────────────────────────────────────────────
+
+// SlackIntegration is an org's connected Slack workspace and its channel routing.
+// BotToken is encrypted at rest (never exposed in JSON).
+type SlackIntegration struct {
+	ID                 uuid.UUID  `json:"id" db:"id"`
+	OrgID              uuid.UUID  `json:"org_id" db:"org_id"`
+	TeamID             string     `json:"team_id" db:"team_id"`
+	WorkspaceName      string     `json:"workspace_name" db:"workspace_name"`
+	BotToken           string     `json:"-" db:"bot_token"` // encrypted; never exposed
+	AlertChannelID     *string    `json:"alert_channel_id" db:"alert_channel_id"`
+	AlertChannelName   *string    `json:"alert_channel_name" db:"alert_channel_name"`
+	DeployChannelID    *string    `json:"deploy_channel_id" db:"deploy_channel_id"`
+	DeployChannelName  *string    `json:"deploy_channel_name" db:"deploy_channel_name"`
+	SummaryChannelID   *string    `json:"summary_channel_id" db:"summary_channel_id"`
+	SummaryChannelName *string    `json:"summary_channel_name" db:"summary_channel_name"`
+	InstalledBy        *uuid.UUID `json:"installed_by" db:"installed_by"`
+	CreatedAt          time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// DailySummary is the morning digest posted to an org's Slack summary channel.
+type DailySummary struct {
+	OrgName          string   `json:"org_name"`
+	Date             string   `json:"date"` // YYYY-MM-DD
+	DeploysSucceeded int      `json:"deploys_succeeded"`
+	DeploysFailed    int      `json:"deploys_failed"`
+	OpenIncidents    int      `json:"open_incidents"`
+	AlertsFired      int      `json:"alerts_fired"`
+	ProjectsCount    int      `json:"projects_count"`
+	Highlights       []string `json:"highlights"` // short per-project / per-incident notes
+}
+
 // ValidFramework reports whether the string is a supported framework identifier.
 func ValidFramework(f string) bool {
 	switch f {

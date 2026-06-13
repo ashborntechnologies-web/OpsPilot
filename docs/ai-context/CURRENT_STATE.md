@@ -28,6 +28,15 @@ Status is derived from the code on `main`, not from plans.
   near-duplicate merging.
 - Pre-deploy risk score (advisory, broadcast as `deploy_risk`) + deployment health score.
 
+**Slack integration**
+- Per-org Slack connect via OAuth v2 (admin); bot token encrypted at rest (`pkg/crypto`).
+- Notifications (best-effort): color-coded **alerts** (link to war room), **deploy
+  results** (green/red), and a daily **summary** digest (scheduler at 14:00 UTC). Channels
+  configurable per purpose on `/settings/integrations`.
+- `/opspilot` slash commands: `status`, `incidents`, `deploy [project] [env]`,
+  `rollback [project]`, `help` — deploy/rollback post an in-channel Approve confirmation
+  handled via `/slack/interactivity`. Request signatures verified (`X-Slack-Signature`).
+
 **Incident war room**
 - Incidents are first-class, lifecycle-tracked (`open`→`investigating`→`resolved`) with
   severity, acknowledgement, resolution, and an AI-generated postmortem.
@@ -112,6 +121,11 @@ Status is derived from the code on `main`, not from plans.
 - Email requires SMTP config; without it, notifications are logged no-ops.
 - **Billing is still per-user** (`CheckProjectLimit`/AI metering key off `user_id`), not
   per-org — a known seam now that projects are org-owned.
+- **Slack slash commands aren't tied to a platform user/role** — Slack users aren't
+  mapped to Clerk identities, so anyone in a connected workspace can run `/opspilot
+  deploy` (workspace connection is admin-gated). The alert "Acknowledge" button is a link
+  to the war room (no per-alert incident exists at alert time, so it can't be a true
+  action button). Both noted for a future Slack-identity-linking pass.
 - Role-aware dashboard guards the action **handlers** + shows a view-only banner;
   per-button `disabled` styling across every control is a follow-up (backend enforces
   regardless, so viewers always get 403).
