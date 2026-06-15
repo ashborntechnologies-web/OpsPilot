@@ -11,6 +11,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { useProjectWS, type ChatEntry } from "@/lib/use-ws";
+import { ConfidenceBadge } from "@/components/ai/explainability";
 import { getConversationHistory, getProject, listAlerts, listDeployments, submitDiagnosisFeedback } from "@/lib/api";
 import type { Project, Alert, Deployment } from "@/types/api";
 import { toast } from "sonner";
@@ -266,9 +267,17 @@ export default function ChatPage() {
             </div>
           )}
 
-          {entries.map((entry) => (
+          {entries.map((entry) => {
+            const confMatch = entry.role === "assistant" ? entry.content.match(/confidence:\s*(\d+)%/i) : null;
+            return (
             <div key={entry.id}>
               <MessageBubble entry={entry} />
+              {/* AI confidence badge — when the response carries a confidence percentage */}
+              {confMatch && (
+                <div className="mt-1 ml-10">
+                  <ConfidenceBadge score={Number(confMatch[1]) / 100} />
+                </div>
+              )}
               {/* Diagnosis feedback — shown after assistant messages containing a root cause */}
               {entry.role === "assistant" && entry.content.includes("Root Cause:") && (
                 <div className="mt-1.5 ml-10 text-xs">
@@ -300,7 +309,8 @@ export default function ChatPage() {
                 </div>
               )}
             </div>
-          ))}
+            );
+          })}
 
           <div ref={bottomRef} />
         </div>

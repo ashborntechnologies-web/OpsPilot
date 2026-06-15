@@ -148,15 +148,16 @@ func (a *AlertEngine) EvaluateEvent(ctx context.Context, ev models.OperationalEv
 	// Context for the title/summary.
 	envName, projectName := a.names(ctx, ev.ProjectID, ev.EnvironmentID)
 	title := alertTitle(alertType, envName)
-	summary := a.generateSummary(ctx, ev, envName, projectName, title)
+	summary, evidenceText := a.generateSummary(ctx, ev, envName, projectName, title)
 
 	alert := models.Alert{
-		ProjectID: ev.ProjectID,
-		AlertType: alertType,
-		Severity:  ev.Severity,
-		Title:     title,
-		Summary:   summary,
-		Status:    models.AlertStatusOpen,
+		ProjectID:    ev.ProjectID,
+		AlertType:    alertType,
+		Severity:     ev.Severity,
+		Title:        title,
+		Summary:      summary,
+		EvidenceText: &evidenceText,
+		Status:       models.AlertStatusOpen,
 	}
 	alert.EnvironmentID = ev.EnvironmentID
 
@@ -166,11 +167,11 @@ func (a *AlertEngine) EvaluateEvent(ctx context.Context, ev models.OperationalEv
 	}
 
 	err = a.db.Pool.QueryRow(ctx, `
-		INSERT INTO alerts (project_id, org_id, environment_id, alert_type, severity, title, summary, source_event_ids)
-		VALUES ($1, (SELECT org_id FROM projects WHERE id = $1), $2, $3, $4, $5, $6, $7)
+		INSERT INTO alerts (project_id, org_id, environment_id, alert_type, severity, title, summary, evidence_text, source_event_ids)
+		VALUES ($1, (SELECT org_id FROM projects WHERE id = $1), $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id, triggered_at, created_at`,
 		alert.ProjectID, alert.EnvironmentID, alert.AlertType, alert.Severity,
-		alert.Title, alert.Summary, sourceIDs,
+		alert.Title, alert.Summary, evidenceText, sourceIDs,
 	).Scan(&alert.ID, &alert.TriggeredAt, &alert.CreatedAt)
 	if err != nil {
 		slog.Error("alert engine: failed to insert alert", "component", "monitor.alerts",
@@ -242,7 +243,12 @@ func (a *AlertEngine) names(ctx context.Context, projectID uuid.UUID, envID *uui
 
 // generateSummary asks the LLM for a one-sentence description, falling back to
 // a deterministic summary when the LLM is unavailable.
-func (a *AlertEngine) generateSummary(ctx context.Context, ev models.OperationalEvent, envName, projectName, title string) string {
+// generateSummary returns an LLM one-sentence summary plus a deterministic
+// evidence_text (1–2 sentences) explaining what in the event payload triggered the alert
+// — the alert's explainability, derived from real data rather than the model.
+func (a *AlertEngine) generateSummary(ctx context.Context, ev models.OperationalEvent, envName, projectName, title string) (summary, evidenceText string) {
+	evidenceText = alertEvidence(ev)
+
 	payloadJSON, _ := json.Marshal(ev.Payload)
 	prompt := fmt.Sprintf(
 		"In one sentence, describe this infrastructure alert for a developer. "+
@@ -256,13 +262,64 @@ func (a *AlertEngine) generateSummary(ctx context.Context, ev models.Operational
 	defer cancel()
 	summary, err := a.llm.Complete(llmCtx, "", prompt, 100)
 	if err != nil || strings.TrimSpace(summary) == "" {
-		return fmt.Sprintf("%s in %s/%s", title, projectName, envName)
+		return fmt.Sprintf("%s in %s/%s", title, projectName, envName), evidenceText
 	}
 	summary = strings.TrimSpace(summary)
 	if len(summary) > 200 {
 		summary = summary[:200]
 	}
-	return summary
+	return summary, evidenceText
+}
+
+// alertEvidence builds a short, factual explanation of what triggered an alert from the
+// operational event payload (no LLM) — e.g. error rate, task counts, matched log pattern.
+func alertEvidence(ev models.OperationalEvent) string {
+	p := ev.Payload
+	num := func(k string) (float64, bool) {
+		if v, ok := p[k]; ok {
+			switch n := v.(type) {
+			case float64:
+				return n, true
+			case int:
+				return float64(n), true
+			case int32:
+				return float64(n), true
+			}
+		}
+		return 0, false
+	}
+	switch ev.EventType {
+	case models.EventRuntimeServiceDown:
+		return "Triggered because the service has 0 running tasks while the desired count is above zero."
+	case models.EventRuntimeTasksDegraded:
+		r, ok1 := num("running")
+		d, ok2 := num("desired")
+		if ok1 && ok2 {
+			return fmt.Sprintf("Triggered because only %.0f of %.0f desired tasks are running.", r, d)
+		}
+		return "Triggered because fewer tasks are running than desired."
+	case models.EventRuntimeHighErrorRate:
+		if pct, ok := num("error_rate_pct"); ok {
+			return fmt.Sprintf("Triggered by an elevated 5xx error rate of %.1f%% over the sampling window.", pct)
+		}
+		return "Triggered by an elevated 5xx error rate from the load balancer."
+	case models.EventRuntimeHighLatency:
+		if ms, ok := num("p99_latency_ms"); ok {
+			return fmt.Sprintf("Triggered by p99 latency of %.0f ms exceeding the threshold.", ms)
+		}
+		return "Triggered by p99 latency exceeding the threshold."
+	case models.EventRuntimeLogAnomaly:
+		pt, _ := p["pattern_type"].(string)
+		if n, ok := num("line_count"); ok && pt != "" {
+			return fmt.Sprintf("Matched the %q anomaly pattern in %.0f recent log line(s).", pt, n)
+		}
+		if pt != "" {
+			return fmt.Sprintf("Matched the %q anomaly pattern in recent application logs.", pt)
+		}
+		return "Matched an anomaly pattern in recent application logs."
+	default:
+		return fmt.Sprintf("Triggered by a %s event from continuous monitoring.", strings.ReplaceAll(ev.EventType, ".", " "))
+	}
 }
 
 // notifyOwner emails the project owner (if their preferences allow) and posts to the

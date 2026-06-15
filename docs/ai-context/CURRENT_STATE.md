@@ -28,6 +28,16 @@ Status is derived from the code on `main`, not from plans.
   near-duplicate merging.
 - Pre-deploy risk score (advisory, broadcast as `deploy_risk`) + deployment health score.
 
+**Explainability & confidence**
+- Every AI decision shows *why*: diagnoses carry a confidence score (0–1) + a structured
+  evidence array (`{type, description, data, weight}`) from a second Claude call, stored on
+  the incident and rendered as a confidence badge + collapsible evidence list (diagnosis
+  dialog, war room, chat).
+- Alerts carry a deterministic `evidence_text` (1–2 sentences from the event payload),
+  shown under the summary in the alerts panel.
+- Risk scores expose every factor's reason + a `top_factor`; the full factor list is in the
+  `deploy_risk` WS payload. Shared UI: `components/ai/explainability.tsx`.
+
 **Daily operational summary**
 - AI morning briefing per org (`internal/summary`): last-24h deploys, incidents + MTTR,
   alerts, 7-day top recurring failures → Claude paragraph + ≤3 grounded recommendations,

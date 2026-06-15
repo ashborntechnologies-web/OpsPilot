@@ -16,6 +16,41 @@ Format:
 
 ---
 
+## 2026-06-15 — Explainability & confidence on every AI decision
+- **What:** Every AI output now ships with a "why" — confidence + structured evidence.
+  - **Data model:** `incidents.confidence_score` (FLOAT 0–1) + `incidents.evidence` (JSONB
+    array of `{type, description, data, weight}`); `alerts.evidence_text`. New
+    `models.EvidenceItem`; `RiskScore.TopFactor`.
+  - **Diagnosis:** a second structured Claude call (`analyzeConfidenceEvidence`, 500
+    tokens) scores confidence (0–100→0–1) and enumerates evidence; threaded through
+    `diagnose()`/`DiagnoseProject`/runtime and `incidents.CreateParams`/`CreateIncident`
+    (stored on insert + refreshed on re-diagnosis). Fails safe (`confidence=null,
+    evidence=[]`). `HandleDiagnose` returns confidence+evidence; chat appends a compact
+    "Based on N signals — confidence: X%" line.
+  - **Alerts:** `generateSummary` now also returns a deterministic `evidence_text` built
+    from the event payload (error rate / task counts / matched log pattern); stored on
+    insert and returned by the alerts list.
+  - **Risk:** `ScoreFromSignals` sets `TopFactor` (highest-points reason); the full factor
+    list already rides in the `deploy_risk` WS payload.
+  - **Frontend:** shared `components/ai/explainability.tsx` (`ConfidenceBadge` color-coded
+    >75/50–75/<50; `EvidenceSection` collapsible typed cards). Wired into the diagnosis
+    dialog, incident war room (left panel), and chat (confidence badge); `evidence_text`
+    under alerts in `AlertsPanel`; factor-count tooltip + `top_factor` on the risk banner.
+    Diagnose API + Incident/Alert/RiskScore types updated.
+- **Files:** `pkg/models/{db,types}.go`; `internal/diagnosis/service.go`,
+  `internal/incidents/{service,handlers}.go`, `internal/monitor/{alerts,handlers}.go`,
+  `internal/deploy/riskscore.go`; frontend `types/api.ts`, `lib/api.ts`,
+  `components/ai/explainability.tsx` (new), `components/project/alerts-panel.tsx`,
+  `app/projects/[id]/page.tsx`, `app/projects/[id]/chat/page.tsx`,
+  `app/incidents/[id]/page.tsx`.
+- **Why:** Engineers must be able to interrogate and trust AI conclusions — the "show your
+  work" requirement for an AI DevOps engineer.
+- **Assumptions changed:** diagnosis now costs a second (bounded) LLM call; AI outputs are
+  contracts with confidence + typed evidence, not opaque prose.
+- **Verification:** `go build`/`go vet`/`gofmt`/`tsc --noEmit` all clean. The evidence
+  LLM call not exercised against live Claude.
+- **Docs updated:** ARCHITECTURE, DATABASE_SCHEMA, CURRENT_STATE, DECISIONS (ADR-012).
+
 ## 2026-06-15 — Daily operational summary (AI morning briefing)
 - **What:** A dedicated, richer daily summary subsystem (`internal/summary`) — supersedes
   the simple Slack-only digest stubbed during the Slack feature.

@@ -275,6 +275,42 @@ time). Added `/slack/interactivity` (beyond the spec) for the Approve-button dep
 
 ---
 
+## ADR-012 — Explainability: confidence + a structured evidence array
+**Date:** 2026-06-15 · **Status:** Accepted
+
+**Decision.** Every AI decision is explainable. Diagnoses store a `confidence_score`
+(0.0–1.0) and an `evidence` JSONB **array** of items
+`{type, description, data, weight}` (type ∈ log_pattern | metric_spike |
+deploy_correlation | memory_match | similar_incident), produced by a *second*, structured
+Claude call after the prose diagnosis. Alerts store a deterministic `evidence_text`. Risk
+scores already carry per-factor reasons (+ a `top_factor`).
+
+**Context.** Engineers won't trust — or act on — AI output they can't interrogate. The
+diagnosis prose alone doesn't expose *which signals* drove the conclusion or how sure the
+model is.
+
+**Alternatives.**
+- *Parse evidence out of the single diagnosis response* — rejected: brittle, and mixes
+  free-form prose with structure. A dedicated structured call yields clean JSON.
+- *Free-form "reasoning" string* — rejected: not renderable as discrete, weighted signals;
+  an array of typed items powers per-signal UI cards and future scoring/aggregation.
+- *LLM-generated alert evidence* — rejected for alerts: the triggering data (error rate,
+  task counts, matched pattern) is already in the event payload, so a deterministic
+  sentence is cheaper, instant, and always accurate (no extra token cost on the hot path).
+
+**Rationale.** A typed, weighted evidence array is a stable contract the UI renders
+uniformly (`components/ai/explainability.tsx`) and that can later feed confidence
+calibration or "similar incident" retrieval. The second diagnosis call is bounded
+(500 tokens) and fully degradable — failure saves `confidence=null, evidence=[]`.
+
+**Impact.** `incidents.confidence_score`/`evidence`, `alerts.evidence_text`,
+`models.EvidenceItem`, `RiskScore.TopFactor`; a second diagnosis LLM call; the
+diagnose() return + `incidents.CreateParams` thread confidence/evidence through; shared
+frontend `ConfidenceBadge`/`EvidenceSection`. Adds one LLM call per diagnosis (the extra
+latency/cost is acceptable for a low-frequency, high-stakes action).
+
+---
+
 ## ADR-008 — Tenant isolation via one ownership middleware
 **Date:** 2025-Q4 · **Status:** Superseded by ADR-009 (RBAC/org membership replaces
 single-user ownership; the "one middleware guard" principle carries forward)

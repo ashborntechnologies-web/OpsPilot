@@ -150,6 +150,7 @@ export interface Alert {
   severity: "warn" | "error" | "info";
   title: string;
   summary: string;
+  evidence_text?: string | null;
   status: "open" | "resolved" | "snoozed";
   triggered_at: string;
   resolved_at: string | null;
@@ -161,6 +162,7 @@ export interface RiskScore {
   level: "low" | "medium" | "high" | "critical";
   factors: { name: string; points: number; reason: string }[];
   explanation: string;
+  top_factor?: string;
 }
 
 export interface UserMe {
@@ -227,6 +229,13 @@ export interface DiscoveredResource {
 export type IncidentStatus = "open" | "investigating" | "resolved";
 export type IncidentSeverity = "info" | "warn" | "error";
 
+export interface EvidenceItem {
+  type: "log_pattern" | "metric_spike" | "deploy_correlation" | "memory_match" | "similar_incident" | string;
+  description: string;
+  data?: Record<string, unknown>;
+  weight: number; // 0.0–1.0
+}
+
 export interface Incident {
   id: string;
   project_id: string;
@@ -236,6 +245,8 @@ export interface Incident {
   trigger: string;
   root_cause?: string | null;
   resolution?: string | null;
+  confidence_score?: number | null; // 0.0–1.0
+  evidence?: EvidenceItem[];
   title: string | null;
   status: IncidentStatus;
   severity: IncidentSeverity;

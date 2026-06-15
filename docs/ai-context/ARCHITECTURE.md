@@ -212,6 +212,24 @@ pointing at dashboard buttons.
   in source. Model defaults to the latest Claude (see `internal/llm`).
 - Every LLM call has a degradation path; an AI outage never hard-fails a request.
 
+### Explainability & confidence (ADR-012)
+Every AI decision carries a "why". Three mechanisms:
+- **Diagnosis** makes a *second* structured Claude call (`analyzeConfidenceEvidence`,
+  max 500 tokens) returning a confidence (0–100 → stored 0.0–1.0 on `incidents.confidence_score`)
+  and a JSONB **evidence** array on `incidents.evidence`. Each evidence item is
+  `{type, description, data, weight}` where `type` ∈ `log_pattern | metric_spike |
+  deploy_correlation | memory_match | similar_incident`. If the call fails, the diagnosis
+  is still saved with `confidence=null, evidence=[]`. Chat appends a compact
+  "Based on N signal(s) — confidence: X%" line; the dashboard/war room render a colored
+  confidence badge + a collapsible evidence list (`components/ai/explainability.tsx`).
+- **Alerts** carry `evidence_text` (1–2 sentences) built **deterministically** from the
+  triggering operational-event payload (error rate, task counts, matched log pattern) —
+  no LLM, so it's always present and accurate. Shown under the alert summary.
+- **Risk scores** are already explainable: every `RiskFactor` has a `Reason`; `TopFactor`
+  is the highest-points reason for compact display. The full factor list rides in the
+  `deploy_risk` WebSocket payload.
+- *Principle:* no AI output appears in the UI without at least one sentence of explanation.
+
 ---
 
 ## Memory architecture

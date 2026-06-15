@@ -139,6 +139,11 @@ type Incident struct {
 	Resolution    *string    `json:"resolution" db:"resolution"`
 	RawLogs       *string    `json:"-" db:"raw_logs"`
 
+	// Explainability: AI confidence (0.0–1.0) + the structured evidence behind the
+	// diagnosis. Evidence is db:"-" (scanned from the JSONB column into the slice).
+	ConfidenceScore *float64       `json:"confidence_score" db:"confidence_score"`
+	Evidence        []EvidenceItem `json:"evidence" db:"-"`
+
 	// War-room lifecycle fields.
 	Title          *string    `json:"title" db:"title"`
 	Status         string     `json:"status" db:"status"` // open | investigating | resolved
@@ -154,6 +159,16 @@ type Incident struct {
 	EnvironmentName    string `json:"environment_name,omitempty" db:"-"`
 	ProjectName        string `json:"project_name,omitempty" db:"-"`
 	AcknowledgedByName string `json:"acknowledged_by_name,omitempty" db:"-"`
+}
+
+// EvidenceItem is one structured signal the AI used in its reasoning, surfaced so
+// engineers can see *why* a conclusion was reached. Stored as a JSONB array on incidents.
+type EvidenceItem struct {
+	// Type ∈ log_pattern | metric_spike | deploy_correlation | memory_match | similar_incident
+	Type        string         `json:"type"`
+	Description string         `json:"description"` // human-readable explanation
+	Data        map[string]any `json:"data,omitempty"`
+	Weight      float64        `json:"weight"` // 0.0–1.0, how much this contributed
 }
 
 // Incident status + severity constants.
@@ -491,6 +506,7 @@ type Alert struct {
 	Severity       string      `json:"severity" db:"severity"`
 	Title          string      `json:"title" db:"title"`
 	Summary        string      `json:"summary" db:"summary"`
+	EvidenceText   *string     `json:"evidence_text" db:"evidence_text"` // 1-2 sentences: what triggered this
 	Status         string      `json:"status" db:"status"`
 	TriggeredAt    time.Time   `json:"triggered_at" db:"triggered_at"`
 	ResolvedAt     *time.Time  `json:"resolved_at" db:"resolved_at"`

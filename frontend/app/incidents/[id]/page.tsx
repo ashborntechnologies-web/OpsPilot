@@ -17,6 +17,7 @@ import {
 } from "@/lib/api";
 import { useActiveOrg } from "@/lib/use-org";
 import { Markdown } from "@/lib/markdown";
+import { ConfidenceBadge, EvidenceSection } from "@/components/ai/explainability";
 import { SEVERITY_BADGE, STATUS_BADGE, timeOpen } from "@/lib/incidents";
 import type { IncidentDetail, IncidentTimelineEntry, IncidentAction, WsMessage } from "@/types/api";
 import { cn } from "@/lib/utils";
@@ -284,6 +285,16 @@ export default function WarRoomPage() {
           </div>
           <Meta label="Time open" value={timeOpen(incident.created_at, incident.resolved_at)} />
           <Meta label="Acknowledged by" value={incident.acknowledged_by_name || "—"} />
+
+          {/* AI explainability — confidence + the evidence behind the diagnosis. */}
+          {(incident.confidence_score != null || (incident.evidence && incident.evidence.length > 0)) && (
+            <div className="pt-1 border-t">
+              <p className="text-[10px] uppercase tracking-wide text-muted-foreground mt-3 mb-1.5">AI diagnosis</p>
+              <ConfidenceBadge score={incident.confidence_score} />
+              <EvidenceSection items={incident.evidence} className="mt-2" />
+            </div>
+          )}
+
           {incident.deployment_id && (
             <Link href={`/projects/${incident.project_id}`} className="text-xs text-indigo-600 hover:underline block">
               View project →

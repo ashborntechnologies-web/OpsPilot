@@ -32,7 +32,8 @@ import { StatusSidebar } from "@/components/project/status-sidebar";
 import { AlertsPanel } from "@/components/project/alerts-panel";
 import { useActiveOrg } from "@/lib/use-org";
 import { RESOURCE_ICONS, resourceLabel, resourceStatus } from "@/lib/resources";
-import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar, Webhook, CostSummary, Alert, RiskScore, UserMe, DiscoveredResource } from "@/types/api";
+import { ConfidenceBadge, EvidenceSection } from "@/components/ai/explainability";
+import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar, Webhook, CostSummary, Alert, RiskScore, UserMe, DiscoveredResource, EvidenceItem } from "@/types/api";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
@@ -207,6 +208,8 @@ export default function ProjectPage() {
   // diagnose
   const [diagnosing, setDiagnosing] = useState<string | null>(null);
   const [diagnosisResult, setDiagnosisResult] = useState<string | null>(null);
+  const [diagnosisConfidence, setDiagnosisConfidence] = useState<number | null>(null);
+  const [diagnosisEvidence, setDiagnosisEvidence] = useState<EvidenceItem[]>([]);
 
   // health
   const [healthData, setHealthData] = useState<Record<string, { status: string; running: number; desired: number; pending: number; url?: string }>>({});
@@ -773,8 +776,10 @@ export default function ProjectPage() {
     if (!token) return;
     setDiagnosing(dep.id);
     try {
-      const { diagnosis } = await diagnoseDeployment(token, id, dep.id);
-      setDiagnosisResult(diagnosis);
+      const res = await diagnoseDeployment(token, id, dep.id);
+      setDiagnosisResult(res.diagnosis);
+      setDiagnosisConfidence(res.confidence_score);
+      setDiagnosisEvidence(res.evidence ?? []);
     } catch (e: unknown) {
       toast.error((e as Error).message ?? "Diagnosis failed");
     } finally {
@@ -994,12 +999,16 @@ export default function ProjectPage() {
       <Dialog open={!!diagnosisResult} onOpenChange={(v) => !v && setDiagnosisResult(null)}>
         <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>AI Diagnosis</DialogTitle>
+            <DialogTitle className="flex items-center gap-2">
+              AI Diagnosis
+              <ConfidenceBadge score={diagnosisConfidence} />
+            </DialogTitle>
             <DialogDescription>Analysis of the last failed deployment</DialogDescription>
           </DialogHeader>
           <pre className="text-xs bg-zinc-950 text-zinc-100 rounded-lg p-4 whitespace-pre-wrap font-mono overflow-x-auto">
             {diagnosisResult}
           </pre>
+          <EvidenceSection items={diagnosisEvidence} />
           <DialogFooter>
             <Button variant="outline" onClick={() => setDiagnosisResult(null)}>Close</Button>
           </DialogFooter>
@@ -1190,10 +1199,15 @@ export default function ProjectPage() {
         {/* High-risk deploy banner (advisory, from the deploy_risk WS message) */}
         {currentRiskScore && (currentRiskScore.level === "high" || currentRiskScore.level === "critical") && (
           <div className="mb-6 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-            <p className="font-medium">
+            <p
+              className="font-medium"
+              title={`Score calculated from ${currentRiskScore.factors.filter((f) => f.points > 0).length} factor(s). See the breakdown below.`}
+            >
               ⚠️ {currentRiskScore.level === "critical" ? "Critical" : "High"} risk deploy (score {currentRiskScore.score}/100)
             </p>
-            {currentRiskScore.explanation && <p className="mt-0.5">{currentRiskScore.explanation}</p>}
+            {(currentRiskScore.explanation || currentRiskScore.top_factor) && (
+              <p className="mt-0.5">{currentRiskScore.explanation || currentRiskScore.top_factor}</p>
+            )}
             <ul className="mt-1.5 text-xs space-y-0.5 text-amber-800">
               {currentRiskScore.factors.filter((f) => f.points > 0).map((f) => (
                 <li key={f.name}>• {f.reason}</li>

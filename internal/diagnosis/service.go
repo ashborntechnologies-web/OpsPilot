@@ -2,6 +2,7 @@ package diagnosis
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -70,13 +71,21 @@ func (s *Service) HandleDiagnose(c *gin.Context) {
 		return
 	}
 
-	result, incidentID, err := s.diagnose(c.Request.Context(), projectID, deployment)
+	result, incidentID, confidence, evidence, err := s.diagnose(c.Request.Context(), projectID, deployment)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	if evidence == nil {
+		evidence = []models.EvidenceItem{}
+	}
 
-	c.JSON(http.StatusOK, gin.H{"diagnosis": result, "incident_id": incidentID})
+	c.JSON(http.StatusOK, gin.H{
+		"diagnosis":        result,
+		"incident_id":      incidentID,
+		"confidence_score": confidence,
+		"evidence":         evidence,
+	})
 }
 
 // DiagnoseProject diagnoses the most recent failed deployment — the entrypoint
@@ -87,15 +96,27 @@ func (s *Service) DiagnoseProject(ctx context.Context, projectID uuid.UUID) (str
 	if err != nil {
 		return "", fmt.Errorf("no failed deployment found: %w", err)
 	}
-	result, _, err := s.diagnose(ctx, projectID, deployment)
-	return result, err
+	result, _, confidence, evidence, err := s.diagnose(ctx, projectID, deployment)
+	if err != nil {
+		return "", err
+	}
+	return withConfidence(result, confidence, len(evidence)), nil
+}
+
+// withConfidence appends a compact confidence line to a chat diagnosis response, e.g.
+// "…based on 3 signals (confidence: 84%)". Omitted when confidence is unavailable.
+func withConfidence(text string, confidence *float64, signals int) string {
+	if confidence == nil {
+		return text
+	}
+	return fmt.Sprintf("%s\n\n_Based on %d signal(s) — confidence: %.0f%%_", text, signals, *confidence*100)
 }
 
 // diagnose collects real operational context (failure reason, live CloudWatch logs,
 // the deployment's event timeline, deployment history, and past incidents) for one
 // deployment and sends a structured, size-bounded prompt to Claude. Missing logs are
 // handled gracefully.
-func (s *Service) diagnose(ctx context.Context, projectID uuid.UUID, deployment *models.Deployment) (string, uuid.UUID, error) {
+func (s *Service) diagnose(ctx context.Context, projectID uuid.UUID, deployment *models.Deployment) (string, uuid.UUID, *float64, []models.EvidenceItem, error) {
 	if s.events != nil {
 		depID := deployment.ID
 		envID := deployment.EnvironmentID
@@ -144,15 +165,18 @@ func (s *Service) diagnose(ctx context.Context, projectID uuid.UUID, deployment 
 	}
 	diagnosis, err := s.analyzeWithClaude(ctx, userMessage)
 	if err != nil {
-		return "", uuid.Nil, fmt.Errorf("analysis failed: %w", err)
+		return "", uuid.Nil, nil, nil, fmt.Errorf("analysis failed: %w", err)
 	}
+
+	// Step 7.5: explainability — a second structured call for confidence + evidence.
+	confidence, evidence := s.analyzeConfidenceEvidence(ctx, diagnosis, userMessage)
 
 	// Step 8: save incident to memory layer
 	rawForMemory := failureReason
 	if len(logLines) > 0 {
 		rawForMemory = strings.Join(logLines, "\n")
 	}
-	incidentID := s.saveIncident(ctx, projectID, deployment.ID, "deploy_failure", rawForMemory, diagnosis)
+	incidentID := s.saveIncident(ctx, projectID, deployment.ID, "deploy_failure", rawForMemory, diagnosis, confidence, evidence)
 
 	if s.events != nil {
 		depID := deployment.ID
@@ -168,7 +192,7 @@ func (s *Service) diagnose(ctx context.Context, projectID uuid.UUID, deployment 
 		})
 	}
 
-	return diagnosis, incidentID, nil
+	return diagnosis, incidentID, confidence, evidence, nil
 }
 
 // fetchDeploymentLogs loads the environment for a deployment, assumes its IAM role, and
@@ -249,6 +273,60 @@ func buildDiagnosisContext(failureReason string, logLines []string, history, pas
 
 func (s *Service) analyzeWithClaude(ctx context.Context, userMessage string) (string, error) {
 	return s.llm.Complete(ctx, prompts.Diagnosis(), userMessage, 1000)
+}
+
+// analyzeConfidenceEvidence makes a second, structured call asking Claude to score its
+// own confidence (0–100) and enumerate the evidence it relied on, so the UI can show why
+// the diagnosis was reached. Returns (nil, nil) on any failure — the caller still saves
+// the diagnosis with confidence=null and evidence=[].
+func (s *Service) analyzeConfidenceEvidence(ctx context.Context, diagnosis, contextText string) (*float64, []models.EvidenceItem) {
+	system := "You assess your own diagnosis. Given the diagnosis and the data it was based " +
+		"on, respond with STRICT JSON: " +
+		`{"confidence":<0-100 int>,"evidence":[{"type":"log_pattern|metric_spike|deploy_correlation|memory_match|similar_incident","description":"<why this supports the diagnosis>","data":{},"weight":<0.0-1.0>}]}. ` +
+		"Only include evidence actually present in the data. Confidence reflects how well the data supports the root cause."
+
+	user := fmt.Sprintf("DIAGNOSIS:\n%s\n\nDATA AVAILABLE:\n%s", diagnosis, truncateForEvidence(contextText))
+	text, err := s.llm.Complete(ctx, system, user, 500)
+	if err != nil {
+		return nil, nil
+	}
+
+	var parsed struct {
+		Confidence float64               `json:"confidence"`
+		Evidence   []models.EvidenceItem `json:"evidence"`
+	}
+	if err := json.Unmarshal([]byte(stripJSONFences(text)), &parsed); err != nil {
+		return nil, nil
+	}
+	score := parsed.Confidence / 100.0
+	if score < 0 {
+		score = 0
+	}
+	if score > 1 {
+		score = 1
+	}
+	if parsed.Evidence == nil {
+		parsed.Evidence = []models.EvidenceItem{}
+	}
+	return &score, parsed.Evidence
+}
+
+// stripJSONFences removes markdown code fences the model occasionally wraps around JSON.
+func stripJSONFences(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "```json")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	return strings.TrimSpace(s)
+}
+
+// truncateForEvidence caps the context passed to the evidence call to control tokens.
+func truncateForEvidence(s string) string {
+	const max = 4000
+	if len(s) > max {
+		return s[:max] + "\n…(truncated)"
+	}
+	return s
 }
 
 // getDeployment loads one deployment scoped to the project (tenant-isolation guard).
@@ -340,7 +418,7 @@ func extractDiagnosisField(diagnosis, label string) string {
 	return strings.TrimSpace(rest)
 }
 
-func (s *Service) saveIncident(ctx context.Context, projectID, deploymentID uuid.UUID, trigger, logs, diagnosis string) uuid.UUID {
+func (s *Service) saveIncident(ctx context.Context, projectID, deploymentID uuid.UUID, trigger, logs, diagnosis string, confidence *float64, evidence []models.EvidenceItem) uuid.UUID {
 	// Store the structured pieces so the memory layer can show past causes AND
 	// their fixes; fall back to the full text when parsing fails.
 	rootCause := extractDiagnosisField(diagnosis, "Root Cause")
@@ -361,6 +439,8 @@ func (s *Service) saveIncident(ctx context.Context, projectID, deploymentID uuid
 			Resolution:        resolution,
 			RawLogs:           logs,
 			DiagnosisMarkdown: diagnosis,
+			ConfidenceScore:   confidence,
+			Evidence:          evidence,
 		}); err == nil {
 			return id
 		}
@@ -457,6 +537,7 @@ func (s *Service) DiagnoseRuntime(ctx context.Context, projectID uuid.UUID) (str
 		rootCause = diagnosis
 	}
 	resolution := extractDiagnosisField(diagnosis, "Fix")
+	confidence, evidence := s.analyzeConfidenceEvidence(ctx, diagnosis, userMessage)
 	var incidentID uuid.UUID
 	if s.incidents != nil {
 		incidentID, _ = s.incidents.CreateIncident(ctx, incidents.CreateParams{
@@ -468,6 +549,8 @@ func (s *Service) DiagnoseRuntime(ctx context.Context, projectID uuid.UUID) (str
 			Resolution:        resolution,
 			RawLogs:           rawForMemory,
 			DiagnosisMarkdown: diagnosis,
+			ConfidenceScore:   confidence,
+			Evidence:          evidence,
 		})
 	} else {
 		s.db.Pool.QueryRow(ctx,

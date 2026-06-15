@@ -182,7 +182,7 @@ export function getDeploymentEvents(token: string, projectId: string, deployment
 }
 
 export function diagnoseDeployment(token: string, projectId: string, deploymentId: string) {
-  return request<{ diagnosis: string }>(
+  return request<{ diagnosis: string; incident_id: string; confidence_score: number | null; evidence: import("@/types/api").EvidenceItem[] }>(
     `/projects/${projectId}/deployments/${deploymentId}/diagnose`,
     token
   );

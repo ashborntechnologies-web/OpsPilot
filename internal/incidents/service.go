@@ -44,6 +44,9 @@ type CreateParams struct {
 	Resolution        string
 	RawLogs           string
 	DiagnosisMarkdown string // full diagnosis text → first timeline entry
+	// Explainability — AI confidence (0.0–1.0) and structured evidence behind the diagnosis.
+	ConfidenceScore *float64
+	Evidence        []models.EvidenceItem
 }
 
 // CreateIncident creates an incident and posts the AI diagnosis as its first timeline
@@ -51,11 +54,17 @@ type CreateParams struct {
 // deployment (or the same environment for a runtime anomaly), the diagnosis is appended
 // to that incident's timeline instead of opening a duplicate. Returns the incident ID.
 func (s *Service) CreateIncident(ctx context.Context, p CreateParams) (uuid.UUID, error) {
+	evidenceJSON := evidenceToJSON(p.Evidence)
+
 	if existing, found := s.findOpenIncident(ctx, p); found {
 		if strings.TrimSpace(p.DiagnosisMarkdown) != "" {
 			_, _ = s.postTimelineEntry(ctx, existing, models.IncidentAuthorAI, nil,
 				p.DiagnosisMarkdown, models.IncidentEntryDiagnosis, map[string]any{"rediagnosis": true})
 		}
+		// Refresh confidence + evidence with the latest re-diagnosis.
+		_, _ = s.db.Pool.Exec(ctx,
+			`UPDATE incidents SET confidence_score = $1, evidence = $2 WHERE id = $3`,
+			p.ConfidenceScore, evidenceJSON, existing)
 		return existing, nil
 	}
 
@@ -72,12 +81,12 @@ func (s *Service) CreateIncident(ctx context.Context, p CreateParams) (uuid.UUID
 	err := s.db.Pool.QueryRow(ctx, `
 		INSERT INTO incidents
 		    (project_id, org_id, deployment_id, environment_id, trigger,
-		     root_cause, resolution, raw_logs, title, status, severity)
+		     root_cause, resolution, raw_logs, title, status, severity, confidence_score, evidence)
 		VALUES ($1, (SELECT org_id FROM projects WHERE id = $1), $2, $3, $4,
-		        $5, $6, $7, $8, 'open', $9)
+		        $5, $6, $7, $8, 'open', $9, $10, $11)
 		RETURNING id`,
 		p.ProjectID, p.DeploymentID, p.EnvironmentID, p.Trigger,
-		p.RootCause, p.Resolution, p.RawLogs, title, severity,
+		p.RootCause, p.Resolution, p.RawLogs, title, severity, p.ConfidenceScore, evidenceJSON,
 	).Scan(&id)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("create incident: %w", err)
@@ -101,6 +110,18 @@ func (s *Service) CreateIncident(ctx context.Context, p CreateParams) (uuid.UUID
 
 	slog.Info("incident opened", "component", "incidents", "incident", id, "trigger", p.Trigger)
 	return id, nil
+}
+
+// evidenceToJSON marshals evidence to a JSONB-ready array, defaulting to "[]".
+func evidenceToJSON(items []models.EvidenceItem) []byte {
+	if len(items) == 0 {
+		return []byte("[]")
+	}
+	b, err := json.Marshal(items)
+	if err != nil {
+		return []byte("[]")
+	}
+	return b
 }
 
 // findOpenIncident returns a non-resolved incident matching the diagnosis target, for

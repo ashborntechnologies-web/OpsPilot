@@ -140,7 +140,10 @@ A diagnosed problem and the unit of the **incident war room** (lifecycle-tracked
 `root_cause`, `resolution`, `raw_logs` (`json:"-"`). War-room fields (added by
 `extendIncidentsForWarRoom`): `title`, `status` (`open`→`investigating`→`resolved`,
 CHECK-constrained), `severity`, `acknowledged_by`/`acknowledged_at`,
-`resolved_by`/`resolved_at`, `postmortem` (AI-generated markdown), `org_id`. Created by
+`resolved_by`/`resolved_at`, `postmortem` (AI-generated markdown), `org_id`.
+Explainability (added by `addExplainabilityColumns`): `confidence_score` (FLOAT 0.0–1.0,
+nullable) + `evidence` (JSONB array of `{type, description, data, weight}`, default `[]`),
+populated by a second structured Claude call during diagnosis. Created by
 `incidents.CreateIncident` from a completed diagnosis (deduplicated per deployment, or per
 environment for runtime anomalies); rated via `diagnosis_feedback`.
 
@@ -167,7 +170,9 @@ training dataset** (exported via admin endpoints; feeds project memory).
 ### `alerts`
 Deduplicated, user-facing notification derived from operational events by the alert
 engine. `alert_type` (`service_down`/`tasks_degraded`/`high_error_rate`/`high_latency`/
-`crash_loop`/`log_anomaly`/`deploy_stuck`), AI-generated `title`+`summary`, `status`
+`crash_loop`/`log_anomaly`/`deploy_stuck`), AI-generated `title`+`summary`, and
+`evidence_text` (1–2 sentences built deterministically from the triggering event payload —
+the alert's explainability; added by `addExplainabilityColumns`). `status`
 (`open`/`resolved`/`snoozed`), `triggered_at`/`resolved_at`/`snoozed_until`,
 `source_event_ids` (UUID[]). Auto-resolved on a recovery event.
 

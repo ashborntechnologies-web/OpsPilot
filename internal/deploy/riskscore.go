@@ -35,6 +35,8 @@ type RiskScore struct {
 	Level       string       `json:"level"` // low | medium | high | critical
 	Factors     []RiskFactor `json:"factors"`
 	Explanation string       `json:"explanation"`
+	// TopFactor is the reason of the highest-points factor, for compact UI display.
+	TopFactor string `json:"top_factor"`
 }
 
 // riskSignals are the raw inputs to scoring, gathered from the DB. Separated
@@ -99,6 +101,16 @@ func ScoreFromSignals(s riskSignals) *RiskScore {
 		rs.Level = RiskHigh
 	default:
 		rs.Level = RiskCritical
+	}
+
+	// TopFactor = the reason of the highest-points (most risk-increasing) factor, for
+	// compact UI display. Negative factors (e.g. success streak) are not "top".
+	topPoints := 0
+	for _, f := range rs.Factors {
+		if f.Points > topPoints {
+			topPoints = f.Points
+			rs.TopFactor = f.Reason
+		}
 	}
 	return rs
 }

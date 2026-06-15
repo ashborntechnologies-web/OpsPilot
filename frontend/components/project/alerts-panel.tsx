@@ -63,6 +63,9 @@ export function AlertsPanel({ alerts, latestInsight, onSnooze, onResolve }: Prop
                     {alert.summary && (
                       <p className="text-xs text-muted-foreground mt-1">{alert.summary}</p>
                     )}
+                    {alert.evidence_text && (
+                      <p className="text-[11px] text-muted-foreground/80 mt-1 line-clamp-2 italic">{alert.evidence_text}</p>
+                    )}
                     <p className="text-[11px] text-muted-foreground mt-1 flex items-center gap-1">
                       <Clock className="h-3 w-3" />
                       {timeAgo(alert.triggered_at)}

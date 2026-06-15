@@ -104,10 +104,12 @@ func (s *Service) HandleGetIncident(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	var i models.Incident
+	var evidenceRaw []byte
 	err := s.db.Pool.QueryRow(ctx, `
 		SELECT i.id, i.project_id, i.org_id, i.deployment_id, i.environment_id, i.trigger,
 		       i.root_cause, i.resolution, i.title, i.status, i.severity,
 		       i.acknowledged_by, i.acknowledged_at, i.resolved_by, i.resolved_at, i.postmortem, i.created_at,
+		       i.confidence_score, i.evidence,
 		       COALESCE(e.name, ''), COALESCE(p.name, ''), COALESCE(au.email, '')
 		FROM incidents i
 		LEFT JOIN environments e ON e.id = i.environment_id
@@ -117,11 +119,13 @@ func (s *Service) HandleGetIncident(c *gin.Context) {
 	).Scan(&i.ID, &i.ProjectID, &i.OrgID, &i.DeploymentID, &i.EnvironmentID, &i.Trigger,
 		&i.RootCause, &i.Resolution, &i.Title, &i.Status, &i.Severity,
 		&i.AcknowledgedBy, &i.AcknowledgedAt, &i.ResolvedBy, &i.ResolvedAt, &i.Postmortem, &i.CreatedAt,
+		&i.ConfidenceScore, &evidenceRaw,
 		&i.EnvironmentName, &i.ProjectName, &i.AcknowledgedByName)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "incident not found"})
 		return
 	}
+	_ = json.Unmarshal(evidenceRaw, &i.Evidence)
 
 	c.JSON(http.StatusOK, gin.H{
 		"incident": i,

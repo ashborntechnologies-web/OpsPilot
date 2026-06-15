@@ -111,6 +111,7 @@ func RunMigrations(db *DB) error {
 		createSlackIntegrationsTable,
 		addSummaryConfigToOrganizations,
 		createDailySummariesTable,
+		addExplainabilityColumns,
 	}
 
 	for _, m := range migrations {
@@ -618,6 +619,16 @@ CREATE TABLE IF NOT EXISTS daily_summaries (
     UNIQUE (org_id, summary_date)
 );
 CREATE INDEX IF NOT EXISTS idx_daily_summaries_org ON daily_summaries(org_id, summary_date DESC);`
+
+// addExplainabilityColumns adds AI confidence + structured evidence to incidents and a
+// short evidence sentence to alerts, so every AI decision can show why it concluded what
+// it did. evidence is a JSONB array of {type, description, data, weight} items.
+const addExplainabilityColumns = `
+ALTER TABLE incidents
+    ADD COLUMN IF NOT EXISTS confidence_score FLOAT,
+    ADD COLUMN IF NOT EXISTS evidence JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE alerts
+    ADD COLUMN IF NOT EXISTS evidence_text TEXT;`
 
 // createIncidentActionsTable stores remediation actions proposed during an incident
 // (by the AI or a human) and their approval lifecycle.
