@@ -188,6 +188,9 @@ export interface Organization {
   created_at: string;
   updated_at: string;
   role: OrgRole; // the current user's role in this org
+  summary_time?: string;     // "HH:MM"
+  summary_timezone?: string; // IANA name
+  summary_enabled?: boolean;
 }
 
 export interface OrganizationMember {
@@ -304,6 +307,32 @@ export interface SlackStatus {
   connected: boolean;
   configured: boolean;
   integration?: SlackIntegration;
+}
+
+export interface DailySummaryMetrics {
+  deploy_count?: number;
+  deploy_succeeded?: number;
+  deploy_failed?: number;
+  incident_count?: number;
+  incidents_mttr?: number;
+  open_alerts?: number;
+  resolved_alerts?: number;
+  cost_change_pct?: number;
+  top_failures?: string[];
+  recommendations?: string[];
+  markdown_content?: string;
+}
+
+export interface DailySummaryRecord {
+  id: string;
+  org_id: string;
+  summary_date: string; // YYYY-MM-DD
+  content_markdown: string;
+  content_json: DailySummaryMetrics | null;
+  generated_at: string;
+  delivered_slack: boolean;
+  delivered_email: boolean;
+  created_at: string;
 }
 
 export interface ConversationMessage {

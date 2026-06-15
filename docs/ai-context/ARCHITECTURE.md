@@ -323,6 +323,38 @@ user via WebSocket and email (`internal/notify`, a no-op without SMTP).
 
 ---
 
+## Daily operational summary
+
+An AI morning briefing per org (`internal/summary`), posted to Slack and emailed.
+
+```mermaid
+graph TB
+  TICK["scheduler: summary tick (hourly cron)"] --> DUE["EnqueueDueSummaries\n(orgs whose summary_time hour == now in their tz,\nno summary yet for local date)"]
+  DUE -->|per org| GEN["queue: TaskGenerateSummary"]
+  MANUAL["POST /orgs/:id/summaries/generate (admin)"] --> GANDD
+  GEN --> GANDD["GenerateAndDeliver"]
+  GANDD --> Q["GenerateDailySummary:\n24h deploys/incidents+MTTR/alerts,\n7d recurring failures, (cost best-effort)"]
+  Q -->|Claude → paragraph + ≤3 recs| MD["render markdown"]
+  MD --> STORE[(daily_summaries\nUNIQUE org_id,summary_date)]
+  STORE --> DELIVER["DeliverSummary"]
+  DELIVER -->|slack.PostDailySummary| SLACK["Slack summary channel"]
+  DELIVER -->|notify.SendDailySummary| EMAIL["admins + engineers (opted in)"]
+```
+
+- **Scheduling:** an hourly cron tick (`TaskSummaryTick`) calls `EnqueueDueSummaries`,
+  which fans out one `TaskGenerateSummary` per org whose configured `summary_time` hour
+  matches the current hour **in the org's timezone** and has no summary for its local
+  date yet (the `UNIQUE(org_id, summary_date)` upsert also guards races).
+- **Generation:** `GenerateDailySummary` aggregates the last 24h (deploys by status,
+  incidents + MTTR, alerts) + 7-day top recurring failures from project memory, asks
+  Claude for a grounded paragraph + ≤3 recommendations (strict JSON, template fallback),
+  renders markdown, and upserts `daily_summaries`. Cost-change is best-effort (currently
+  stubbed — see CURRENT_STATE).
+- **Delivery:** Slack (reuses `slack.PostDailySummary`) + email to admins/engineers who
+  enabled notifications; `delivered_slack`/`delivered_email` flags recorded. Config
+  (time/timezone/enabled) lives on the `organizations` row.
+- *(Supersedes the simpler Slack-only daily digest from the Slack feature.)*
+
 ## Slack integration
 
 Per-org Slack workspace connection (`internal/slack`, ADR-011) for notifications and

@@ -176,6 +176,19 @@ account/ARN for the bootstrap template + same-account AssumeRole.
 - **Consumed by:** `deploy` (via `SlackNotifier`), `monitor` (via `SlackAlertNotifier`),
   `queue` (daily summary task). Tokens encrypted via `pkg/crypto`.
 
+## `internal/summary` — daily operational summary
+- **Purpose:** AI morning briefing per org — 24h metrics + recommendations, posted to
+  Slack and emailed. See the ARCHITECTURE daily-summary flow.
+- **Files:** `service.go` (`DailySummary` struct, `GenerateDailySummary` [queries +
+  Claude + upsert], `GenerateAndDeliver`, `DeliverSummary`, `EnqueueDueSummaries`,
+  `costChange` [stubbed]), `handlers.go` (list / latest / generate-now / update-config).
+- **Key type:** `Service` (db, llm, email, awsSvc, frontendURL); interfaces `SlackPoster`
+  (satisfied by `*slack.Service`) + `SummaryEnqueuer` (satisfied by `*queue.Client`),
+  injected via `SetSlack`/`SetEnqueuer` to avoid cycles.
+- **Consumed by:** `queue` (`TaskSummaryTick` hourly → `EnqueueDueSummaries`;
+  `TaskGenerateSummary` → `GenerateAndDeliver`). Reads project memory, incidents, alerts,
+  deployments. (Replaced the simpler `slack.PostDailySummaries` digest.)
+
 ## `internal/notify` — email
 - `EmailService` over SMTP+STARTTLS. `SendAlert`, `SendDeployResult`. A logging no-op
   when SMTP env is unset (rest of platform never nil-checks).

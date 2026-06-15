@@ -98,6 +98,24 @@ func (e *EmailService) SendOrgInvite(ctx context.Context, toEmail, orgName, role
 	return e.send(ctx, toEmail, subject, body)
 }
 
+// SendDailySummary emails the AI morning briefing (paragraph + recommendations).
+func (e *EmailService) SendDailySummary(ctx context.Context, toEmail, orgName, date, paragraph string, recommendations []string, url string) error {
+	subject := fmt.Sprintf("☀️ OpsPilot daily summary — %s", orgName)
+	// detail is rendered as raw HTML by renderBody (workspace line + recommendations list);
+	// the plain-text paragraph goes through the escaped summary slot.
+	var detail strings.Builder
+	fmt.Fprintf(&detail, "Workspace <strong>%s</strong>", html.EscapeString(orgName))
+	if len(recommendations) > 0 {
+		detail.WriteString(`<p style="margin:12px 0 4px;font-size:13px;font-weight:600;color:#18181b;">Recommendations</p><ul style="margin:0;padding-left:18px;font-size:14px;color:#3f3f46;">`)
+		for _, r := range recommendations {
+			detail.WriteString("<li>" + html.EscapeString(r) + "</li>")
+		}
+		detail.WriteString("</ul>")
+	}
+	body := e.renderBody("#4f46e5", fmt.Sprintf("Daily summary — %s", date), detail.String(), paragraph, url, "View in OpsPilot")
+	return e.send(ctx, toEmail, subject, body)
+}
+
 // renderBody produces a minimal HTML email in the OpsPilot zinc/indigo theme.
 func (e *EmailService) renderBody(accentColor, headline, detail, summary, linkURL, linkLabel string) string {
 	var b strings.Builder

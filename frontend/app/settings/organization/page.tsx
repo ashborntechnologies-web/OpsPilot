@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import useSWR from "swr";
 import { useAuth } from "@clerk/nextjs";
@@ -13,12 +13,21 @@ import {
   listOrgMembers, createOrgInvite, updateMemberRole, removeMember,
 } from "@/lib/api";
 import { useActiveOrg } from "@/lib/use-org";
+import { updateSummaryConfig, generateSummaryNow } from "@/lib/api";
 import type { OrganizationMember, OrgRole } from "@/types/api";
 import { toast } from "sonner";
 import { Building2, Loader2, Trash2, UserPlus } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const ROLES: OrgRole[] = ["admin", "engineer", "viewer"];
+
+// A curated set of common IANA timezones for the daily-summary picker (any stored value
+// not in this list is shown as an extra option so it's never lost).
+const TIMEZONES = [
+  "UTC", "America/Los_Angeles", "America/Denver", "America/Chicago", "America/New_York",
+  "America/Sao_Paulo", "Europe/London", "Europe/Paris", "Europe/Berlin", "Asia/Kolkata",
+  "Asia/Singapore", "Asia/Tokyo", "Australia/Sydney",
+];
 
 const ROLE_BADGE: Record<OrgRole, string> = {
   admin: "bg-indigo-100 text-indigo-700",
@@ -41,6 +50,54 @@ export default function OrganizationSettingsPage() {
   const [inviteRole, setInviteRole] = useState<OrgRole>("engineer");
   const [inviting, setInviting] = useState(false);
   const [busyUser, setBusyUser] = useState<string | null>(null);
+
+  // Daily-summary config (seeded from the active org once loaded).
+  const [sumEnabled, setSumEnabled] = useState(true);
+  const [sumHour, setSumHour] = useState("08");
+  const [sumTz, setSumTz] = useState("UTC");
+  const [savingSummary, setSavingSummary] = useState(false);
+  const [testingSummary, setTestingSummary] = useState(false);
+
+  useEffect(() => {
+    if (!activeOrg) return;
+    setSumEnabled(activeOrg.summary_enabled ?? true);
+    setSumHour((activeOrg.summary_time ?? "08:00").slice(0, 2));
+    setSumTz(activeOrg.summary_timezone ?? "UTC");
+  }, [activeOrg]);
+
+  async function handleSaveSummary() {
+    if (!orgId) return;
+    const token = await getToken();
+    if (!token) return;
+    setSavingSummary(true);
+    try {
+      await updateSummaryConfig(token, orgId, {
+        summary_enabled: sumEnabled,
+        summary_time: `${sumHour}:00:00`,
+        summary_timezone: sumTz,
+      });
+      toast.success("Daily summary settings saved");
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+    } finally {
+      setSavingSummary(false);
+    }
+  }
+
+  async function handleTestSummary() {
+    if (!orgId) return;
+    const token = await getToken();
+    if (!token) return;
+    setTestingSummary(true);
+    try {
+      await generateSummaryNow(token, orgId);
+      toast.success("Test summary generated and delivered");
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+    } finally {
+      setTestingSummary(false);
+    }
+  }
 
   const { data: members, mutate } = useSWR<OrganizationMember[]>(
     orgId ? ["org-members", orgId] : null,
@@ -214,6 +271,67 @@ export default function OrganizationSettingsPage() {
                 ))}
                 {members && members.length === 0 && (
                   <p className="py-4 text-sm text-muted-foreground">No members yet.</p>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Daily summary */}
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base">Daily summary</CardTitle>
+                <CardDescription>An AI morning briefing of the last 24 hours, posted to Slack and emailed to admins &amp; engineers.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={sumEnabled}
+                    disabled={!isAdmin}
+                    onChange={(e) => setSumEnabled(e.target.checked)}
+                    className="h-3.5 w-3.5"
+                  />
+                  Enable daily summary
+                </label>
+
+                <div className="flex flex-col sm:flex-row gap-3 sm:items-end">
+                  <div className="space-y-1.5">
+                    <Label className="text-xs">Delivery time (on the hour)</Label>
+                    <select
+                      value={sumHour}
+                      disabled={!isAdmin}
+                      onChange={(e) => setSumHour(e.target.value)}
+                      className="h-9 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring disabled:opacity-60"
+                    >
+                      {Array.from({ length: 24 }, (_, h) => String(h).padStart(2, "0")).map((h) => (
+                        <option key={h} value={h}>{h}:00</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="flex-1 space-y-1.5">
+                    <Label className="text-xs">Timezone</Label>
+                    <select
+                      value={sumTz}
+                      disabled={!isAdmin}
+                      onChange={(e) => setSumTz(e.target.value)}
+                      className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring disabled:opacity-60"
+                    >
+                      {TIMEZONES.includes(sumTz) ? null : <option value={sumTz}>{sumTz}</option>}
+                      {TIMEZONES.map((tz) => <option key={tz} value={tz}>{tz}</option>)}
+                    </select>
+                  </div>
+                </div>
+
+                {isAdmin && (
+                  <div className="flex items-center justify-between pt-1">
+                    <Button variant="outline" onClick={handleTestSummary} disabled={testingSummary}>
+                      {testingSummary ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
+                      Send test summary now
+                    </Button>
+                    <Button onClick={handleSaveSummary} disabled={savingSummary}>
+                      {savingSummary ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
+                      Save
+                    </Button>
+                  </div>
                 )}
               </CardContent>
             </Card>

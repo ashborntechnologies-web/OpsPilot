@@ -33,6 +33,7 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/prompts"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/queue"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/slack"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/summary"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/terminal"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/users"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/webhooks"
@@ -284,13 +285,18 @@ func main() {
 	deploySvc.SetSlackNotifier(slackSvc)
 	alertEngine.SetSlackNotifier(slackSvc)
 
+	// Daily operational summary — AI morning briefing posted to Slack + emailed.
+	summarySvc := summary.NewService(db, llm.New(os.Getenv("ANTHROPIC_API_KEY")), emailSvc, awsSvc, os.Getenv("FRONTEND_URL"))
+	summarySvc.SetSlack(slackSvc)
+	summarySvc.SetEnqueuer(queueClient)
+
 	// Init job queue server
 	queueServer := queue.NewServer(
 		os.Getenv("REDIS_URL"),
 		deploySvc,
 		diagnosisSvc,
 		discoverySvc,
-		slackSvc,
+		summarySvc,
 	)
 	go queueServer.Start()
 	defer queueServer.Stop()
@@ -417,6 +423,12 @@ func main() {
 		org.GET("/slack/install", middleware.RequireRole(models.RoleAdmin), slackSvc.HandleInstallURL)
 		org.PATCH("/slack", middleware.RequireRole(models.RoleAdmin), slackSvc.HandleUpdateChannels)
 		org.DELETE("/slack", middleware.RequireRole(models.RoleAdmin), slackSvc.HandleDisconnect)
+
+		// Daily operational summaries — reads for any member; generate/config are admin.
+		org.GET("/summaries", summarySvc.HandleListSummaries)
+		org.GET("/summaries/latest", summarySvc.HandleLatestSummary)
+		org.POST("/summaries/generate", middleware.RequireRole(models.RoleAdmin), summarySvc.HandleGenerateNow)
+		org.PATCH("/summary-config", middleware.RequireRole(models.RoleAdmin), summarySvc.HandleUpdateConfig)
 
 		org.POST("/invites", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleCreateInvite)
 		org.PATCH("/members/:userId", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleUpdateMemberRole)

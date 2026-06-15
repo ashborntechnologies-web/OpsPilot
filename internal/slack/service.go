@@ -9,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -216,21 +215,19 @@ func (s *Service) PostDeployResult(ctx context.Context, orgID uuid.UUID, project
 	return s.postAttachments(ctx, in.BotToken, *in.DeployChannelID, attachment)
 }
 
-// PostDailySummary posts the morning digest to the org's summary channel.
-func (s *Service) PostDailySummary(ctx context.Context, orgID uuid.UUID, sum models.DailySummary) error {
+// PostDailySummary posts an AI-generated morning briefing (markdown) to the org's summary
+// channel. The rich generation lives in internal/summary; this just delivers it. No-op if
+// Slack isn't connected or no summary channel is set. Returns (delivered, error).
+func (s *Service) PostDailySummary(ctx context.Context, orgID uuid.UUID, markdown string) (bool, error) {
 	in, err := s.loadIntegration(ctx, orgID)
 	if err != nil || in == nil || in.SummaryChannelID == nil {
-		return err
+		return false, err
 	}
-	lines := fmt.Sprintf(
-		"*:sunny: OpsPilot daily summary — %s*\n• Deploys: %d succeeded, %d failed\n• Open incidents: %d\n• Alerts fired (24h): %d\n• Projects: %d",
-		sum.Date, sum.DeploysSucceeded, sum.DeploysFailed, sum.OpenIncidents, sum.AlertsFired, sum.ProjectsCount)
-	blocks := []any{section(lines)}
-	if len(sum.Highlights) > 0 {
-		blocks = append(blocks, section("*Highlights*\n• "+strings.Join(sum.Highlights, "\n• ")))
+	body, _ := json.Marshal(map[string]any{"blocks": []any{section(markdown)}})
+	if err := s.SendMessage(ctx, in.BotToken, *in.SummaryChannelID, body); err != nil {
+		return false, err
 	}
-	body, _ := json.Marshal(map[string]any{"blocks": blocks})
-	return s.SendMessage(ctx, in.BotToken, *in.SummaryChannelID, body)
+	return true, nil
 }
 
 // postAttachments posts a single color-coded attachment (chat.postMessage attachments).
@@ -239,80 +236,6 @@ func (s *Service) postAttachments(ctx context.Context, token, channelID string, 
 		"channel":     channelID,
 		"attachments": []any{attachment},
 	})
-}
-
-// ─── Daily summary builder ────────────────────────────────────────────────────
-
-// PostDailySummaries builds and posts a digest for every org that has a summary channel
-// configured. Invoked by the daily scheduler.
-func (s *Service) PostDailySummaries(ctx context.Context) error {
-	rows, err := s.db.Pool.Query(ctx, `
-		SELECT si.org_id, o.name
-		FROM slack_integrations si JOIN organizations o ON o.id = si.org_id
-		WHERE si.summary_channel_id IS NOT NULL`)
-	if err != nil {
-		return err
-	}
-	type orgRow struct {
-		id   uuid.UUID
-		name string
-	}
-	var orgsList []orgRow
-	for rows.Next() {
-		var r orgRow
-		if rows.Scan(&r.id, &r.name) == nil {
-			orgsList = append(orgsList, r)
-		}
-	}
-	rows.Close()
-
-	for _, o := range orgsList {
-		sum := s.buildDailySummary(ctx, o.id, o.name)
-		if err := s.PostDailySummary(ctx, o.id, sum); err != nil {
-			slog.Warn("slack: daily summary failed", "component", "slack", "org", o.id, "error", err)
-		}
-	}
-	return nil
-}
-
-// buildDailySummary aggregates the last 24h of activity for an org.
-func (s *Service) buildDailySummary(ctx context.Context, orgID uuid.UUID, orgName string) models.DailySummary {
-	sum := models.DailySummary{OrgName: orgName, Date: time.Now().UTC().Format("2006-01-02")}
-
-	_ = s.db.Pool.QueryRow(ctx, `
-		SELECT
-		  COUNT(*) FILTER (WHERE d.status = 'live'   AND d.updated_at > NOW() - INTERVAL '24 hours'),
-		  COUNT(*) FILTER (WHERE d.status = 'failed' AND d.updated_at > NOW() - INTERVAL '24 hours')
-		FROM deployments d JOIN projects p ON p.id = d.project_id
-		WHERE p.org_id = $1`, orgID,
-	).Scan(&sum.DeploysSucceeded, &sum.DeploysFailed)
-
-	_ = s.db.Pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM incidents WHERE org_id = $1 AND status <> 'resolved'`, orgID,
-	).Scan(&sum.OpenIncidents)
-
-	_ = s.db.Pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM alerts WHERE org_id = $1 AND triggered_at > NOW() - INTERVAL '24 hours'`, orgID,
-	).Scan(&sum.AlertsFired)
-
-	_ = s.db.Pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM projects WHERE org_id = $1`, orgID,
-	).Scan(&sum.ProjectsCount)
-
-	// Highlights: open incidents (most recent first).
-	hrows, err := s.db.Pool.Query(ctx, `
-		SELECT COALESCE(title, 'Incident'), severity FROM incidents
-		WHERE org_id = $1 AND status <> 'resolved' ORDER BY created_at DESC LIMIT 3`, orgID)
-	if err == nil {
-		for hrows.Next() {
-			var title, sev string
-			if hrows.Scan(&title, &sev) == nil {
-				sum.Highlights = append(sum.Highlights, fmt.Sprintf("[%s] %s", sev, title))
-			}
-		}
-		hrows.Close()
-	}
-	return sum
 }
 
 // ─── Block Kit helpers ────────────────────────────────────────────────────────

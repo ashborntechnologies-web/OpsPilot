@@ -28,6 +28,16 @@ Status is derived from the code on `main`, not from plans.
   near-duplicate merging.
 - Pre-deploy risk score (advisory, broadcast as `deploy_risk`) + deployment health score.
 
+**Daily operational summary**
+- AI morning briefing per org (`internal/summary`): last-24h deploys, incidents + MTTR,
+  alerts, 7-day top recurring failures → Claude paragraph + ≤3 grounded recommendations,
+  rendered to markdown and stored (`daily_summaries`, one per org/day).
+- Delivered to Slack + emailed to admins/engineers; per-org schedule (time/timezone/
+  enabled) via an hourly scheduler tick that fans out per-org generation jobs.
+- UI: "Daily summary" card on the projects dashboard, config + "Send test summary" in org
+  settings, and a `/orgs/[orgId]/summaries` history page. Supersedes the simpler Slack-only
+  digest.
+
 **Slack integration**
 - Per-org Slack connect via OAuth v2 (admin); bot token encrypted at rest (`pkg/crypto`).
 - Notifications (best-effort): color-coded **alerts** (link to war room), **deploy
@@ -121,6 +131,9 @@ Status is derived from the code on `main`, not from plans.
 - Email requires SMTP config; without it, notifications are logged no-ops.
 - **Billing is still per-user** (`CheckProjectLimit`/AI metering key off `user_id`), not
   per-org — a known seam now that projects are org-owned.
+- **Daily-summary cost-change is stubbed** — `summary.costChange` returns 0 (the
+  `CostChangePct` field + 7d-vs-prior-7d Cost Explorer comparison are not yet implemented;
+  it's omitted from output when 0). Everything else in the summary is real DB data.
 - **Slack slash commands aren't tied to a platform user/role** — Slack users aren't
   mapped to Clerk identities, so anyone in a connected workspace can run `/opspilot
   deploy` (workspace connection is admin-gated). The alert "Acknowledge" button is a link

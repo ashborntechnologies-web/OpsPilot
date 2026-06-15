@@ -204,6 +204,14 @@ commands back to the org; `bot_token` is **encrypted at rest** with ENCRYPTION_K
 connected it. Managed by `internal/slack` (OAuth callback writes it; the integrations UI
 updates channels; disconnect deletes it).
 
+### `daily_summaries`
+One AI-generated morning briefing per org per day (`UNIQUE(org_id, summary_date)`).
+`content_markdown` is the rendered briefing; `content_json` the structured metrics
+(deploys, incidents+MTTR, alerts, top failures, recommendations). `delivered_slack` /
+`delivered_email` track delivery. Written by `internal/summary` (idempotent upsert).
+Delivery schedule lives on **`organizations`**: `summary_time` (TIME), `summary_timezone`
+(IANA), `summary_enabled` (bool) — added by `addSummaryConfigToOrganizations`.
+
 ### `conversations`
 Chat history per project. `role` (`user`/`assistant`), `message`, classified `intent`,
 `metadata` (JSONB). Source for the intent-classifier training export.

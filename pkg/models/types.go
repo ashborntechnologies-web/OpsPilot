@@ -549,6 +549,10 @@ type Organization struct {
 	CreatedBy uuid.UUID `json:"created_by" db:"created_by"`
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
+	// Daily-summary delivery config.
+	SummaryTime     string `json:"summary_time" db:"summary_time"`         // "HH:MM:SS"
+	SummaryTimezone string `json:"summary_timezone" db:"summary_timezone"` // IANA name
+	SummaryEnabled  bool   `json:"summary_enabled" db:"summary_enabled"`
 	// Role is the requesting user's role in this org — populated by list queries,
 	// not a column.
 	Role string `json:"role,omitempty" db:"-"`
@@ -663,16 +667,19 @@ type SlackIntegration struct {
 	UpdatedAt          time.Time  `json:"updated_at" db:"updated_at"`
 }
 
-// DailySummary is the morning digest posted to an org's Slack summary channel.
-type DailySummary struct {
-	OrgName          string   `json:"org_name"`
-	Date             string   `json:"date"` // YYYY-MM-DD
-	DeploysSucceeded int      `json:"deploys_succeeded"`
-	DeploysFailed    int      `json:"deploys_failed"`
-	OpenIncidents    int      `json:"open_incidents"`
-	AlertsFired      int      `json:"alerts_fired"`
-	ProjectsCount    int      `json:"projects_count"`
-	Highlights       []string `json:"highlights"` // short per-project / per-incident notes
+// DailySummaryRecord is a stored daily summary row (the rich generation logic lives in
+// internal/summary). content_json holds the structured metrics; content_markdown the
+// rendered briefing.
+type DailySummaryRecord struct {
+	ID              uuid.UUID      `json:"id" db:"id"`
+	OrgID           uuid.UUID      `json:"org_id" db:"org_id"`
+	SummaryDate     string         `json:"summary_date" db:"summary_date"` // YYYY-MM-DD
+	ContentMarkdown string         `json:"content_markdown" db:"content_markdown"`
+	ContentJSON     map[string]any `json:"content_json" db:"content_json"`
+	GeneratedAt     time.Time      `json:"generated_at" db:"generated_at"`
+	DeliveredSlack  bool           `json:"delivered_slack" db:"delivered_slack"`
+	DeliveredEmail  bool           `json:"delivered_email" db:"delivered_email"`
+	CreatedAt       time.Time      `json:"created_at" db:"created_at"`
 }
 
 // ValidFramework reports whether the string is a supported framework identifier.

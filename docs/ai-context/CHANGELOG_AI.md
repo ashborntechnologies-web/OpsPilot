@@ -16,6 +16,43 @@ Format:
 
 ---
 
+## 2026-06-15 — Daily operational summary (AI morning briefing)
+- **What:** A dedicated, richer daily summary subsystem (`internal/summary`) — supersedes
+  the simple Slack-only digest stubbed during the Slack feature.
+  - **Data model:** `daily_summaries` table (one per org/day, `content_markdown` +
+    `content_json`, delivery flags) + per-org schedule columns on `organizations`
+    (`summary_time`, `summary_timezone`, `summary_enabled`). Removed `models.DailySummary`
+    (the rich `DailySummary` now lives in `internal/summary`); added `DailySummaryRecord`.
+  - **internal/summary:** `GenerateDailySummary` (24h deploys/incidents+MTTR/alerts, 7d
+    top recurring failures from memory, cost-change best-effort/stubbed) → Claude paragraph
+    + ≤3 grounded recommendations (strict JSON, template fallback) → markdown → idempotent
+    upsert; `GenerateAndDeliver`/`DeliverSummary` (Slack + email to admins/engineers);
+    `EnqueueDueSummaries` (timezone-aware hourly fan-out). Handlers: list/latest/generate/
+    config.
+  - **Reconciliation:** `slack.PostDailySummary` now posts AI markdown (was a counts
+    digest); removed `slack.PostDailySummaries`/`buildDailySummary` and the daily
+    `TaskSlackSummary`. New queue tasks `TaskSummaryTick` (hourly cron) + `TaskGenerateSummary`
+    (+ `EnqueueGenerateSummary`); queue `Server` now holds the summary service.
+  - **Extracted earlier but reused:** `notify.SendDailySummary` email; `/orgs/me` now
+    returns the summary config.
+  - **Frontend:** "Daily summary" card on the projects dashboard (recent briefing +
+    recommendations + history link), org-settings Daily Summary section (enable/time/
+    timezone + "Send test summary now"), and `/orgs/[orgId]/summaries` history page; a tiny
+    markdown renderer reused from the war room; summary types + API.
+- **Files:** `pkg/models/{db,types}.go`; `internal/summary/{service,handlers}.go` (new);
+  `internal/slack/service.go`, `internal/notify/email.go`, `internal/orgs/service.go`,
+  `internal/queue/server.go`, `cmd/api/main.go`; frontend `types/api.ts`, `lib/api.ts`,
+  `components/summary/yesterday-card.tsx` (new), `app/orgs/[orgId]/summaries/page.tsx`
+  (new), `app/projects/page.tsx`, `app/settings/organization/page.tsx`.
+- **Why:** A morning briefing turns OpsPilot's accumulated signals (deploys, incidents,
+  alerts, memory) into a proactive, data-grounded digest — the "advise" step of the
+  AI-DevOps-engineer vision.
+- **Assumptions changed:** daily summaries are now a first-class, scheduled, per-org
+  artifact (stored + history), not a transient Slack post; delivery is multi-channel.
+- **Verification:** `go build`/`go vet`/`gofmt`/`tsc --noEmit` all clean. Claude generation
+  + scheduled delivery not exercised against live services. Cost-change is stubbed.
+- **Docs updated:** ARCHITECTURE, DATABASE_SCHEMA, API_CONTRACTS, CURRENT_STATE, BACKEND.
+
 ## 2026-06-13 — Slack integration (notifications, daily summary, slash commands)
 - **What:** Per-org Slack integration for alert/deploy notifications, a daily digest, and
   `/opspilot` slash commands.

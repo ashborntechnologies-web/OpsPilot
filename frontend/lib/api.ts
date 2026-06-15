@@ -627,3 +627,29 @@ export function updateSlackChannels(
 export function disconnectSlack(token: string, orgId: string) {
   return request<{ message: string }>(`/orgs/${orgId}/slack`, token, { method: "DELETE" });
 }
+
+// ---- Daily operational summary -------------------------------------------------
+
+import type { DailySummaryRecord } from "@/types/api";
+
+export function listSummaries(token: string, orgId: string, limit = 30) {
+  return request<DailySummaryRecord[]>(`/orgs/${orgId}/summaries?limit=${limit}`, token);
+}
+
+export function getLatestSummary(token: string, orgId: string) {
+  return request<{ summary: DailySummaryRecord | null }>(`/orgs/${orgId}/summaries/latest`, token);
+}
+
+export function generateSummaryNow(token: string, orgId: string) {
+  return request<unknown>(`/orgs/${orgId}/summaries/generate`, token, { method: "POST" });
+}
+
+export function updateSummaryConfig(
+  token: string,
+  orgId: string,
+  body: { summary_time?: string; summary_timezone?: string; summary_enabled?: boolean }
+) {
+  return request<{ message: string }>(`/orgs/${orgId}/summary-config`, token, {
+    method: "PATCH", body: JSON.stringify(body),
+  });
+}

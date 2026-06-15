@@ -69,6 +69,10 @@ Frontend client: [`frontend/lib/api.ts`](../../frontend/lib/api.ts). Errors are
 | GET | `/orgs/:orgId/slack/install` | — | `{url}` (signed-state OAuth URL) | **admin** |
 | PATCH | `/orgs/:orgId/slack` | `{alert/deploy/summary_channel_id+name}` | `{message}` | **admin** |
 | DELETE | `/orgs/:orgId/slack` | — | `{message}` (disconnect) | **admin** |
+| GET | `/orgs/:orgId/summaries?limit=30` | — | `DailySummaryRecord[]` | member |
+| GET | `/orgs/:orgId/summaries/latest` | — | `{summary}` (most recent or null) | member |
+| POST | `/orgs/:orgId/summaries/generate` | — | `DailySummary` (generate + deliver today; testing) | **admin** |
+| PATCH | `/orgs/:orgId/summary-config` | `{summary_time?,summary_timezone?,summary_enabled?}` | `{message}` | **admin** |
 
 ## Incident war room (RequireAuth; org membership + role checked per handler)
 `:incidentId` resolves its own org. Reads need any member; mutations need engineer+.

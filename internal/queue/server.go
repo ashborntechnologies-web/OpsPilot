@@ -10,7 +10,7 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/discovery"
-	"github.com/ashborntechnologies-web/OpsPilot/internal/slack"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/summary"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
@@ -18,16 +18,21 @@ import (
 )
 
 const (
-	TaskDeploy        = "deploy:run"
-	TaskDiagnose      = "diagnosis:run"
-	TaskProvision     = "provision:run"
-	TaskRollback      = "rollback:run"
-	TaskWatchdog      = "watchdog:run"
-	TaskDeleteProject = "project:delete"
-	TaskScan          = "discovery:scan"      // scan one AWS account
-	TaskScanAll       = "discovery:scan_all"  // enqueue a scan for every account (daily)
-	TaskSlackSummary  = "slack:daily_summary" // post the daily digest to each org's Slack (daily)
+	TaskDeploy          = "deploy:run"
+	TaskDiagnose        = "diagnosis:run"
+	TaskProvision       = "provision:run"
+	TaskRollback        = "rollback:run"
+	TaskWatchdog        = "watchdog:run"
+	TaskDeleteProject   = "project:delete"
+	TaskScan            = "discovery:scan"     // scan one AWS account
+	TaskScanAll         = "discovery:scan_all" // enqueue a scan for every account (daily)
+	TaskSummaryTick     = "summary:tick"       // hourly — enqueue generation for orgs due now
+	TaskGenerateSummary = "summary:generate"   // generate + deliver one org's daily summary
 )
+
+type GenerateSummaryPayload struct {
+	OrgID string `json:"org_id"`
+}
 
 type DeployPayload struct {
 	ProjectID     string `json:"project_id"`
@@ -71,10 +76,10 @@ type Server struct {
 	deploySvc    *deploy.Service
 	diagnosisSvc *diagnosis.Service
 	discoverySvc *discovery.Service
-	slackSvc     *slack.Service
+	summarySvc   *summary.Service
 }
 
-func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnosis.Service, discoverySvc *discovery.Service, slackSvc *slack.Service) *Server {
+func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnosis.Service, discoverySvc *discovery.Service, summarySvc *summary.Service) *Server {
 	srv := asynq.NewServer(
 		asynq.RedisClientOpt{Addr: redisURL},
 		asynq.Config{
@@ -92,7 +97,7 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 		deploySvc:    deploySvc,
 		diagnosisSvc: diagnosisSvc,
 		discoverySvc: discoverySvc,
-		slackSvc:     slackSvc,
+		summarySvc:   summarySvc,
 	}
 
 	s.mux.HandleFunc(TaskDeploy, s.handleDeploy)
@@ -103,7 +108,8 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 	s.mux.HandleFunc(TaskDeleteProject, s.handleDeleteProject)
 	s.mux.HandleFunc(TaskScan, s.handleScan)
 	s.mux.HandleFunc(TaskScanAll, s.handleScanAll)
-	s.mux.HandleFunc(TaskSlackSummary, s.handleSlackSummary)
+	s.mux.HandleFunc(TaskSummaryTick, s.handleSummaryTick)
+	s.mux.HandleFunc(TaskGenerateSummary, s.handleGenerateSummary)
 
 	return s
 }
@@ -257,12 +263,30 @@ func (s *Server) handleScanAll(ctx context.Context, _ *asynq.Task) error {
 	return s.discoverySvc.ScanAllAccounts(ctx)
 }
 
-// handleSlackSummary posts the daily digest to each org's Slack summary channel.
-func (s *Server) handleSlackSummary(ctx context.Context, _ *asynq.Task) error {
-	if s.slackSvc == nil {
+// handleSummaryTick (hourly) enqueues a generation job for every org whose configured
+// delivery hour matches the current hour in its timezone.
+func (s *Server) handleSummaryTick(ctx context.Context, _ *asynq.Task) error {
+	if s.summarySvc == nil {
 		return nil
 	}
-	return s.slackSvc.PostDailySummaries(ctx)
+	return s.summarySvc.EnqueueDueSummaries(ctx)
+}
+
+// handleGenerateSummary generates + delivers one org's daily summary.
+func (s *Server) handleGenerateSummary(ctx context.Context, t *asynq.Task) error {
+	if s.summarySvc == nil {
+		return nil
+	}
+	var p GenerateSummaryPayload
+	if err := json.Unmarshal(t.Payload(), &p); err != nil {
+		return fmt.Errorf("%w: unmarshal summary payload: %w", asynq.SkipRetry, err)
+	}
+	orgID, err := uuid.Parse(p.OrgID)
+	if err != nil {
+		return fmt.Errorf("%w: invalid org ID: %w", asynq.SkipRetry, err)
+	}
+	_, err = s.summarySvc.GenerateAndDeliver(ctx, orgID, time.Now())
+	return err
 }
 
 func (s *Server) handleDiagnose(ctx context.Context, t *asynq.Task) error {
@@ -358,8 +382,17 @@ func NewScanAllTask() *asynq.Task {
 	return asynq.NewTask(TaskScanAll, nil, asynq.Queue("default"), asynq.MaxRetry(0))
 }
 
-func NewSlackSummaryTask() *asynq.Task {
-	return asynq.NewTask(TaskSlackSummary, nil, asynq.Queue("default"), asynq.MaxRetry(0))
+func NewSummaryTickTask() *asynq.Task {
+	return asynq.NewTask(TaskSummaryTick, nil, asynq.Queue("default"), asynq.MaxRetry(0))
+}
+
+func NewGenerateSummaryTask(orgID string) (*asynq.Task, error) {
+	payload, err := json.Marshal(GenerateSummaryPayload{OrgID: orgID})
+	if err != nil {
+		return nil, err
+	}
+	// One retry — generation hits Claude; the UNIQUE(org,date) upsert makes it idempotent.
+	return asynq.NewTask(TaskGenerateSummary, payload, asynq.Queue("default"), asynq.MaxRetry(1)), nil
 }
 
 func NewDiagnoseTask(projectID, deploymentID string) (*asynq.Task, error) {
@@ -397,8 +430,9 @@ func (sc *Scheduler) Start() error {
 	if _, err := sc.s.Register("@every 24h", NewScanAllTask()); err != nil {
 		return err
 	}
-	// Daily Slack digest at 14:00 UTC (~morning in the Americas).
-	if _, err := sc.s.Register("0 14 * * *", NewSlackSummaryTask()); err != nil {
+	// Hourly daily-summary tick — enqueues generation for orgs whose configured delivery
+	// hour matches the current hour in their timezone.
+	if _, err := sc.s.Register("0 * * * *", NewSummaryTickTask()); err != nil {
 		return err
 	}
 	return sc.s.Start()
@@ -517,6 +551,17 @@ func (c *Client) EnqueueScan(accountID string) (string, error) {
 		return "", err
 	}
 	return info.ID, nil
+}
+
+// EnqueueGenerateSummary implements summary.SummaryEnqueuer — enqueues generation +
+// delivery of one org's daily summary.
+func (c *Client) EnqueueGenerateSummary(orgID string) error {
+	task, err := NewGenerateSummaryTask(orgID)
+	if err != nil {
+		return err
+	}
+	_, err = c.c.Enqueue(task)
+	return err
 }
 
 // EnqueueDiagnose implements events.DiagnosisEnqueuer. Empty deploymentID means

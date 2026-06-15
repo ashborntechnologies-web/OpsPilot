@@ -139,7 +139,8 @@ func (s *Service) HandleListMyOrgs(c *gin.Context) {
 		return
 	}
 	rows, err := s.db.Pool.Query(c.Request.Context(),
-		`SELECT o.id, o.name, o.slug, o.created_by, o.created_at, o.updated_at, m.role
+		`SELECT o.id, o.name, o.slug, o.created_by, o.created_at, o.updated_at, m.role,
+		        to_char(o.summary_time, 'HH24:MI'), o.summary_timezone, o.summary_enabled
 		   FROM organizations o
 		   JOIN organization_members m ON m.org_id = o.id
 		  WHERE m.user_id = $1
@@ -153,7 +154,8 @@ func (s *Service) HandleListMyOrgs(c *gin.Context) {
 	orgs := []models.Organization{}
 	for rows.Next() {
 		var o models.Organization
-		if err := rows.Scan(&o.ID, &o.Name, &o.Slug, &o.CreatedBy, &o.CreatedAt, &o.UpdatedAt, &o.Role); err != nil {
+		if err := rows.Scan(&o.ID, &o.Name, &o.Slug, &o.CreatedBy, &o.CreatedAt, &o.UpdatedAt, &o.Role,
+			&o.SummaryTime, &o.SummaryTimezone, &o.SummaryEnabled); err != nil {
 			continue
 		}
 		orgs = append(orgs, o)

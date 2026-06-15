@@ -109,6 +109,8 @@ func RunMigrations(db *DB) error {
 		createIncidentTimelineTable,
 		createIncidentActionsTable,
 		createSlackIntegrationsTable,
+		addSummaryConfigToOrganizations,
+		createDailySummariesTable,
 	}
 
 	for _, m := range migrations {
@@ -592,6 +594,30 @@ CREATE TABLE IF NOT EXISTS slack_integrations (
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_slack_team ON slack_integrations(team_id);`
+
+// addSummaryConfigToOrganizations: per-org delivery schedule for the AI daily summary.
+const addSummaryConfigToOrganizations = `
+ALTER TABLE organizations
+    ADD COLUMN IF NOT EXISTS summary_time     TIME NOT NULL DEFAULT '08:00:00',
+    ADD COLUMN IF NOT EXISTS summary_timezone TEXT NOT NULL DEFAULT 'UTC',
+    ADD COLUMN IF NOT EXISTS summary_enabled  BOOLEAN NOT NULL DEFAULT true;`
+
+// createDailySummariesTable stores one AI-generated morning briefing per org per day.
+// content_json holds the structured metrics; content_markdown the rendered briefing.
+const createDailySummariesTable = `
+CREATE TABLE IF NOT EXISTS daily_summaries (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id           UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    summary_date     DATE NOT NULL,
+    content_markdown TEXT NOT NULL DEFAULT '',
+    content_json     JSONB NOT NULL DEFAULT '{}',
+    generated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    delivered_slack  BOOLEAN NOT NULL DEFAULT false,
+    delivered_email  BOOLEAN NOT NULL DEFAULT false,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (org_id, summary_date)
+);
+CREATE INDEX IF NOT EXISTS idx_daily_summaries_org ON daily_summaries(org_id, summary_date DESC);`
 
 // createIncidentActionsTable stores remediation actions proposed during an incident
 // (by the AI or a human) and their approval lifecycle.
