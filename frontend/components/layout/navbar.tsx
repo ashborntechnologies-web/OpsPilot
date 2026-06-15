@@ -5,14 +5,14 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import useSWR from "swr";
 import { UserButton, useAuth } from "@clerk/nextjs";
-import { Rocket, CheckCircle2, ChevronDown, Building2, Check, Siren } from "lucide-react";
+import { Rocket, CheckCircle2, ChevronDown, Building2, Check, Siren, ShieldCheck } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { getMe, listOrgIncidents } from "@/lib/api";
+import { getMe, listOrgIncidents, listOrgActions } from "@/lib/api";
 import { useActiveOrg } from "@/lib/use-org";
-import type { Incident } from "@/types/api";
+import type { Incident, AIAction } from "@/types/api";
 import { cn } from "@/lib/utils";
 
 const TIERS = [
@@ -46,6 +46,18 @@ export function Navbar() {
     { refreshInterval: 30_000 }
   );
   const openCount = (openIncidents ?? []).filter((i) => i.status !== "resolved").length;
+
+  // Pending AI-action approvals count for the active workspace.
+  const { data: pendingActions } = useSWR<AIAction[]>(
+    activeOrg ? ["navbar-actions", activeOrg.id] : null,
+    async () => {
+      const token = await getToken();
+      if (!token || !activeOrg) return [];
+      return listOrgActions(token, activeOrg.id, "pending");
+    },
+    { refreshInterval: 30_000 }
+  );
+  const pendingCount = (pendingActions ?? []).length;
 
   const usageLabel = me
     ? me.plan === "free"
@@ -135,6 +147,19 @@ export function Navbar() {
               </span>
             )}
           </Link>
+          {pendingCount > 0 && (
+            <Link
+              href="/settings/organization"
+              className="relative inline-flex items-center gap-1 text-amber-700"
+              title={`${pendingCount} AI action(s) awaiting approval`}
+            >
+              <ShieldCheck className="h-3.5 w-3.5" />
+              Approvals
+              <span className="ml-0.5 inline-flex items-center justify-center h-4 min-w-4 px-1 rounded-full bg-amber-500 text-white text-[10px] font-semibold">
+                {pendingCount}
+              </span>
+            </Link>
+          )}
           <Link
             href="/settings/organization"
             className={cn("hidden sm:inline", path.startsWith("/settings") ? "text-foreground font-medium" : "hover:text-foreground")}

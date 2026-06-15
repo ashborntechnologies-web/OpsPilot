@@ -113,6 +113,21 @@ A deployment target for a project: `staging`, `production`, or a `pr-N` preview.
   `github_pr_comment_id`. Partial unique indexes: one non-preview name per project; one
   preview per PR number.
 
+> **Trust columns on `environments`** (added by `addTrustLevelToEnvironments`):
+> `trust_level` (`suggest`|`supervised`|`autonomous`, CHECK-constrained, default `suggest`)
+> and `autonomous_boundaries` (JSONB: `{can_rollback, can_scale, min_replicas, max_replicas,
+> can_change_resources}`) — govern whether AI-initiated actions auto-execute.
+
+### `ai_actions`
+Every AI-proposed action and its approval/execution lifecycle (the trust layer is the only
+writer). Scoped to `org_id`/`project_id`/`environment_id`, optional `incident_id`.
+`proposed_by_type` (`ai`|`human`) + nullable `proposed_by_user_id`; `action_type`
+(`deploy`|`rollback`|`scale`|`change_resources`|`terminal_command`); `parameters` JSONB;
+`confidence_score`; `rationale`; `status` (`pending_approval`→`approved`/`rejected`→
+`executed`/`failed`); `approval_required`; `approved_by`; `proposed_at`/`decided_at`/
+`executed_at`; `result` JSONB. Distinct from the war-room `incident_actions` (advisory
+suggested-fixes) — this table is the executable, trust-gated record.
+
 ### `deployments`
 One build+rollout of a commit to an environment.
 - `commit_sha`, `commit_message`, `image_uri` (ECR), `build_id` (CodeBuild — enables

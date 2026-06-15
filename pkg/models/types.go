@@ -111,6 +111,9 @@ type Environment struct {
 	PRHeadSHA         *string `json:"pr_head_sha,omitempty" db:"pr_head_sha"`
 	GithubPRCommentID *int64  `json:"github_pr_comment_id,omitempty" db:"github_pr_comment_id"`
 
+	// Trust level for AI-initiated actions on this environment.
+	TrustLevel string `json:"trust_level" db:"trust_level"` // suggest | supervised | autonomous
+
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
 }
@@ -696,6 +699,72 @@ type DailySummaryRecord struct {
 	DeliveredSlack  bool           `json:"delivered_slack" db:"delivered_slack"`
 	DeliveredEmail  bool           `json:"delivered_email" db:"delivered_email"`
 	CreatedAt       time.Time      `json:"created_at" db:"created_at"`
+}
+
+// ─── Trust levels & AI action approval ───────────────────────────────────────
+
+// Trust level constants — how much autonomy AI-initiated actions have per environment.
+const (
+	TrustSuggest    = "suggest"    // AI only suggests; every action needs human approval
+	TrustSupervised = "supervised" // every action needs approval, surfaced prominently
+	TrustAutonomous = "autonomous" // actions within boundaries auto-execute; others need approval
+)
+
+// AI action type + status + proposer constants.
+const (
+	ActionDeploy          = "deploy"
+	ActionRollback        = "rollback"
+	ActionScale           = "scale"
+	ActionChangeResources = "change_resources"
+	ActionTerminalCommand = "terminal_command"
+
+	ActionStatusPending  = "pending_approval"
+	ActionStatusApproved = "approved"
+	ActionStatusRejected = "rejected"
+	ActionStatusExecuted = "executed"
+	ActionStatusFailed   = "failed"
+
+	ProposerAI    = "ai"
+	ProposerHuman = "human"
+)
+
+// AutonomousBoundaries bounds what may auto-execute in 'autonomous' trust mode. A nil
+// boundaries (or a false flag) means that action type always requires approval. There is
+// deliberately no can_deploy — deploys always require approval (see ADR-013).
+type AutonomousBoundaries struct {
+	CanRollback        bool `json:"can_rollback"`
+	CanScale           bool `json:"can_scale"`
+	MinReplicas        int  `json:"min_replicas"`
+	MaxReplicas        int  `json:"max_replicas"`
+	CanChangeResources bool `json:"can_change_resources"`
+}
+
+// AIAction is one AI-proposed action and its approval/execution lifecycle.
+type AIAction struct {
+	ID               uuid.UUID      `json:"id" db:"id"`
+	OrgID            uuid.UUID      `json:"org_id" db:"org_id"`
+	ProjectID        uuid.UUID      `json:"project_id" db:"project_id"`
+	EnvironmentID    *uuid.UUID     `json:"environment_id" db:"environment_id"`
+	IncidentID       *uuid.UUID     `json:"incident_id" db:"incident_id"`
+	ProposedByType   string         `json:"proposed_by_type" db:"proposed_by_type"`
+	ProposedByUserID *uuid.UUID     `json:"proposed_by_user_id" db:"proposed_by_user_id"`
+	ActionType       string         `json:"action_type" db:"action_type"`
+	Parameters       map[string]any `json:"parameters" db:"parameters"`
+	ConfidenceScore  *float64       `json:"confidence_score" db:"confidence_score"`
+	Rationale        string         `json:"rationale" db:"rationale"`
+	Status           string         `json:"status" db:"status"`
+	ApprovedBy       *uuid.UUID     `json:"approved_by" db:"approved_by"`
+	ApprovalRequired bool           `json:"approval_required" db:"approval_required"`
+	ProposedAt       time.Time      `json:"proposed_at" db:"proposed_at"`
+	DecidedAt        *time.Time     `json:"decided_at" db:"decided_at"`
+	ExecutedAt       *time.Time     `json:"executed_at" db:"executed_at"`
+	Result           map[string]any `json:"result" db:"result"`
+	CreatedAt        time.Time      `json:"created_at" db:"created_at"`
+	// Joined/derived (not columns).
+	EnvironmentName string `json:"environment_name,omitempty" db:"-"`
+	ProjectName     string `json:"project_name,omitempty" db:"-"`
+	ProposedByName  string `json:"proposed_by_name,omitempty" db:"-"`
+	ApprovedByName  string `json:"approved_by_name,omitempty" db:"-"`
 }
 
 // ValidFramework reports whether the string is a supported framework identifier.

@@ -5,9 +5,10 @@
 
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
-import type { Alert } from "@/types/api";
+import { PendingApprovalCard } from "@/components/trust/actions";
+import type { Alert, AIAction } from "@/types/api";
 import { cn } from "@/lib/utils";
-import { AlertTriangle, CheckCircle2, Clock, Sparkles } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Clock, Sparkles, ShieldCheck } from "lucide-react";
 
 function timeAgo(iso: string) {
   const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -22,14 +23,35 @@ interface Props {
   latestInsight: string | null;
   onSnooze: (alertId: string) => void;
   onResolve: (alertId: string) => void;
+  pendingActions?: AIAction[];
+  canAct?: boolean;
+  onApproveAction?: (id: string) => Promise<void>;
+  onRejectAction?: (id: string) => Promise<void>;
 }
 
-export function AlertsPanel({ alerts, latestInsight, onSnooze, onResolve }: Props) {
+export function AlertsPanel({
+  alerts, latestInsight, onSnooze, onResolve,
+  pendingActions = [], canAct = false, onApproveAction, onRejectAction,
+}: Props) {
   const [insightExpanded, setInsightExpanded] = useState(false);
   const open = alerts.filter((a) => a.status === "open");
 
   return (
     <aside className="w-80 shrink-0 border-l bg-white p-4 space-y-6 overflow-y-auto">
+      {pendingActions.length > 0 && onApproveAction && onRejectAction && (
+        <div>
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3 flex items-center gap-1.5">
+            <ShieldCheck className="h-3 w-3 text-amber-600" />
+            Pending Approvals ({pendingActions.length})
+          </h2>
+          <div className="space-y-3">
+            {pendingActions.map((a) => (
+              <PendingApprovalCard key={a.id} action={a} canAct={canAct} onApprove={onApproveAction} onReject={onRejectAction} />
+            ))}
+          </div>
+        </div>
+      )}
+
       <div>
         <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3">
           Open Alerts

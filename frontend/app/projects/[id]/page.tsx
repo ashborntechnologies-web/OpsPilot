@@ -26,14 +26,17 @@ import {
   terminalWsURL, getProjectCosts, enablePreviews, disablePreviews,
   getHealthScore, listAlerts, snoozeAlert, resolveAlert, cancelDeployment,
   updateProject, getMe, updateNotificationPrefs, deleteProject,
-  listProjectResources,
+  listProjectResources, listProjectActions, approveAction, rejectAction,
+  getEnvironmentTrust, updateEnvironmentTrust,
 } from "@/lib/api";
+import { ActionRow } from "@/components/trust/actions";
+import { EnvTrustSettings } from "@/components/trust/env-trust-settings";
 import { StatusSidebar } from "@/components/project/status-sidebar";
 import { AlertsPanel } from "@/components/project/alerts-panel";
 import { useActiveOrg } from "@/lib/use-org";
 import { RESOURCE_ICONS, resourceLabel, resourceStatus } from "@/lib/resources";
 import { ConfidenceBadge, EvidenceSection } from "@/components/ai/explainability";
-import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar, Webhook, CostSummary, Alert, RiskScore, UserMe, DiscoveredResource, EvidenceItem } from "@/types/api";
+import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar, Webhook, CostSummary, Alert, RiskScore, UserMe, DiscoveredResource, EvidenceItem, AIAction, TrustLevel, AutonomousBoundaries } from "@/types/api";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
@@ -132,7 +135,7 @@ export default function ProjectPage() {
 
   // Role in the active workspace. Viewers get read-only UI; the backend enforces
   // this regardless, so these guards are UX (clear messaging), not the security boundary.
-  const { isViewer } = useActiveOrg();
+  const { isViewer, canAct, isAdmin } = useActiveOrg();
   const VIEW_ONLY_MSG = "You have view-only (viewer) access to this workspace. Ask an admin for the engineer role to perform this action.";
   function blockIfViewer(): boolean {
     if (isViewer) { toast.error(VIEW_ONLY_MSG); return true; }
@@ -241,6 +244,10 @@ export default function ProjectPage() {
   // infrastructure (assigned discovered + managed resources)
   const [resources, setResources] = useState<DiscoveredResource[] | null>(null);
   const [loadingResources, setLoadingResources] = useState(false);
+  // AI actions (trust/approval): all (history) + pending (right-column approvals)
+  const [actions, setActions] = useState<AIAction[] | null>(null);
+  const [actionBanner, setActionBanner] = useState(false);
+  const pendingActions = (actions ?? []).filter((a) => a.status === "pending_approval");
   const [loadingCosts, setLoadingCosts] = useState(false);
 
   // PR previews
@@ -277,6 +284,17 @@ export default function ProjectPage() {
       return listAlerts(token, id, "open");
     },
     { refreshInterval: 30_000, onSuccess: (data) => setAlerts(data ?? []) }
+  );
+
+  // AI actions (trust/approval) — initial load + 30s refresh; WS updates in between.
+  useSWR(
+    ["actions", id],
+    async () => {
+      const token = await getToken();
+      if (!token) return [];
+      return listProjectActions(token, id);
+    },
+    { refreshInterval: 30_000, onSuccess: (data) => setActions(data ?? []) }
   );
 
   // Settings form mirrors the project record; /users/me feeds notification toggles.
@@ -356,6 +374,11 @@ export default function ProjectPage() {
             try {
               setCurrentRiskScore(JSON.parse(msg.payload) as RiskScore);
             } catch {}
+          } else if (msg.type === "action_proposed") {
+            setActionBanner(true);
+            loadActions().catch(() => {});
+          } else if (msg.type === "action_updated") {
+            loadActions().catch(() => {});
           }
         } catch {}
       };
@@ -907,6 +930,40 @@ export default function ProjectPage() {
     }
   }
 
+  async function loadActions() {
+    const token = await getToken();
+    if (!token) return;
+    try {
+      setActions(await listProjectActions(token, id));
+    } catch {
+      toast.error("Failed to load actions");
+    }
+  }
+
+  async function handleApproveAction(actionId: string) {
+    const token = await getToken();
+    if (!token) return;
+    try {
+      await approveAction(token, actionId);
+      toast.success("Action approved");
+      await loadActions();
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+    }
+  }
+
+  async function handleRejectAction(actionId: string) {
+    const token = await getToken();
+    if (!token) return;
+    try {
+      await rejectAction(token, actionId);
+      toast.success("Action rejected");
+      await loadActions();
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+    }
+  }
+
   async function handleTogglePreviews() {
     if (blockIfViewer()) return;
     const token = await getToken();
@@ -1175,6 +1232,14 @@ export default function ProjectPage() {
           </div>
         </div>
 
+        {/* AI proposed an action — persistent banner until reviewed. */}
+        {actionBanner && pendingActions.length > 0 && (
+          <div className="mb-6 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 flex items-center justify-between gap-2 text-sm text-amber-900">
+            <span>🤖 OpsPilot has proposed {pendingActions.length === 1 ? "an action" : `${pendingActions.length} actions`} — review and approve in the Pending Approvals panel.</span>
+            <button className="underline shrink-0" onClick={() => setActionBanner(false)}>Dismiss</button>
+          </div>
+        )}
+
         {/* View-only banner — shown to viewers; action buttons are disabled. */}
         {isViewer && (
           <div className="mb-6 rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-3 flex items-center gap-2 text-sm text-zinc-600">
@@ -1226,6 +1291,7 @@ export default function ProjectPage() {
             <TabsTrigger value="webhooks" onClick={() => loadHooks()}>Webhooks</TabsTrigger>
             <TabsTrigger value="infrastructure" onClick={() => loadResources()}>Infrastructure</TabsTrigger>
             <TabsTrigger value="costs" onClick={() => loadCosts()}>Costs</TabsTrigger>
+            <TabsTrigger value="actions" onClick={() => loadActions()}>Actions</TabsTrigger>
             <TabsTrigger value="settings">Settings</TabsTrigger>
           </TabsList>
 
@@ -2262,6 +2328,34 @@ export default function ProjectPage() {
             </div>
           </TabsContent>
 
+          {/* ── Actions (AI + human action history) ── */}
+          <TabsContent value="actions">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-medium">Action history</p>
+                  <p className="text-xs text-muted-foreground">AI-proposed and approved actions, their status, and who approved them.</p>
+                </div>
+                <Button size="sm" variant="outline" onClick={loadActions}>
+                  <RefreshCw className="h-3.5 w-3.5 mr-1" /> Refresh
+                </Button>
+              </div>
+              {(actions ?? []).length === 0 ? (
+                <Card className="border-dashed">
+                  <CardContent className="py-12 text-center">
+                    <Activity className="h-10 w-10 text-zinc-300 mx-auto mb-3" />
+                    <p className="font-medium text-sm">No actions yet</p>
+                    <p className="text-muted-foreground text-xs mt-1">AI-proposed deploys, rollbacks, and scaling will appear here.</p>
+                  </CardContent>
+                </Card>
+              ) : (
+                <div className="rounded-lg border bg-white divide-y">
+                  {(actions ?? []).map((a) => <ActionRow key={a.id} action={a} />)}
+                </div>
+              )}
+            </div>
+          </TabsContent>
+
           {/* ── Settings ── */}
           <TabsContent value="settings">
             <div className="max-w-2xl space-y-6">
@@ -2347,6 +2441,12 @@ export default function ProjectPage() {
                 </CardContent>
               </Card>
 
+              {/* AI trust levels per environment */}
+              <div>
+                <h3 className="text-sm font-semibold mb-2">AI Trust Levels</h3>
+                <EnvTrustSettings projectId={id} environments={environments} canEdit={isAdmin} />
+              </div>
+
               <Card className="border-red-200">
                 <CardHeader>
                   <CardTitle className="text-base text-red-700">Danger Zone</CardTitle>
@@ -2373,6 +2473,10 @@ export default function ProjectPage() {
             latestInsight={diagnosisResult}
             onSnooze={handleSnoozeAlert}
             onResolve={handleResolveAlert}
+            pendingActions={pendingActions}
+            canAct={canAct}
+            onApproveAction={handleApproveAction}
+            onRejectAction={handleRejectAction}
           />
         </div>
       </div>

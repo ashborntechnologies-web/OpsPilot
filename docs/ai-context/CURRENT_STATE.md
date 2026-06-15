@@ -28,6 +28,19 @@ Status is derived from the code on `main`, not from plans.
   near-duplicate merging.
 - Pre-deploy risk score (advisory, broadcast as `deploy_risk`) + deployment health score.
 
+**Trust levels & AI-action approval**
+- Per-environment trust level (`suggest`/`supervised`/`autonomous`) with autonomous
+  boundaries (can_rollback/can_scale/min-max replicas/can_change_resources). Configurable
+  in the project Settings tab (admin-only).
+- AI-initiated actions (chat deploy/rollback/scale/change_resources; diagnosis → rollback
+  recommendation) route through `trust.ProposeAction`: auto-execute when autonomous +
+  within boundaries, else recorded as a pending approval (`ai_actions`). Deploys always
+  require approval. Execution routes to the deploy service; incident-linked actions post to
+  the war-room timeline.
+- Approve/reject (engineer+) via the Pending Approvals panel (right column) + navbar badge;
+  `action_proposed` WS banner; project Actions tab (AI/human history); Slack proposal with
+  a review link.
+
 **Explainability & confidence**
 - Every AI decision shows *why*: diagnoses carry a confidence score (0–1) + a structured
   evidence array (`{type, description, data, weight}`) from a second Claude call, stored on
@@ -144,6 +157,9 @@ Status is derived from the code on `main`, not from plans.
 - **Daily-summary cost-change is stubbed** — `summary.costChange` returns 0 (the
   `CostChangePct` field + 7d-vs-prior-7d Cost Explorer comparison are not yet implemented;
   it's omitted from output when 0). Everything else in the summary is real DB data.
+- **Diagnosis auto-proposes a rollback** for every deploy-failure diagnosis (in `suggest`
+  mode it's just a pending suggestion). `terminal_command` actions are modeled but not
+  auto-executable. `change_resources` execution goes through propose+apply.
 - **Slack slash commands aren't tied to a platform user/role** — Slack users aren't
   mapped to Clerk identities, so anyone in a connected workspace can run `/opspilot
   deploy` (workspace connection is admin-gated). The alert "Acknowledge" button is a link

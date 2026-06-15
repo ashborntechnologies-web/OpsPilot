@@ -108,6 +108,19 @@ account/ARN for the bootstrap template + same-account AssumeRole.
 - **HTTP:** `HandleDiagnose`, `HandleSubmitFeedback`, `HandleFeedbackSummary`.
 - **Depends on:** `aws` (logs), `events`, `memory`, `llm`, `prompts`, `models`.
 
+## `internal/trust` — trust levels & AI-action approval
+- **Purpose:** gate AI-initiated actions by per-environment trust level; auto-execute or
+  require human approval. See ADR-013 and the ARCHITECTURE trust flow.
+- **Files:** `service.go` (`ProposeAction`, pure `requiresApproval`, `ExecuteAction`,
+  `ApproveAction`/`RejectAction`, `resolveEnv`), `handlers.go` (env trust GET/PATCH, org
+  pending actions, project action history, approve/reject).
+- **Key type:** `Service` (db, deployer, hub, slack, incidents, frontendURL); interfaces
+  `Deployer` (deploy.Service), `SlackActionNotifier` (slack.Service), `IncidentPoster`
+  (incidents.Service) injected to avoid cycles. `ActionProposal` is the input.
+- **Consumed by:** `conversation` (chat actions → ProposeAction) and `diagnosis`
+  (deploy-failure → recommend rollback), both holding `*trust.Service`. Writes `ai_actions`;
+  broadcasts `action_proposed`/`action_updated`.
+
 ## `internal/incidents` — incident war room
 - **Purpose:** first-class, lifecycle-tracked incidents with a shared real-time timeline
   (AI + human) and an approval flow for proposed actions; AI postmortem on resolve. See

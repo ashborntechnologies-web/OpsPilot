@@ -43,6 +43,8 @@ Frontend client: [`frontend/lib/api.ts`](../../frontend/lib/api.ts). Errors are
 |---|---|---|---|---|
 | GET | `/users/me` | — | `UserMe` (plan, usage, project count, notifications) | navbar, settings |
 | PATCH | `/users/me/notifications` | `{enabled?,deploy_failed?,deploy_succeeded?,alert_fired?}` | `{message}` | settings |
+| POST | `/actions/:actionId/approve` | — | `{message}` | approvals — **engineer+** (checked against the action's org) |
+| POST | `/actions/:actionId/reject` | — | `{message}` | approvals — **engineer+** |
 | GET | `/github/auth` | — | `{url}` | new-project / accounts |
 | GET | `/github/repos` | — | `GithubRepo[]` | new-project |
 | GET | `/github/repos/:owner/:repo/branches` | — | `string[]` | new-project |
@@ -64,6 +66,7 @@ Frontend client: [`frontend/lib/api.ts`](../../frontend/lib/api.ts). Errors are
 | GET | `/orgs/:orgId/members` | — | `OrganizationMember[]` (with email) | member |
 | GET | `/orgs/:orgId/resources?resource_type=&region=&project_id=(uuid\|null)` | — | `DiscoveredResource[]` (discovery inventory) | member |
 | GET | `/orgs/:orgId/incidents?limit=&offset=` | — | `Incident[]` (open first, then severity, then recency) | member |
+| GET | `/orgs/:orgId/actions?status=pending` | — | `AIAction[]` (pending approvals across the org) | member |
 | GET | `/orgs/:orgId/slack` | — | `{connected, configured, integration?}` | member |
 | GET | `/orgs/:orgId/slack/channels` | — | `SlackChannel[]` (Slack conversations.list) | member |
 | GET | `/orgs/:orgId/slack/install` | — | `{url}` (signed-state OAuth URL) | **admin** |
@@ -128,6 +131,9 @@ intents.
 | GET | `/costs` | — | `CostSummary` (30-day, Cost Explorer) |
 | GET | `/health-score` | — | `HealthScore{score,grade,components,insights}` |
 | GET | `/resources` | — | `DiscoveredResource[]` (assigned to this project; managed + discovered) |
+| GET | `/actions?limit=50` | — | `AIAction[]` (action history) |
+| GET | `/environments/:envId/trust` | — | `{trust_level, autonomous_boundaries}` |
+| PATCH | `/environments/:envId/trust` *(admin)* | `{trust_level?, autonomous_boundaries?}` | `{message}` |
 | POST | `/previews/enable` | — | `{message,webhook_id}` (installs GitHub webhook) |
 | POST | `/previews/disable` | — | `{message}` |
 | GET/POST/PATCH/DELETE | `/webhooks[/:webhookId]` | `{url,secret?,events,active?}` | `Webhook` / `{message}` |
@@ -144,8 +150,9 @@ intents.
 **`WsMessage.type` values:** `auth_ok`, `thinking`, `response`, `deploy_progress`,
 `deploy_done`, `deploy_failed`, `provision_progress`, `provision_done`,
 `provision_failed`, `alert`, `alert_resolved`, `deploy_risk`, `build_log`, `runtime_event`,
-`incident_timeline`, `incident_update`, `incident_action`, `error`. (`payload` is a
-string; alert/risk/incident payloads are JSON strings.)
+`incident_timeline`, `incident_update`, `incident_action`, `action_proposed`,
+`action_updated`, `error`. (`payload` is a string; alert/risk/incident/action payloads are
+JSON strings.)
 
 ## Admin (ApiKeyAuth — trade-secret datasets)
 | Method | Path | Response |

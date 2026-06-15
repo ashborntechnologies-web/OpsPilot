@@ -35,6 +35,7 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/slack"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/summary"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/terminal"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/trust"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/users"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/webhooks"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
@@ -285,6 +286,15 @@ func main() {
 	deploySvc.SetSlackNotifier(slackSvc)
 	alertEngine.SetSlackNotifier(slackSvc)
 
+	// Trust levels + AI-action approval workflow. AI-initiated actions (chat, diagnosis)
+	// route through ProposeAction, which auto-executes or registers a pending approval
+	// based on the environment's trust level.
+	trustSvc := trust.NewService(db, deploySvc, hub, os.Getenv("FRONTEND_URL"))
+	trustSvc.SetSlack(slackSvc)
+	trustSvc.SetIncidents(incidentsSvc)
+	conversationSvc.SetTrustService(trustSvc)
+	diagnosisSvc.SetTrustService(trustSvc)
+
 	// Daily operational summary — AI morning briefing posted to Slack + emailed.
 	summarySvc := summary.NewService(db, llm.New(os.Getenv("ANTHROPIC_API_KEY")), emailSvc, awsSvc, os.Getenv("FRONTEND_URL"))
 	summarySvc.SetSlack(slackSvc)
@@ -399,6 +409,10 @@ func main() {
 		protected.POST("/aws-accounts/:id/scan", discoverySvc.HandleScanAccount)
 		protected.PATCH("/resources/:resourceId/assign", discoverySvc.HandleAssignResource)
 
+		// AI action approvals (engineer+ enforced against the action's org in the handler).
+		protected.POST("/actions/:actionId/approve", trustSvc.HandleApprove)
+		protected.POST("/actions/:actionId/reject", trustSvc.HandleReject)
+
 		// Organizations (team workspaces)
 		protected.POST("/orgs", orgsSvc.HandleCreateOrg)
 		protected.GET("/orgs/me", orgsSvc.HandleListMyOrgs)
@@ -416,6 +430,7 @@ func main() {
 		org.GET("/members", orgsSvc.HandleListMembers)
 		org.GET("/resources", discoverySvc.HandleListOrgResources) // discovered resource inventory
 		org.GET("/incidents", incidentsSvc.HandleListOrgIncidents) // war-room incident list
+		org.GET("/actions", trustSvc.HandleListOrgActions)         // pending AI-action approvals
 
 		// Slack integration — read for any member; install/config/disconnect are admin.
 		org.GET("/slack", slackSvc.HandleGetIntegration)
@@ -466,6 +481,9 @@ func main() {
 		proj.GET("/health-score", deploySvc.HandleGetHealthScore)
 		proj.GET("/resources", discoverySvc.HandleListProjectResources)
 		proj.GET("/incidents", incidentsSvc.HandleListProjectIncidents)
+		proj.GET("/actions", trustSvc.HandleListProjectActions)
+		proj.GET("/environments/:envId/trust", trustSvc.HandleGetTrust)
+		proj.PATCH("/environments/:envId/trust", requireAdmin, trustSvc.HandleUpdateTrust)
 		proj.GET("/conversation/history", conversationSvc.HandleHistory)
 
 		// Engineer actions — deploy, rollback, scale, env vars, alerts, chat, webhooks.

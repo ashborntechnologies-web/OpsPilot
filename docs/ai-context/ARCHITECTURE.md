@@ -232,6 +232,47 @@ Every AI decision carries a "why". Three mechanisms:
 
 ---
 
+## Trust levels & AI-action approval (ADR-013)
+
+Every AI-*initiated* action passes through the trust layer (`internal/trust`) before it
+can touch infrastructure. Direct human actions (the dashboard deploy button) bypass this.
+
+```mermaid
+graph TB
+  CHAT["conversation: chat deploy/rollback/scale/change_resources"] --> PROP
+  DIAG["diagnosis: deploy-failure → recommend rollback"] --> PROP
+  PROP["trust.ProposeAction"] --> ENV{"env trust_level + boundaries"}
+  ENV -->|autonomous & within boundaries| EXEC["ExecuteAction → deploy service"]
+  ENV -->|suggest / supervised / outside boundaries| PEND[("ai_actions: pending_approval")]
+  PEND --> WS["WS action_proposed → amber banner + Pending Approvals panel"]
+  PEND --> SLACK["Slack: proposal + review link"]
+  WS -->|engineer/admin| APPROVE["POST /actions/:id/approve"]
+  APPROVE --> EXEC
+  WS --> REJECT["POST /actions/:id/reject"]
+  EXEC --> RESULT[("status executed/failed + result")]
+  EXEC -->|if incident_id| TL["incident war-room timeline entry"]
+```
+
+- **Trust levels** (per environment): `suggest` (every AI action needs approval),
+  `supervised` (same, surfaced prominently), `autonomous` (actions within
+  `autonomous_boundaries` auto-execute; others need approval). **There is no `can_deploy`
+  boundary — deploys always require approval**, even in autonomous mode.
+- **`requiresApproval`** is a pure policy function: autonomous + boundary-permitted
+  (rollback/scale-within-min/max/change_resources) ⇒ auto-execute; everything else ⇒
+  pending approval. Every proposal is recorded in `ai_actions` with rationale + (for
+  diagnosis-sourced ones) the diagnosis confidence.
+- **Execution** routes by `action_type` to the deploy service (deploy/rollback/scale/
+  change_resources; terminal_command is not auto-executable) and records
+  `status`/`executed_at`/`result`; incident-linked actions post to the war-room timeline.
+- **Approval** requires engineer/admin in the action's org (`ApproveAction` validates via
+  `UserOrgRole`); rejection is recorded. Slack proposals link back to the app (Slack
+  users aren't mapped to platform users, so role-checked approval happens in-app).
+- **Seams** (no import cycles): `trust.Deployer` (deploy.Service), `trust.SlackActionNotifier`
+  (slack.Service), `trust.IncidentPoster` (incidents.Service); conversation/diagnosis hold
+  `*trust.Service` (trust imports neither).
+- *Reconciliation:* `ai_actions` is the executable, trust-gated action record; the
+  war-room `incident_actions` remains the advisory "suggested fix" surfaced in the room.
+
 ## Memory architecture
 
 ```mermaid

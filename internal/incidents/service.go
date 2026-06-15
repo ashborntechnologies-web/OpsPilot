@@ -166,6 +166,13 @@ func (s *Service) postTimelineEntry(ctx context.Context, incidentID uuid.UUID, a
 	return e, nil
 }
 
+// PostActionEntry appends an AI "action taken" entry to an incident's timeline (used by
+// the trust service when it executes/rejects a proposed action). Satisfies
+// trust.IncidentPoster.
+func (s *Service) PostActionEntry(ctx context.Context, incidentID uuid.UUID, content string) {
+	_, _ = s.postTimelineEntry(ctx, incidentID, models.IncidentAuthorAI, nil, content, models.IncidentEntryActionTaken, nil)
+}
+
 // broadcast JSON-encodes a payload and sends it to all war-room subscribers.
 func (s *Service) broadcast(incidentID uuid.UUID, msgType string, payload any) {
 	if s.hub == nil {

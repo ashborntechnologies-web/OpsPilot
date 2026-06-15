@@ -112,6 +112,8 @@ func RunMigrations(db *DB) error {
 		addSummaryConfigToOrganizations,
 		createDailySummariesTable,
 		addExplainabilityColumns,
+		addTrustLevelToEnvironments,
+		createAIActionsTable,
 	}
 
 	for _, m := range migrations {
@@ -629,6 +631,46 @@ ALTER TABLE incidents
     ADD COLUMN IF NOT EXISTS evidence JSONB NOT NULL DEFAULT '[]';
 ALTER TABLE alerts
     ADD COLUMN IF NOT EXISTS evidence_text TEXT;`
+
+// addTrustLevelToEnvironments sets how much autonomy AI-initiated actions have per
+// environment. autonomous_boundaries (JSONB) bounds what may auto-execute in 'autonomous'
+// mode: {can_rollback, can_scale, min_replicas, max_replicas, can_change_resources}.
+const addTrustLevelToEnvironments = `
+ALTER TABLE environments
+    ADD COLUMN IF NOT EXISTS trust_level TEXT NOT NULL DEFAULT 'suggest',
+    ADD COLUMN IF NOT EXISTS autonomous_boundaries JSONB;
+DO $$ BEGIN
+    ALTER TABLE environments ADD CONSTRAINT environments_trust_level_check
+        CHECK (trust_level IN ('suggest', 'supervised', 'autonomous'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;`
+
+// createAIActionsTable records every AI-proposed action and its approval/execution
+// lifecycle. The trust service (internal/trust) is the only writer.
+const createAIActionsTable = `
+CREATE TABLE IF NOT EXISTS ai_actions (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id              UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    project_id          UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    environment_id      UUID REFERENCES environments(id) ON DELETE SET NULL,
+    incident_id         UUID REFERENCES incidents(id) ON DELETE SET NULL,
+    proposed_by_type    TEXT NOT NULL CHECK (proposed_by_type IN ('ai', 'human')),
+    proposed_by_user_id UUID REFERENCES users(id),
+    action_type         TEXT NOT NULL CHECK (action_type IN ('deploy','rollback','scale','change_resources','terminal_command')),
+    parameters          JSONB NOT NULL DEFAULT '{}',
+    confidence_score    FLOAT,
+    rationale           TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'pending_approval'
+                        CHECK (status IN ('pending_approval','approved','rejected','executed','failed')),
+    approved_by         UUID REFERENCES users(id),
+    approval_required   BOOLEAN NOT NULL DEFAULT true,
+    proposed_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    decided_at          TIMESTAMPTZ,
+    executed_at         TIMESTAMPTZ,
+    result              JSONB,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ai_actions_org     ON ai_actions(org_id, status, proposed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_actions_project ON ai_actions(project_id, proposed_at DESC);`
 
 // createIncidentActionsTable stores remediation actions proposed during an incident
 // (by the AI or a human) and their approval lifecycle.

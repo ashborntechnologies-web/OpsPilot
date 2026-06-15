@@ -311,6 +311,44 @@ latency/cost is acceptable for a low-frequency, high-stakes action).
 
 ---
 
+## ADR-013 — Environment trust levels + AI-action approval
+**Date:** 2026-06-15 · **Status:** Accepted
+
+**Decision.** Every AI-initiated action is gated by the target **environment's** trust
+level — `suggest` / `supervised` / `autonomous` — with `autonomous` bounded by a
+per-environment `autonomous_boundaries` object. Actions are recorded in `ai_actions`;
+within-boundary autonomous actions auto-execute, everything else awaits human approval
+(engineer/admin). Direct human actions (the dashboard deploy button) are unaffected.
+
+**Context.** The product vision is an autonomous AI DevOps engineer earned via a
+staging-first trust model. Teams need graduated control: watch the AI, then let it act on
+low-risk operations, without ever surprising them on production.
+
+**Why three levels.** Two (manual/auto) is too coarse — there's no "I want to see it
+prominently and act fast, but still decide" middle ground, which is where teams actually
+build trust. Four+ adds config burden without a clear behavioral difference. Three maps to
+the trust journey: observe (suggest) → supervise (supervised) → delegate (autonomous).
+
+**Why boundaries are per-environment, not per-action-type globally.** Trust is contextual
+to *where* an action runs: a team may grant autonomous rollback/scale on staging while
+keeping production in suggest. A global per-action policy can't express "auto-scale staging
+but not prod." Per-environment boundaries make the blast radius explicit and let staging
+genuinely be the proving ground. There is deliberately **no `can_deploy`** — deploys are
+high-impact and always require approval even in autonomous mode.
+
+**Alternatives.** Per-action-type global trust (rejected: can't vary by environment);
+approval on the deploy service itself (rejected: would also gate direct human actions —
+the spec keeps those direct); reusing `incident_actions` (rejected: too narrow — actions
+exist outside incidents and need org/env scope, approval lifecycle, and results).
+
+**Impact.** New `internal/trust` package + `ai_actions` table + env trust columns;
+conversation routes chat actions and diagnosis proposes a rollback through `ProposeAction`;
+new approval UI (pending panel, navbar badge, Actions tab, env settings, `action_proposed`
+banner). Slack proposals link to in-app approval (Slack identity isn't mapped to platform
+users). `ai_actions` coexists with the advisory `incident_actions`.
+
+---
+
 ## ADR-008 — Tenant isolation via one ownership middleware
 **Date:** 2025-Q4 · **Status:** Superseded by ADR-009 (RBAC/org membership replaces
 single-user ownership; the "one middleware guard" principle carries forward)

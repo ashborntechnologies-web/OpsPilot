@@ -138,6 +138,8 @@ export interface WsMessage {
     | "incident_timeline"
     | "incident_update"
     | "incident_action"
+    | "action_proposed"
+    | "action_updated"
     | "error";
   payload: string;
 }
@@ -344,6 +346,48 @@ export interface DailySummaryRecord {
   delivered_slack: boolean;
   delivered_email: boolean;
   created_at: string;
+}
+
+export type TrustLevel = "suggest" | "supervised" | "autonomous";
+
+export interface AutonomousBoundaries {
+  can_rollback: boolean;
+  can_scale: boolean;
+  min_replicas: number;
+  max_replicas: number;
+  can_change_resources: boolean;
+}
+
+export interface EnvironmentTrust {
+  trust_level: TrustLevel;
+  autonomous_boundaries: AutonomousBoundaries | null;
+}
+
+export type ActionStatus = "pending_approval" | "approved" | "rejected" | "executed" | "failed";
+
+export interface AIAction {
+  id: string;
+  org_id: string;
+  project_id: string;
+  environment_id: string | null;
+  incident_id: string | null;
+  proposed_by_type: "ai" | "human";
+  proposed_by_user_id: string | null;
+  action_type: "deploy" | "rollback" | "scale" | "change_resources" | "terminal_command";
+  parameters: Record<string, unknown> | null;
+  confidence_score: number | null;
+  rationale: string;
+  status: ActionStatus;
+  approved_by: string | null;
+  approval_required: boolean;
+  proposed_at: string;
+  decided_at: string | null;
+  executed_at: string | null;
+  result: Record<string, unknown> | null;
+  environment_name?: string;
+  project_name?: string;
+  proposed_by_name?: string;
+  approved_by_name?: string;
 }
 
 export interface ConversationMessage {

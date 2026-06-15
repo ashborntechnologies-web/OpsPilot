@@ -16,6 +16,41 @@ Format:
 
 ---
 
+## 2026-06-15 — Environment trust levels & AI-action approval workflow
+- **What:** AI-initiated actions are gated by per-environment trust level; they auto-execute
+  within boundaries or require human approval. The "act" step of the AI-DevOps vision.
+  - **Data model:** `environments.trust_level` + `autonomous_boundaries` (JSONB); new
+    `ai_actions` table (org/project/env/incident scope, proposer, action_type, parameters,
+    confidence, rationale, approval lifecycle, result). New `AIAction`/`AutonomousBoundaries`
+    models + constants.
+  - **New `internal/trust`:** `ProposeAction` (pure `requiresApproval` policy → auto-execute
+    or pending), `ExecuteAction` (routes to deploy service; records status/result; posts to
+    incident timeline), `ApproveAction`/`RejectAction` (engineer+ via org role). Interfaces
+    `Deployer`/`SlackActionNotifier`/`IncidentPoster` avoid cycles. HTTP: env trust GET/PATCH,
+    org pending actions, project action history, approve/reject.
+  - **Wiring:** conversation routes chat deploy/rollback/scale/change_resources through
+    `ProposeAction` (replies "executed" or "needs approval"); diagnosis proposes a rollback
+    for deploy-failure incidents with the diagnosis confidence; `slack.PostActionProposal`
+    (review link); `incidents.PostActionEntry` for war-room timeline. main wires trustSvc
+    into conversation/diagnosis + routes. Direct human deploy button unchanged.
+  - **Frontend:** per-env trust settings (Settings tab, admin-only), Pending Approvals panel
+    in the right column + navbar badge, project Actions history tab, `action_proposed` amber
+    banner; shared `components/trust/*` + `components/ai` ConfidenceBadge reuse; types + API.
+- **Files:** `pkg/models/{db,types}.go`; `internal/trust/{service,handlers}.go` (new);
+  `internal/{conversation,diagnosis,slack,incidents}/…`, `cmd/api/main.go`; frontend
+  `types/api.ts`, `lib/api.ts`, `components/trust/{actions,env-trust-settings}.tsx` (new),
+  `components/project/alerts-panel.tsx`, `components/layout/navbar.tsx`,
+  `app/projects/[id]/page.tsx`.
+- **Why:** Graduated, staging-first autonomy — let the AI act on low-risk ops while keeping
+  humans in the loop on anything significant (deploys always need approval).
+- **Assumptions changed:** AI-initiated actions are no longer executed inline by the
+  conversation/diagnosis services — they flow through the trust layer, which may defer them
+  for approval. `ai_actions` is the executable action record (vs advisory `incident_actions`).
+- **Verification:** `go build`/`go vet`/`gofmt`/`tsc --noEmit` all clean. Auto-execution +
+  approvals not exercised against live services.
+- **Docs updated:** ARCHITECTURE, DATABASE_SCHEMA, API_CONTRACTS, CURRENT_STATE, BACKEND,
+  DECISIONS (ADR-013).
+
 ## 2026-06-15 — Explainability & confidence on every AI decision
 - **What:** Every AI output now ships with a "why" — confidence + structured evidence.
   - **Data model:** `incidents.confidence_score` (FLOAT 0–1) + `incidents.evidence` (JSONB

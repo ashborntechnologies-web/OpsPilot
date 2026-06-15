@@ -463,6 +463,41 @@ export function getProjectEvents(token: string, projectId: string, limit = 5) {
   return request<OperationalEvent[]>(`/projects/${projectId}/events?limit=${limit}`, token);
 }
 
+// ---- Trust levels & AI action approvals ----------------------------------------
+
+import type { EnvironmentTrust, AutonomousBoundaries, AIAction } from "@/types/api";
+
+export function getEnvironmentTrust(token: string, projectId: string, envId: string) {
+  return request<EnvironmentTrust>(`/projects/${projectId}/environments/${envId}/trust`, token);
+}
+
+export function updateEnvironmentTrust(
+  token: string,
+  projectId: string,
+  envId: string,
+  body: { trust_level?: string; autonomous_boundaries?: AutonomousBoundaries }
+) {
+  return request<{ message: string }>(`/projects/${projectId}/environments/${envId}/trust`, token, {
+    method: "PATCH", body: JSON.stringify(body),
+  });
+}
+
+export function listOrgActions(token: string, orgId: string, status = "pending") {
+  return request<AIAction[]>(`/orgs/${orgId}/actions?status=${status}`, token);
+}
+
+export function listProjectActions(token: string, projectId: string, limit = 50) {
+  return request<AIAction[]>(`/projects/${projectId}/actions?limit=${limit}`, token);
+}
+
+export function approveAction(token: string, actionId: string) {
+  return request<{ message: string }>(`/actions/${actionId}/approve`, token, { method: "POST" });
+}
+
+export function rejectAction(token: string, actionId: string) {
+  return request<{ message: string }>(`/actions/${actionId}/reject`, token, { method: "POST" });
+}
+
 // ---- Organizations (team workspaces) -------------------------------------------
 
 import type { Organization, OrganizationMember, OrgRole } from "@/types/api";

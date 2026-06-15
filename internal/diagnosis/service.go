@@ -14,6 +14,7 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/memory"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/prompts"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/trust"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -29,7 +30,12 @@ type Service struct {
 	llm       *llm.Client
 	memory    *memory.Service
 	incidents IncidentCreator
+	trust     *trust.Service
 }
+
+// SetTrustService lets diagnosis propose a remediation action (rollback) through the
+// trust/approval layer when it diagnoses a deploy failure. Optional.
+func (s *Service) SetTrustService(t *trust.Service) { s.trust = t }
 
 // IncidentCreator opens (or appends to) an incident from a completed diagnosis. The
 // concrete implementation is *incidents.Service, injected at startup to avoid a hard
@@ -177,6 +183,27 @@ func (s *Service) diagnose(ctx context.Context, projectID uuid.UUID, deployment 
 		rawForMemory = strings.Join(logLines, "\n")
 	}
 	incidentID := s.saveIncident(ctx, projectID, deployment.ID, "deploy_failure", rawForMemory, diagnosis, confidence, evidence)
+
+	// Recommend a remediation: a failed deploy's canonical fix is a rollback to the last
+	// healthy version. Proposed through the trust layer (gated by the env's trust level —
+	// in 'suggest' mode this is just a pending suggestion a human approves).
+	if s.trust != nil {
+		envID := deployment.EnvironmentID
+		incID := incidentID
+		rationale := "Diagnosis of the failed deployment recommends rolling back to the last healthy version."
+		if fix := extractDiagnosisField(diagnosis, "Fix"); fix != "" {
+			rationale = "Diagnosis recommendation: " + firstSentence(fix)
+		}
+		_, _ = s.trust.ProposeAction(ctx, trust.ActionProposal{
+			ProjectID:       projectID,
+			EnvironmentID:   &envID,
+			IncidentID:      &incID,
+			ProposedByType:  models.ProposerAI,
+			ActionType:      models.ActionRollback,
+			ConfidenceScore: confidence,
+			Rationale:       rationale,
+		})
+	}
 
 	if s.events != nil {
 		depID := deployment.ID

@@ -230,6 +230,26 @@ func (s *Service) PostDailySummary(ctx context.Context, orgID uuid.UUID, markdow
 	return true, nil
 }
 
+// PostActionProposal posts a pending AI-action approval to the org's alert channel with a
+// link to review it in OpsPilot. (Approve/Reject happen in-app, where the acting user's
+// platform role can be verified — Slack users aren't mapped to platform users.)
+func (s *Service) PostActionProposal(ctx context.Context, orgID uuid.UUID, action models.AIAction, reviewURL string) error {
+	in, err := s.loadIntegration(ctx, orgID)
+	if err != nil || in == nil || in.AlertChannelID == nil {
+		return err
+	}
+	conf := ""
+	if action.ConfidenceScore != nil {
+		conf = fmt.Sprintf(" · %d%% confidence", int(*action.ConfidenceScore*100))
+	}
+	text := fmt.Sprintf("*:robot_face: AI proposed a %s action*%s\n%s", action.ActionType, conf, action.Rationale)
+	attachment := map[string]any{
+		"color":  colorWarn,
+		"blocks": []any{section(text), actions(urlButton("Review & approve", reviewURL))},
+	}
+	return s.postAttachments(ctx, in.BotToken, *in.AlertChannelID, attachment)
+}
+
 // postAttachments posts a single color-coded attachment (chat.postMessage attachments).
 func (s *Service) postAttachments(ctx context.Context, token, channelID string, attachment map[string]any) error {
 	return s.apiPostOK(ctx, token, "chat.postMessage", map[string]any{
