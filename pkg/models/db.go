@@ -119,6 +119,7 @@ func RunMigrations(db *DB) error {
 		createServiceSLAsTable,
 		createUptimeSnapshotsTable,
 		createOncallSchedulesTable,
+		addBillingToOrganizations,
 	}
 
 	for _, m := range migrations {
@@ -759,6 +760,19 @@ CREATE TABLE IF NOT EXISTS oncall_schedules (
     created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );`
+
+// addBillingToOrganizations moves plan + AI-action metering from the user to the org (the
+// tenant boundary), so plan limits are enforced per workspace rather than per individual
+// member (ADR-017). Existing orgs inherit the founding user's plan so paid users aren't
+// downgraded. The per-user columns remain for backward compatibility but are no longer the
+// source of truth for limits.
+const addBillingToOrganizations = `
+ALTER TABLE organizations
+    ADD COLUMN IF NOT EXISTS plan                  TEXT NOT NULL DEFAULT 'free',
+    ADD COLUMN IF NOT EXISTS ai_actions_this_month INT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS ai_actions_reset_at   TIMESTAMPTZ NOT NULL DEFAULT NOW();
+UPDATE organizations o SET plan = u.plan
+    FROM users u WHERE u.id = o.created_by AND u.plan IS NOT NULL AND u.plan <> 'free';`
 
 // createIncidentActionsTable stores remediation actions proposed during an incident
 // (by the AI or a human) and their approval lifecycle.

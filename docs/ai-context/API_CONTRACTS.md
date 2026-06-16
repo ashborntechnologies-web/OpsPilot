@@ -41,7 +41,7 @@ Frontend client: [`frontend/lib/api.ts`](../../frontend/lib/api.ts). Errors are
 ## User-scoped (RequireAuth)
 | Method | Path | Request | Response | Consumer |
 |---|---|---|---|---|
-| GET | `/users/me` | — | `UserMe` (plan, usage, project count, notifications) | navbar, settings |
+| GET | `/users/me` | — | `UserMe` (plan, usage, project count, notifications — **plan/usage are for the caller's active org**, ADR-017) | navbar, settings |
 | PATCH | `/users/me/notifications` | `{enabled?,deploy_failed?,deploy_succeeded?,alert_fired?}` | `{message}` | settings |
 | POST | `/actions/:actionId/approve` | — | `{message}` | approvals — **engineer+** (checked against the action's org) |
 | POST | `/actions/:actionId/reject` | — | `{message}` | approvals — **engineer+** |

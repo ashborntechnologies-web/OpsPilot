@@ -1,11 +1,26 @@
 import React from "react";
 
-// Markdown is a tiny, dependency-free renderer for the subset of markdown the AI
-// produces in diagnoses and postmortems: ## headings, **bold**, `code`, ``` fences,
-// and "- " bullet lists. It is intentionally minimal (no HTML passthrough) so it is
-// safe to render model output without sanitization concerns.
+// Markdown is a dependency-free renderer for the markdown the AI produces in diagnoses
+// and postmortems: ## headings, **bold**, `code`, ``` fences, ordered + unordered lists,
+// GFM pipe tables, blockquotes, and horizontal rules. It is intentionally minimal (no raw
+// HTML passthrough) so it is safe to render model output without sanitization concerns.
 export function Markdown({ content, className }: { content: string; className?: string }) {
   return <div className={className}>{renderBlocks(content)}</div>;
+}
+
+// isTableSeparator matches the GFM header-underline row, e.g. | --- | :--: |.
+function isTableSeparator(line: string): boolean {
+  return line.includes("-") && /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$/.test(line);
+}
+
+// splitRow splits a pipe-table row into trimmed cells (honoring escaped \|).
+function splitRow(line: string): string[] {
+  return line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split(/(?<!\\)\|/)
+    .map((c) => c.replace(/\\\|/g, "|").trim());
 }
 
 function renderBlocks(text: string): React.ReactNode[] {
@@ -44,16 +59,88 @@ function renderBlocks(text: string): React.ReactNode[] {
       continue;
     }
 
-    // Bullet list
-    if (/^\s*[-*]\s+/.test(line)) {
+    // Horizontal rule
+    if (/^\s*([-*_])\1{2,}\s*$/.test(line)) {
+      out.push(<hr key={key++} className="my-3 border-zinc-200" />);
+      i++;
+      continue;
+    }
+
+    // GFM pipe table — a header row followed by a separator row.
+    if (line.includes("|") && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+      const header = splitRow(line);
+      i += 2; // header + separator
+      const rows: string[][] = [];
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "") {
+        rows.push(splitRow(lines[i]));
+        i++;
+      }
+      out.push(
+        <div key={key++} className="my-2 overflow-x-auto">
+          <table className="w-full text-sm border-collapse">
+            <thead>
+              <tr>
+                {header.map((c, idx) => (
+                  <th key={idx} className="border border-zinc-200 bg-zinc-50 px-2 py-1 text-left font-medium">{renderInline(c)}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, ri) => (
+                <tr key={ri}>
+                  {header.map((_, ci) => (
+                    <td key={ci} className="border border-zinc-200 px-2 py-1 align-top">{renderInline(r[ci] ?? "")}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+      continue;
+    }
+
+    // Blockquote (consecutive "> " lines)
+    if (/^\s*>\s?/.test(line)) {
+      const quoted: string[] = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+        quoted.push(lines[i].replace(/^\s*>\s?/, ""));
+        i++;
+      }
+      out.push(
+        <blockquote key={key++} className="my-2 border-l-2 border-zinc-300 pl-3 text-sm text-muted-foreground italic">
+          {quoted.map((q, idx) => <p key={idx} className="my-0.5">{renderInline(q)}</p>)}
+        </blockquote>
+      );
+      continue;
+    }
+
+    // Ordered list
+    if (/^\s*\d+\.\s+/.test(line)) {
       const items: string[] = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+\.\s+/, ""));
+        i++;
+      }
+      out.push(
+        <ol key={key++} className="my-1 ml-5 list-decimal space-y-0.5 text-sm">
+          {items.map((it, idx) => <li key={idx}>{renderInline(it)}</li>)}
+        </ol>
+      );
+      continue;
+    }
+
+    // Bullet list (supports one level of nesting via indentation)
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items: { text: string; nested: boolean }[] = [];
       while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
-        items.push(lines[i].replace(/^\s*[-*]\s+/, ""));
+        const indent = /^(\s*)/.exec(lines[i])?.[1].length ?? 0;
+        items.push({ text: lines[i].replace(/^\s*[-*]\s+/, ""), nested: indent >= 2 });
         i++;
       }
       out.push(
         <ul key={key++} className="my-1 ml-4 list-disc space-y-0.5 text-sm">
-          {items.map((it, idx) => <li key={idx}>{renderInline(it)}</li>)}
+          {items.map((it, idx) => <li key={idx} className={it.nested ? "ml-4" : undefined}>{renderInline(it.text)}</li>)}
         </ul>
       );
       continue;

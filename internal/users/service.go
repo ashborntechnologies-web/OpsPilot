@@ -29,7 +29,13 @@ func (s *Service) HandleGetMe(c *gin.Context) {
 		return
 	}
 
-	usage, err := s.billing.GetUsage(c.Request.Context(), userID)
+	// Plan + usage are per workspace (ADR-017), so report the caller's active org
+	// (X-Org-Id header, defaulting to their personal org).
+	orgID, _, ok := middleware.ActiveOrg(c, s.db)
+	if !ok {
+		return // ActiveOrg already wrote the error
+	}
+	usage, err := s.billing.GetUsage(c.Request.Context(), orgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load usage"})
 		return

@@ -16,6 +16,42 @@ Format:
 
 ---
 
+## 2026-06-16 — Review batch: per-org billing, quick wins (robots/markdown/cost/deep-link/viewer UX)
+- **What:** Worked a (partly stale) review list — verified each claim against code, fixed
+  the genuine items, skipped the already-done ones.
+  - **Per-org billing (#2, ADR-017):** plan + AI metering moved from `users` to
+    `organizations` (`addBillingToOrganizations` migration, backfills plan from the founding
+    user). `billing.CheckProjectLimit`/`IncrementAIAction`/`GetUsage` re-keyed to `org_id`.
+    Callers: `deploy.HandleCreateProject` (active org), `conversation.ProcessMessage`
+    (resolves project's org), `users.HandleGetMe` (active org via `middleware.ActiveOrg`).
+    Fixes the hole where N members each got their own Free-tier caps.
+  - **#9 cost change:** `summary.costChange` now real — `aws.GetCostTotalForRange` (daily
+    Cost Explorer) compared 7d vs prior-7d; omitted when no account/prior spend.
+  - **#10 markdown:** extended `lib/markdown.tsx` to GFM tables, blockquotes, horizontal
+    rules, and ordered lists (still dependency-free, no raw-HTML passthrough) — postmortem
+    timeline tables now render.
+  - **#6 alert deep-link:** alert emails link straight to an open incident's war room when
+    one exists for the project/environment, else the incident list.
+  - **#18 viewer UX:** primary dashboard action buttons (deploy/rollback/redeploy/scale/
+    retry/cancel/delete-deployment/add-env-var/add-webhook) now render `disabled` with a
+    view-only tooltip for viewers.
+  - **#17 robots.txt:** added `frontend/app/robots.ts` (marketing/legal crawlable, app
+    routes disallowed).
+  - **Verified already-done (no change):** #1 framework labels (all 18 present), #12 mobile
+    drawers (shipped last commit), #5 `change_resources` execution is wired (only
+    `terminal_command` intentionally isn't).
+  - **Deferred (per direction):** #3 onboarding, #4 Slack↔Clerk identity, #7 IAM template,
+    #8 deploy/service.go refactor, #11 chart tooltips, #13/#14 autonomy/staging-first,
+    #15 HTTPS UX, #16 codebase understanding.
+- **Files:** `pkg/models/db.go`, `internal/billing/limits.go`, `internal/deploy/service.go`,
+  `internal/conversation/service.go`, `internal/users/service.go`, `internal/aws/service.go`,
+  `internal/summary/service.go`, `internal/monitor/alerts.go`,
+  `frontend/app/robots.ts`, `frontend/lib/markdown.tsx`, `frontend/app/projects/[id]/page.tsx`.
+- **Assumptions changed:** plan/usage are now per workspace (org), not per user;
+  `users.plan`/`ai_actions_*` retained but no longer authoritative.
+- **Docs updated:** ARCHITECTURE, DATABASE_SCHEMA, API_CONTRACTS, CURRENT_STATE,
+  DECISIONS (ADR-017), CHANGELOG_AI.
+
 ## 2026-06-16 — AI on-call layer: quiet hours, risk card, mobile reach (+ wiring verified)
 - **What:** Completed the on-call/operator layer around monitoring.
   - **On-call quiet hours (ADR-016, new):** `oncall_schedules` table (per-org timezone,

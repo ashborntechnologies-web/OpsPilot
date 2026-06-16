@@ -1989,6 +1989,57 @@ func (s *Service) GetAccountCostSummary(ctx context.Context, projectID string) (
 	return summary, nil
 }
 
+// GetCostTotalForRange returns the total unblended platform cost for a project's AWS
+// account over [startStr, endStr) (dates as YYYY-MM-DD), using daily granularity. Used by
+// the daily summary's cost-change comparison (7d vs prior 7d).
+func (s *Service) GetCostTotalForRange(ctx context.Context, projectID, startStr, endStr string) (float64, error) {
+	var iamRoleARN, externalID string
+	err := s.db.Pool.QueryRow(ctx, `
+		SELECT a.iam_role_arn, a.external_id
+		FROM aws_accounts a JOIN projects p ON p.account_id = a.id
+		WHERE p.id = $1`, projectID).Scan(&iamRoleARN, &externalID)
+	if err != nil {
+		return 0, fmt.Errorf("no AWS account linked: %w", err)
+	}
+	if externalID == "" {
+		externalID = LegacyExternalID
+	}
+	clients, err := s.assumeRole(ctx, iamRoleARN, "us-east-1", projectID, externalID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to assume role: %w", err)
+	}
+
+	out, err := clients.CostExplorer.GetCostAndUsage(ctx, &costexplorer.GetCostAndUsageInput{
+		TimePeriod:  &cetypes.DateInterval{Start: aws.String(startStr), End: aws.String(endStr)},
+		Granularity: cetypes.GranularityDaily,
+		Filter: &cetypes.Expression{
+			Dimensions: &cetypes.DimensionValues{
+				Key: cetypes.DimensionService,
+				Values: []string{
+					"Amazon Elastic Container Service",
+					"Amazon EC2 Container Registry (ECR)",
+					"AWS CodeBuild",
+					"Amazon Elastic Load Balancing",
+					"Amazon Virtual Private Cloud",
+				},
+			},
+		},
+		Metrics: []string{"UnblendedCost"},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("cost explorer query failed: %w", err)
+	}
+
+	var total float64
+	for _, result := range out.ResultsByTime {
+		if metric, ok := result.Total["UnblendedCost"]; ok {
+			val, _ := strconv.ParseFloat(aws.ToString(metric.Amount), 64)
+			total += val
+		}
+	}
+	return total, nil
+}
+
 // ---- Conversational Infrastructure Mutations ----
 
 // GetCurrentTaskResources returns the CPU and memory of the currently running task definition

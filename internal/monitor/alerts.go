@@ -325,10 +325,22 @@ func alertEvidence(ev models.OperationalEvent) string {
 // notifyOwner emails the project owner (if their preferences allow) and posts to the
 // org's Slack alert channel (if connected). Both are best-effort.
 func (a *AlertEngine) notifyOwner(ctx context.Context, alert models.Alert, projectName, envName string) {
-	// Link to the incident war room. The specific incident is opened by the auto-
-	// diagnosis job that follows this alert, so we link to the org incident list where
-	// the in-progress incident appears (open incidents are surfaced first).
-	alertURL := strings.TrimRight(os.Getenv("FRONTEND_URL"), "/") + "/incidents"
+	// Link to the incident war room. If an incident is already open for this
+	// project/environment (e.g. a recurring issue, or the auto-diagnosis from an earlier
+	// alert in the same window already opened one), deep-link straight to that war room;
+	// otherwise fall back to the incident list (the diagnosis job that follows this alert
+	// opens the specific incident moments later, where it surfaces open-first).
+	frontend := strings.TrimRight(os.Getenv("FRONTEND_URL"), "/")
+	alertURL := frontend + "/incidents"
+	var openIncidentID uuid.UUID
+	if err := a.db.Pool.QueryRow(ctx, `
+		SELECT id FROM incidents
+		WHERE project_id = $1 AND status <> 'resolved'
+		  AND ($2::uuid IS NULL OR environment_id = $2)
+		ORDER BY created_at DESC LIMIT 1`,
+		alert.ProjectID, alert.EnvironmentID).Scan(&openIncidentID); err == nil {
+		alertURL = frontend + "/incidents/" + openIncidentID.String()
+	}
 
 	var email string
 	var enabled bool

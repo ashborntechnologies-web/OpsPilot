@@ -433,8 +433,9 @@ graph TB
 - **Generation:** `GenerateDailySummary` aggregates the last 24h (deploys by status,
   incidents + MTTR, alerts) + 7-day top recurring failures from project memory, asks
   Claude for a grounded paragraph + ≤3 recommendations (strict JSON, template fallback),
-  renders markdown, and upserts `daily_summaries`. Cost-change is best-effort (currently
-  stubbed — see CURRENT_STATE).
+  renders markdown, and upserts `daily_summaries`. Cost-change is real (best-effort): a
+  7d-vs-prior-7d Cost Explorer comparison via `aws.GetCostTotalForRange`, omitted from output
+  when there's no connected account or no prior-period spend.
 - **Delivery:** Slack (reuses `slack.PostDailySummary`) + email to admins/engineers who
   enabled notifications; `delivered_slack`/`delivered_email` flags recorded. Config
   (time/timezone/enabled) lives on the `organizations` row.
