@@ -24,3 +24,4 @@ exports/
 *.pem
 *.key
 *.crt
+.aider*

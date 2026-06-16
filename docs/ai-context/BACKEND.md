@@ -1,0 +1,323 @@
+# Backend Reference — OpsPilot
+
+Go monolith. Module `github.com/ashborntechnologies-web/OpsPilot`. Each `internal/<domain>`
+package exposes a `Service` constructed once in `cmd/api/main.go`. Raw `pgx` for DB
+(no ORM). Below: every backend module — purpose, key files, important types, and
+cross-module dependencies.
+
+> Convention: `Handle*` = Gin HTTP adapter; the matching context-taking method holds
+> reusable logic (called by the conversation engine and queue workers too).
+
+---
+
+## `cmd/api/main.go` — composition root
+Wires every service, runs migrations, mounts routes, starts the HTTP server +
+WebSocket hub + Asynq queue server + watchdog scheduler + monitoring Poller +
+LogScanner. `validateEnv()` fails fast on missing config; `prompts.MustLoad()` panics
+without trade-secret prompts. `resolvePlatformIdentity()` reads the platform AWS
+account/ARN for the bootstrap template + same-account AssumeRole.
+
+---
+
+## `internal/auth` — Clerk identity
+- **Purpose:** validate Clerk JWTs and fetch Clerk user profiles.
+- **Files:** `service.go`.
+- **Key types:** `Service` (caches JWKS), `Claims`, `ClerkUser` (`PrimaryEmail()`).
+- **Key methods:** `ValidateToken` (RS256 via cached JWKS, auto-refresh on unknown
+  kid), `FetchClerkUser`.
+- **Consumed by:** `pkg/middleware/auth.go`, `terminal` (WS auth).
+
+## `internal/llm` — Claude client
+- **Purpose:** the only Anthropic API client.
+- **Files:** `client.go`.
+- **Key type:** `Client`; **method:** `Complete(ctx, system, userMessage, maxTokens)`.
+- **Behavior:** retry with backoff on retryable errors; `APIError` for non-2xx.
+- **Consumed by:** `conversation`, `diagnosis`, `memory`, `monitor` (alert summaries),
+  `deploy` (risk explanation).
+
+## `internal/prompts` — trade-secret prompt loader
+- **Purpose:** load intent-classifier + diagnosis prompts from env/file at startup.
+- **Files:** `prompts.go`. **API:** `MustLoad()` (panics if unconfigured),
+  `IntentClassifier()`, `Diagnosis()`. Never embeds prompt text in source.
+
+## `internal/conversation` — chat engine (intent → action)
+- **Purpose:** classify a user message into an intent and route to a Go workflow.
+- **Files:** `service.go`.
+- **Key types:** `Service`, `IntentResult{Intent, Params}`.
+- **Core method:** `ProcessMessage(ctx, projectID, userID, message)` — meters the AI
+  action (billing), prepends recent conversation context, classifies via Claude
+  (`classifyIntent` → JSON), then `switch`es on intent to
+  `deploy.TriggerDeploy/TriggerRollback/FetchLogsForProject/CheckHealth/ScaleService/
+  GetCostSummary/ProposeResourceChange/ApplyPendingMutation` or
+  `diagnosis.DiagnoseProject`. Degrades gracefully on classifier failure.
+- **HTTP:** `HandleMessage` (REST fallback), `HandleHistory`. Primary transport is WS
+  (the hub calls `ProcessMessage` as its `MessageHandler`).
+- **Depends on:** `llm`, `prompts`, `deploy`, `diagnosis`, `billing`, `ws`, `models`.
+
+## `internal/deploy` — the orchestration core (largest module)
+- **Purpose:** deploy/rollback/provision workflows, PR previews, risk & health scores,
+  cost intelligence, resource mutations, project/deployment CRUD, GitHub webhook.
+- **Files:** `service.go` (~2700 lines), `riskscore.go`, `healthscore.go`,
+  `handlers_test.go`, `validate_test.go`, `riskscore_test.go`.
+- **Key type:** `Service` (deps: aws, github, ws hub, `Enqueuer`, events, envvars,
+  webhooks; optional via `Set*`: email, memory, riskLLM, billing).
+- **Workflows (run in Asynq workers):**
+  - `RunDeployWorkflow` — AssumeRole → CodeBuild (build/push image) → stream build
+    logs → register task def (inject env vars) → ensure target group/listener/ECS
+    service → wait stable → health check → live or rollback. Emits operational events.
+  - `RunProvisionWorkflow` — ensure shared platform stack + per-env project stack.
+  - `RunRollbackWorkflow`, `RunDeleteProjectCleanup`, `runPreviewDeployWorkflow`.
+  - `ReconcileStuckResources` — watchdog target (auto-fail stuck deploys).
+- **Conversation-facing methods:** `TriggerDeploy`, `TriggerRollback`,
+  `FetchLogsForProject`, `CheckHealth`, `ScaleService`, `GetCostSummary`,
+  `ProposeResourceChange` + `ApplyPendingMutation` (CPU/memory change behind confirm).
+- **Scoring:** `ComputeRiskScore` (pre-deploy, advisory, broadcast as `deploy_risk`;
+  factors include recent failures, open alerts, Friday-afternoon), `ComputeHealthScore`.
+- **HTTP:** project/deployment/env CRUD, deploy/rollback/redeploy/cancel, logs, health,
+  scale, costs, previews enable/disable, settings, `HandleGithubWebhook` (HMAC-verified).
+- **Depends on:** `aws`, `github`, `events`, `envvars`, `webhooks`, `notify`, `memory`,
+  `billing`, `llm`, `queue` (via `Enqueuer`), `ws`, `models`.
+
+## `internal/aws` — cloud provider (BYOC)
+- **Purpose:** all AWS calls in the user's account via assumed roles.
+- **Files:** `service.go` (~2200 lines), `cloudformation.go` (platform-stack CF
+  template incl. optional HTTPS listener), `monitoring.go` (ALB metrics, CodeBuild log
+  streaming/stop), `provider.go` (`AWSProvider` interface for mocking), `service_test.go`.
+- **Key types:** `Service`, `ClientBundle` (per-request set of AWS SDK clients from an
+  assumed role), `ServiceHealth`, `ALBMetrics`, `StartCodeBuildResult`.
+- **Highlights:** `AssumeRoleForEnvironment`/`AssumeRoleForAccount` (per-tenant
+  external ID; `explainAssumeRoleError` for friendly messages), `GetOrCreatePlatformStack`
+  (shared VPC/ECS/ALB per account×region), `StartCodeBuildJob` + `WaitForCodeBuild`,
+  `RegisterECSTaskDefinition`, `EnsureTargetGroup/EnsureListenerRule/EnsureECSService`,
+  `WaitForECSServiceStable`, SSM secure-param helpers (GitHub token for build),
+  `StartExecSession` (terminal), `FetchRecentECSLogs`, `GetAccountCostSummary`,
+  `CreatePreviewService`/`TeardownPreviewService`, bootstrap template + CloudShell
+  script rendering, Dockerfile/buildspec generation per framework.
+- **Depends on:** `events`, `awstags`, `models`, AWS SDK v2.
+
+## `internal/awstags` — resource tagging
+- `BuildResourceTags(projectID, envName, platformAccountID)` → converters
+  `ToCloudFormation/ToECS/ToELB`. Consistent ownership tags on every created resource.
+
+## `internal/diagnosis` — root-cause AI
+- **Purpose:** explain deploy failures and runtime anomalies; capture feedback.
+- **Files:** `service.go`, `feedback.go`, `service_test.go`.
+- **Key methods:** `DiagnoseProject` (last failed deploy), `diagnose` (logs + event
+  timeline + history + past incidents + **memory section** → Claude), `DiagnoseRuntime`
+  (continuous-monitoring failures), `saveIncident`. `SetMemoryService` injects memory.
+- **HTTP:** `HandleDiagnose`, `HandleSubmitFeedback`, `HandleFeedbackSummary`.
+- **Depends on:** `aws` (logs), `events`, `memory`, `llm`, `prompts`, `models`.
+
+## `internal/trust` — trust levels & AI-action approval
+- **Purpose:** gate AI-initiated actions by per-environment trust level; auto-execute or
+  require human approval. See ADR-013 and the ARCHITECTURE trust flow.
+- **Files:** `service.go` (`ProposeAction`, pure `requiresApproval`, `ExecuteAction`,
+  `ApproveAction`/`RejectAction`, `resolveEnv`), `handlers.go` (env trust GET/PATCH, org
+  pending actions, project action history, approve/reject).
+- **Key type:** `Service` (db, deployer, hub, slack, incidents, frontendURL); interfaces
+  `Deployer` (deploy.Service), `SlackActionNotifier` (slack.Service), `IncidentPoster`
+  (incidents.Service) injected to avoid cycles. `ActionProposal` is the input.
+- **Consumed by:** `conversation` (chat actions → ProposeAction) and `diagnosis`
+  (deploy-failure → recommend rollback), both holding `*trust.Service`. Writes `ai_actions`;
+  broadcasts `action_proposed`/`action_updated`.
+
+## `internal/incidents` — incident war room
+- **Purpose:** first-class, lifecycle-tracked incidents with a shared real-time timeline
+  (AI + human) and an approval flow for proposed actions. On resolve it **enqueues** async
+  postmortem generation (it no longer renders postmortems itself — that moved to
+  `internal/postmortem`; ADR-014). See the ARCHITECTURE war-room flow.
+- **Files:** `service.go` (`CreateIncident` + dedup + first timeline entry + suggested
+  action; `PostActionEntry`; `postTimelineEntry`/`broadcast`; `PostmortemEnqueuer` interface
+  + `SetPostmortemEnqueuer`), `handlers.go` (list/get/timeline/acknowledge/resolve/approve/
+  reject + `requireIncidentRole`). `HandleResolve` enqueues and returns
+  `{postmortem_generating:true}`.
+- **Key type:** `Service` (deps: db, llm, ws hub, `postmortems PostmortemEnqueuer`);
+  `CreateParams` (the diagnosis→incident bridge). Consumed by `diagnosis` via the
+  `diagnosis.IncidentCreator` interface (`SetIncidentService`) so completed diagnoses open
+  an incident instead of a bare row.
+- **Realtime:** broadcasts `incident_timeline`/`incident_update`/`incident_action` to the
+  war-room WebSocket (`pkg/ws` incident rooms, keyed by incident ID).
+- **Depends on:** `llm`, `ws` (broadcast), `middleware` (auth/role), `models`, and the
+  `PostmortemEnqueuer` seam (satisfied by `*queue.Client`).
+
+## `internal/postmortem` — async postmortem generation
+- **Purpose:** generate a structured, editable, exportable postmortem when an incident is
+  resolved — asynchronously so resolve never blocks on Claude (ADR-014).
+- **Files:** `service.go` (`GeneratePostmortem`: load incident + timeline + ai_actions +
+  deployment + project memory → Claude → parse action items → upsert `postmortems` draft
+  `ON CONFLICT(incident_id)` → mirror to `incidents.postmortem` → `memory.RecordSuccessfulFix`;
+  plus `parseActionItems`/`renderTimeline`/`renderActions`/`renderDeployment`/`renderMemory`),
+  `handlers.go` (`HandleGetByIncident` 404 `{generating}`, `HandleGet`, `HandleUpdate`,
+  `HandlePublish`, `HandleExport` md/print-HTML, `HandleListOrg` + `requireRole`/`loadOne`/
+  `printableHTML`).
+- **Key type:** `Service` (deps: db, llm, `memory` service). Constructed in `main.go`;
+  satisfies the incidents `PostmortemEnqueuer` indirectly via `queue.Client`.
+- **Triggered by:** the Asynq `postmortem:generate` task (`internal/queue` →
+  `s.handlePostmortem`). Idempotent (UNIQUE incident upsert), `MaxRetry(1)`.
+- **Depends on:** `llm` (generation), `memory` (successful-fix learning), `middleware`, `models`.
+
+## `internal/memory` — long-term project memory
+- **Purpose:** learn facts about each project and feed them into diagnosis prompts.
+- **Files:** `service.go`. **Methods:** `upsert` (dedup via normalized `contentKey`,
+  `reference_count++`), `RecordDiagnosisFeedback`, `RecordRecurringFailure`,
+  `RecordDeployPattern`, `RecordSuccessfulFix` (a `successful_fix` memory written by the
+  postmortem generator), `GetRelevantMemory`, `FormatForPrompt`.
+- **Depends on:** `llm`, `models`.
+
+## `internal/events` — operational event hub
+- **Purpose:** record structured state transitions; fan out to alerts + auto-diagnosis.
+- **Files:** `service.go`. **Interfaces:** `AlertEvaluator`, `DiagnosisEnqueuer`
+  (wired post-construction). `Emit` writes the row then notifies the alert engine and
+  (for runtime failures) enqueues a diagnosis. `EmitAccount` for pre-project audit
+  events. **HTTP:** `HandleGetDeploymentEvents`, `HandleGetProjectEvents`.
+
+## `internal/discovery` — AWS infrastructure discovery
+- **Purpose:** scan connected AWS accounts for existing resources so users onboard
+  without migration. See ADR-010 and the ARCHITECTURE discovery flow.
+- **Files:** `clients.go` (`ScanClients` — ECS/ELB/RDS/ElastiCache/Lambda/S3/SQS built
+  from an assumed-role config), `service.go` (scan orchestration + 7 scanners + upsert),
+  `handlers.go` (HTTP + `ScanEnqueuer` seam).
+- **Key methods:** `ScanAccountByID` (resolve regions → assume role per region →
+  `ScanAccount`), `ScanAccount` (run scanners in parallel, isolated, then idempotent
+  `upsert`), `ScanAllAccounts` (daily fan-out), scanners `ScanECSServices`/`ScanRDSInstances`/
+  `ScanElastiCache`/`ScanLambda`/`ScanS3`/`ScanALBs`/`ScanSQS`.
+- **Handlers:** `HandleScanAccount` (POST /aws-accounts/:id/scan, engineer+),
+  `HandleListOrgResources` (GET /orgs/:orgId/resources + filters), `HandleListProjectResources`
+  (GET /projects/:id/resources), `HandleAssignResource` (PATCH /resources/:id/assign).
+- **Depends on:** `aws` (assumed-role config + region enumeration), `awstags` (ManagedBy
+  detection), `models`, AWS SDK v2 (rds/elasticache/lambda/s3/sqs/ecs/elbv2). Consumed by
+  `queue` (scan jobs) and `monitor` (discovered ECS services).
+
+## `internal/monitor` — continuous monitoring + alerts
+- **Files:** `poller.go`, `logscanner.go`, `alerts.go`, `handlers.go`, `monitor_test.go`.
+- **`Poller`** (every 60s, one worker per ready env): ECS `ServiceHealth` + `ALBMetrics`
+  → emits `runtime.*` events on degradation/recovery.
+- **`LogScanner`** (every 5m): pattern-matches recent CloudWatch logs (`ScanLines`,
+  pure Go — no AI) → `runtime.log_anomaly` / crash-loop events.
+- **`AlertEngine`:** `EvaluateEvent` maps events → deduplicated `alerts` (AI summary via
+  `generateSummary`), respects snoozes, auto-resolves on recovery, broadcasts WS +
+  emails/Slacks owner. **On-call quiet hours (ADR-016, `oncall.go`):** `notifyOwner` calls
+  `CheckQuietHours(orgID)` (`alerts.go`) — during quiet hours, warn alerts are suppressed
+  from email/Slack (DB row + WS broadcast still happen); error alerts always notify with a
+  Slack note. **HTTP:** `HandleListAlerts`, `HandleSnooze`, `HandleResolve`,
+  `HandleGetOncallSchedule`/`HandlePutOncallSchedule` (org-tier, `oncall.go`).
+- **Depends on:** `aws`, `events`, `llm`, `notify`, `ws`, `middleware`, `models`.
+
+## `internal/slack` — Slack integration
+- **Purpose:** per-org Slack notifications (alerts, deploys, daily digest) + `/opspilot`
+  slash commands. Raw HTTP to the Slack Web API (no SDK). See ADR-011.
+- **Files:** `service.go` (`SendMessage` base + `PostAlert`/`PostDeployResult`/
+  `PostDailySummary`/`PostDailySummaries`, `loadIntegration`, Block Kit helpers),
+  `oauth.go` (signed-state install URL, callback, channels list, get/update/disconnect),
+  `commands.go` (`HandleCommand` + signature verify + `HandleInteractivity`).
+- **Key type:** `Service` (db, httpClient, encryption keys, Slack app creds);
+  `Deployer` interface (injected `*deploy.Service`) for slash deploy/rollback.
+- **Consumed by:** `deploy` (via `SlackNotifier`), `monitor` (via `SlackAlertNotifier`),
+  `queue` (daily summary task). Tokens encrypted via `pkg/crypto`.
+
+## `internal/summary` — daily operational summary
+- **Purpose:** AI morning briefing per org — 24h metrics + recommendations, posted to
+  Slack and emailed. See the ARCHITECTURE daily-summary flow.
+- **Files:** `service.go` (`DailySummary` struct, `GenerateDailySummary` [queries +
+  Claude + upsert], `GenerateAndDeliver`, `DeliverSummary`, `EnqueueDueSummaries`,
+  `costChange` [stubbed]), `handlers.go` (list / latest / generate-now / update-config).
+- **Key type:** `Service` (db, llm, email, awsSvc, frontendURL); interfaces `SlackPoster`
+  (satisfied by `*slack.Service`) + `SummaryEnqueuer` (satisfied by `*queue.Client`),
+  injected via `SetSlack`/`SetEnqueuer` to avoid cycles.
+- **Consumed by:** `queue` (`TaskSummaryTick` hourly → `EnqueueDueSummaries`;
+  `TaskGenerateSummary` → `GenerateAndDeliver`). Reads project memory, incidents, alerts,
+  deployments. (Replaced the simpler `slack.PostDailySummaries` digest.)
+
+## `internal/analytics` — engineering leadership dashboard
+- **Purpose:** SLA/uptime tracking, MTTD/MTTR, reliability trends, and the monthly
+  operational health report. See ADR-015 and the ARCHITECTURE analytics flow.
+- **Files:** `service.go` (`ComputeUptimeSnapshot` + `SnapshotAllEnvironments`;
+  `GetReliabilityMetrics` with per-metric helpers `windowUptime`/`mttd`/`mttr`/`deployStats`/
+  `uptimeTrend`/`incidentTrend`/`topFailurePatterns`; `GetProjectBreakdown`;
+  `GetUptimeHistory`; `GetSLA`/`UpsertSLA`; `SLAStatus`), `report.go` (`GenerateMonthlyReport`
+  + `GenerateAllMonthlyReports` + Claude `executiveSummary` + markdown render + email/Slack
+  delivery), `handlers.go` (org/project analytics, uptime history, SLA get/set, list/generate
+  reports).
+- **Key type:** `AnalyticsService` (deps: db, llm, email, awsSvc, frontendURL; `SlackPoster`
+  via `SetSlack`). Uptime is computed from `runtime.service_down`/`service_recovered`
+  operational events (idempotent `uptime_snapshots` upsert), never external probes.
+- **Consumed by:** `queue` (`analytics:snapshot` daily, `analytics:monthly` on the 1st).
+  Writes `uptime_snapshots`, `service_slas`, and monthly rows in `daily_summaries`
+  (`is_monthly = true`). **Depends on:** `llm`, `notify`, `aws` (cost), `models`.
+
+## `internal/notify` — email
+- `EmailService` over SMTP+STARTTLS. `SendAlert`, `SendDeployResult`. A logging no-op
+  when SMTP env is unset (rest of platform never nil-checks).
+
+## `internal/billing` — plans & metering
+- `PlanLimits` per tier (`free`/`pro`/`team`), `LimitsFor`. `Service`:
+  `CheckProjectLimit`, `IncrementAIAction` (monthly reset; returns `*ErrLimitReached`),
+  `GetUsage`. Free = 1 project / 10 AI actions per month.
+- **Consumed by:** `conversation` (meter), `deploy` (project limit), `users`.
+
+## `internal/users` — account endpoint
+- `HandleGetMe` (plan, usage, project count, notification prefs),
+  `HandleUpdateNotifications`. Depends on `billing`, `models`.
+
+## `internal/envvars` — per-environment variables
+- CRUD over `env_vars`; secrets redacted in list, plaintext only via
+  `HandleReveal`. `LoadForEnvironment` → `[]ecstypes.KeyValuePair` injected into the
+  task definition at deploy time.
+
+## `internal/webhooks` — outbound webhooks
+- Project-scoped webhook CRUD; `FireEvent` delivers HMAC-SHA256-signed payloads for
+  `deploy.started/succeeded/failed`. SSRF guard (`isDisallowedIP`,
+  `ALLOW_PRIVATE_WEBHOOKS`). `BuildPayload` standard shape.
+
+## `internal/github` — source integration
+- **Files:** `service.go`, `provider.go` (`GitHubProvider` interface), `service_test.go`.
+- OAuth (`HandleOAuthCallback`, `HandleGetOAuthURL`), `HandleListRepos`,
+  `HandleListBranches`, `HandleDetectFramework` (AI-assisted), PR webhook parsing
+  (`PREvent`) for preview environments. Tokens AES-encrypted at rest.
+
+## `internal/terminal` — browser shell into ECS
+- **Files:** `service.go`, `datachannel.go`. `HandleTerminal` upgrades a WebSocket,
+  authenticates via first-message token + project ownership, opens an SSM exec session
+  (`aws.StartExecSession`) and proxies the SSM datachannel ↔ xterm.
+
+## `internal/queue` — async jobs (Asynq/Redis)
+- **`Server`** handlers: `handleDeploy`, `handleProvision`, `handleRollback`,
+  `handleDeleteProject`, `handleDiagnose`, `handleWatchdog`, `handleGenerateSummary`,
+  `handlePostmortem` (`postmortem:generate` → `postmortem.GeneratePostmortem`, `MaxRetry(1)`,
+  idempotent), `handleSnapshotUptime` (`analytics:snapshot`, daily 00:00 UTC →
+  `analytics.SnapshotAllEnvironments`), `handleMonthlyReport` (`analytics:monthly`, 1st 06:00
+  UTC → `analytics.GenerateAllMonthlyReports`). **`Client`**: `Enqueue*` methods (implements `deploy.Enqueuer`,
+  `events.DiagnosisEnqueuer`, and `incidents.PostmortemEnqueuer` via
+  `EnqueueGeneratePostmortem`) + Redis pending-mutation store
+  (`SetPendingMutation`/`GetPendingMutation`). **`Scheduler`**: periodic watchdog
+  (`ReconcileStuckResources`) every 5m. Task constructors `New*Task`.
+
+## `internal/export` — training-data exports (admin)
+- `HandleExportIntents`, `HandleExportDiagnoses` → JSONL training rows from
+  `conversations` / `diagnosis_feedback`. Behind `ApiKeyAuth(ADMIN_API_KEY)`. Trade-secret datasets.
+
+---
+
+## `pkg/` shared
+
+- **`pkg/models`** — `db.go` (pgxpool, `RunMigrations` = ordered idempotent migration
+  strings, `UserOwnsProject`/`UserOwnsAccount` tenancy helpers), `types.go` (all entity
+  structs + status/intent/event/alert/memory constants). See `DATABASE_SCHEMA.md`.
+- **`pkg/ws`** — `Hub`: client registry keyed by **room** (project ID, or incident ID for
+  war rooms), first-message `AuthFunc`/`RoomAuthFunc`, `Broadcast(room, Message)`,
+  `MessageHandler` seam (conversation engine), `HandleUpgrade` (project/chat) +
+  `HandleIncidentUpgrade` (broadcast-only war room). `Message{Type, Payload}`.
+- **`pkg/crypto`** — `Encrypt`/`Decrypt` (AES-256-GCM, key derived from ENCRYPTION_KEY,
+  `v1:` version prefix + legacy/rotation fallback). Shared secret-at-rest scheme used for
+  Slack bot tokens (and mirrored by `internal/github`'s token crypto).
+- **`pkg/middleware`** — `auth.go` (`RequireAuth`, `RequireProjectOwnership`,
+  `ResolveToken`, user upsert), `ratelimit.go` (per-user token bucket), `cors.go`,
+  `apikey.go` (admin), `proprietary.go` (IP/version headers), `requestid.go`
+  (X-Request-ID + context).
+
+## Testing
+`internal/testutil` provides `db.go` (test DB harness), `fixtures.go`, `mocks.go`
+(AWS/GitHub/enqueuer mocks). Unit suites: aws, github, diagnosis, terminal, monitor,
+memory, llm, prompts, middleware. Integration (needs Postgres): models, deploy,
+webhooks. `e2e/` has real-AWS deploy/failure/rollback/diagnosis suites via
+`e2e/cmd/runner`.

@@ -7,8 +7,12 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/ashborntechnologies-web/OpsPilot/internal/analytics"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/discovery"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/postmortem"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/summary"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
@@ -16,13 +20,28 @@ import (
 )
 
 const (
-	TaskDeploy        = "deploy:run"
-	TaskDiagnose      = "diagnosis:run"
-	TaskProvision     = "provision:run"
-	TaskRollback      = "rollback:run"
-	TaskWatchdog      = "watchdog:run"
-	TaskDeleteProject = "project:delete"
+	TaskDeploy          = "deploy:run"
+	TaskDiagnose        = "diagnosis:run"
+	TaskProvision       = "provision:run"
+	TaskRollback        = "rollback:run"
+	TaskWatchdog        = "watchdog:run"
+	TaskDeleteProject   = "project:delete"
+	TaskScan            = "discovery:scan"      // scan one AWS account
+	TaskScanAll         = "discovery:scan_all"  // enqueue a scan for every account (daily)
+	TaskSummaryTick     = "summary:tick"        // hourly — enqueue generation for orgs due now
+	TaskGenerateSummary = "summary:generate"    // generate + deliver one org's daily summary
+	TaskPostmortem      = "postmortem:generate" // generate a postmortem for a resolved incident
+	TaskSnapshotUptime  = "analytics:snapshot"  // daily — compute uptime snapshots for all envs
+	TaskMonthlyReport   = "analytics:monthly"   // monthly — generate the health report for all orgs
 )
+
+type GenerateSummaryPayload struct {
+	OrgID string `json:"org_id"`
+}
+
+type PostmortemPayload struct {
+	IncidentID string `json:"incident_id"`
+}
 
 type DeployPayload struct {
 	ProjectID     string `json:"project_id"`
@@ -55,15 +74,23 @@ type ProvisionPayload struct {
 	EnvironmentID string `json:"environment_id"`
 }
 
-// Server runs Asynq workers that process background jobs.
-type Server struct {
-	server       *asynq.Server
-	mux          *asynq.ServeMux
-	deploySvc    *deploy.Service
-	diagnosisSvc *diagnosis.Service
+type ScanPayload struct {
+	AccountID string `json:"account_id"`
 }
 
-func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnosis.Service) *Server {
+// Server runs Asynq workers that process background jobs.
+type Server struct {
+	server        *asynq.Server
+	mux           *asynq.ServeMux
+	deploySvc     *deploy.Service
+	diagnosisSvc  *diagnosis.Service
+	discoverySvc  *discovery.Service
+	summarySvc    *summary.Service
+	postmortemSvc *postmortem.Service
+	analyticsSvc  *analytics.AnalyticsService
+}
+
+func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnosis.Service, discoverySvc *discovery.Service, summarySvc *summary.Service, postmortemSvc *postmortem.Service, analyticsSvc *analytics.AnalyticsService) *Server {
 	srv := asynq.NewServer(
 		asynq.RedisClientOpt{Addr: redisURL},
 		asynq.Config{
@@ -76,10 +103,14 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 	)
 
 	s := &Server{
-		server:       srv,
-		mux:          asynq.NewServeMux(),
-		deploySvc:    deploySvc,
-		diagnosisSvc: diagnosisSvc,
+		server:        srv,
+		mux:           asynq.NewServeMux(),
+		deploySvc:     deploySvc,
+		diagnosisSvc:  diagnosisSvc,
+		discoverySvc:  discoverySvc,
+		summarySvc:    summarySvc,
+		postmortemSvc: postmortemSvc,
+		analyticsSvc:  analyticsSvc,
 	}
 
 	s.mux.HandleFunc(TaskDeploy, s.handleDeploy)
@@ -88,6 +119,13 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 	s.mux.HandleFunc(TaskRollback, s.handleRollback)
 	s.mux.HandleFunc(TaskWatchdog, s.handleWatchdog)
 	s.mux.HandleFunc(TaskDeleteProject, s.handleDeleteProject)
+	s.mux.HandleFunc(TaskScan, s.handleScan)
+	s.mux.HandleFunc(TaskScanAll, s.handleScanAll)
+	s.mux.HandleFunc(TaskSummaryTick, s.handleSummaryTick)
+	s.mux.HandleFunc(TaskGenerateSummary, s.handleGenerateSummary)
+	s.mux.HandleFunc(TaskPostmortem, s.handlePostmortem)
+	s.mux.HandleFunc(TaskSnapshotUptime, s.handleSnapshotUptime)
+	s.mux.HandleFunc(TaskMonthlyReport, s.handleMonthlyReport)
 
 	return s
 }
@@ -221,6 +259,87 @@ func (s *Server) handleWatchdog(ctx context.Context, _ *asynq.Task) error {
 	return s.deploySvc.ReconcileStuckResources(ctx)
 }
 
+// handleScan runs a full discovery scan of one AWS account.
+func (s *Server) handleScan(ctx context.Context, t *asynq.Task) error {
+	var p ScanPayload
+	if err := json.Unmarshal(t.Payload(), &p); err != nil {
+		return fmt.Errorf("%w: unmarshal scan payload: %w", asynq.SkipRetry, err)
+	}
+	accountID, err := uuid.Parse(p.AccountID)
+	if err != nil {
+		return fmt.Errorf("%w: invalid account ID: %w", asynq.SkipRetry, err)
+	}
+	slog.Info(fmt.Sprintf("[discovery] scanning account=%s", p.AccountID[:8]))
+	return s.discoverySvc.ScanAccountByID(ctx, accountID)
+}
+
+// handleScanAll fans out a per-account scan for every connected account. Enqueued daily
+// by the Scheduler.
+func (s *Server) handleScanAll(ctx context.Context, _ *asynq.Task) error {
+	return s.discoverySvc.ScanAllAccounts(ctx)
+}
+
+// handleSummaryTick (hourly) enqueues a generation job for every org whose configured
+// delivery hour matches the current hour in its timezone.
+func (s *Server) handleSummaryTick(ctx context.Context, _ *asynq.Task) error {
+	if s.summarySvc == nil {
+		return nil
+	}
+	return s.summarySvc.EnqueueDueSummaries(ctx)
+}
+
+// handlePostmortem generates a postmortem for a resolved incident.
+func (s *Server) handlePostmortem(ctx context.Context, t *asynq.Task) error {
+	if s.postmortemSvc == nil {
+		return nil
+	}
+	var p PostmortemPayload
+	if err := json.Unmarshal(t.Payload(), &p); err != nil {
+		return fmt.Errorf("%w: unmarshal postmortem payload: %w", asynq.SkipRetry, err)
+	}
+	incidentID, err := uuid.Parse(p.IncidentID)
+	if err != nil {
+		return fmt.Errorf("%w: invalid incident ID: %w", asynq.SkipRetry, err)
+	}
+	_, err = s.postmortemSvc.GeneratePostmortem(ctx, incidentID)
+	return err
+}
+
+// handleSnapshotUptime computes the daily uptime snapshot for every environment. Enqueued
+// daily by the Scheduler (midnight UTC).
+func (s *Server) handleSnapshotUptime(ctx context.Context, _ *asynq.Task) error {
+	if s.analyticsSvc == nil {
+		return nil
+	}
+	return s.analyticsSvc.SnapshotAllEnvironments(ctx)
+}
+
+// handleMonthlyReport generates the monthly operational health report for every org.
+// Enqueued monthly by the Scheduler (1st of the month).
+func (s *Server) handleMonthlyReport(ctx context.Context, _ *asynq.Task) error {
+	if s.analyticsSvc == nil {
+		return nil
+	}
+	return s.analyticsSvc.GenerateAllMonthlyReports(ctx)
+}
+
+// handleGenerateSummary generates + delivers one org's daily summary.
+func (s *Server) handleGenerateSummary(ctx context.Context, t *asynq.Task) error {
+	if s.summarySvc == nil {
+		return nil
+	}
+	var p GenerateSummaryPayload
+	if err := json.Unmarshal(t.Payload(), &p); err != nil {
+		return fmt.Errorf("%w: unmarshal summary payload: %w", asynq.SkipRetry, err)
+	}
+	orgID, err := uuid.Parse(p.OrgID)
+	if err != nil {
+		return fmt.Errorf("%w: invalid org ID: %w", asynq.SkipRetry, err)
+	}
+	_, err = s.summarySvc.GenerateAndDeliver(ctx, orgID, time.Now())
+	return err
+}
+
 func (s *Server) handleDiagnose(ctx context.Context, t *asynq.Task) error {
 	var p DiagnosePayload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
@@ -299,6 +418,53 @@ func NewWatchdogTask() *asynq.Task {
 	return asynq.NewTask(TaskWatchdog, nil, asynq.Queue("default"), asynq.MaxRetry(0))
 }
 
+func NewScanTask(accountID string) (*asynq.Task, error) {
+	payload, err := json.Marshal(ScanPayload{AccountID: accountID})
+	if err != nil {
+		return nil, err
+	}
+	// One retry — a scan is idempotent (upserts), so a transient AWS/throttle error
+	// is worth retrying once, but not looping.
+	return asynq.NewTask(TaskScan, payload, asynq.Queue("default"), asynq.MaxRetry(1)), nil
+}
+
+func NewScanAllTask() *asynq.Task {
+	// Fan-out task — idempotent; the next daily tick covers any miss.
+	return asynq.NewTask(TaskScanAll, nil, asynq.Queue("default"), asynq.MaxRetry(0))
+}
+
+func NewSummaryTickTask() *asynq.Task {
+	return asynq.NewTask(TaskSummaryTick, nil, asynq.Queue("default"), asynq.MaxRetry(0))
+}
+
+func NewSnapshotUptimeTask() *asynq.Task {
+	// Idempotent (upsert per env+date) — never retry; the next daily tick covers any miss.
+	return asynq.NewTask(TaskSnapshotUptime, nil, asynq.Queue("default"), asynq.MaxRetry(0))
+}
+
+func NewMonthlyReportTask() *asynq.Task {
+	// Idempotent (upsert per org+month) — never retry; manual regeneration is available.
+	return asynq.NewTask(TaskMonthlyReport, nil, asynq.Queue("default"), asynq.MaxRetry(0))
+}
+
+func NewGenerateSummaryTask(orgID string) (*asynq.Task, error) {
+	payload, err := json.Marshal(GenerateSummaryPayload{OrgID: orgID})
+	if err != nil {
+		return nil, err
+	}
+	// One retry — generation hits Claude; the UNIQUE(org,date) upsert makes it idempotent.
+	return asynq.NewTask(TaskGenerateSummary, payload, asynq.Queue("default"), asynq.MaxRetry(1)), nil
+}
+
+func NewPostmortemTask(incidentID string) (*asynq.Task, error) {
+	payload, err := json.Marshal(PostmortemPayload{IncidentID: incidentID})
+	if err != nil {
+		return nil, err
+	}
+	// One retry — hits Claude; UNIQUE(incident_id) upsert makes it idempotent.
+	return asynq.NewTask(TaskPostmortem, payload, asynq.Queue("default"), asynq.MaxRetry(1)), nil
+}
+
 func NewDiagnoseTask(projectID, deploymentID string) (*asynq.Task, error) {
 	payload, err := json.Marshal(DiagnosePayload{
 		ProjectID:    projectID,
@@ -325,9 +491,26 @@ func NewScheduler(redisURL string) *Scheduler {
 	return &Scheduler{s: asynq.NewScheduler(asynq.RedisClientOpt{Addr: redisURL}, nil)}
 }
 
-// Start registers the watchdog schedule and starts the scheduler in the background.
+// Start registers the periodic schedules (stuck-resource watchdog every 5m; discovery
+// scan-all every 24h) and starts the scheduler in the background.
 func (sc *Scheduler) Start() error {
 	if _, err := sc.s.Register("@every 5m", NewWatchdogTask()); err != nil {
+		return err
+	}
+	if _, err := sc.s.Register("@every 24h", NewScanAllTask()); err != nil {
+		return err
+	}
+	// Hourly daily-summary tick — enqueues generation for orgs whose configured delivery
+	// hour matches the current hour in their timezone.
+	if _, err := sc.s.Register("0 * * * *", NewSummaryTickTask()); err != nil {
+		return err
+	}
+	// Daily uptime snapshot at midnight UTC (analytics dashboard substrate — ADR-015).
+	if _, err := sc.s.Register("0 0 * * *", NewSnapshotUptimeTask()); err != nil {
+		return err
+	}
+	// Monthly operational health report on the 1st at 06:00 UTC (covers the prior month).
+	if _, err := sc.s.Register("0 6 1 * *", NewMonthlyReportTask()); err != nil {
 		return err
 	}
 	return sc.s.Start()
@@ -427,6 +610,42 @@ func (c *Client) EnqueueDeleteProject(p deploy.DeleteProjectPayload) error {
 // EnqueueRollback implements deploy.Enqueuer.
 func (c *Client) EnqueueRollback(projectID, environmentID, deploymentID, previousDeploymentID string) error {
 	task, err := NewRollbackTask(projectID, environmentID, deploymentID, previousDeploymentID)
+	if err != nil {
+		return err
+	}
+	_, err = c.c.Enqueue(task)
+	return err
+}
+
+// EnqueueScan implements discovery.ScanEnqueuer — enqueues a scan of one AWS account
+// and returns the Asynq job ID.
+func (c *Client) EnqueueScan(accountID string) (string, error) {
+	task, err := NewScanTask(accountID)
+	if err != nil {
+		return "", err
+	}
+	info, err := c.c.Enqueue(task)
+	if err != nil {
+		return "", err
+	}
+	return info.ID, nil
+}
+
+// EnqueueGenerateSummary implements summary.SummaryEnqueuer — enqueues generation +
+// delivery of one org's daily summary.
+func (c *Client) EnqueueGenerateSummary(orgID string) error {
+	task, err := NewGenerateSummaryTask(orgID)
+	if err != nil {
+		return err
+	}
+	_, err = c.c.Enqueue(task)
+	return err
+}
+
+// EnqueueGeneratePostmortem implements incidents.PostmortemEnqueuer — async postmortem
+// generation for a resolved incident.
+func (c *Client) EnqueueGeneratePostmortem(incidentID string) error {
+	task, err := NewPostmortemTask(incidentID)
 	if err != nil {
 		return err
 	}

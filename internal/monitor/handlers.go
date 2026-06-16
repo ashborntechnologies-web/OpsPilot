@@ -1,6 +1,7 @@
 // handlers.go exposes the alert lifecycle over HTTP: list alerts for a project,
 // snooze an alert type, and manually resolve an alert. All routes sit under
-// /projects/:id behind RequireAuth + RequireProjectOwnership.
+// /projects/:id behind RequireAuth + LoadProjectMembership (org membership). Listing
+// is viewer-readable; snooze/resolve require the engineer role (gated in main.go).
 package monitor
 
 import (
@@ -30,7 +31,7 @@ func (a *AlertEngine) HandleListAlerts(c *gin.Context) {
 	}
 
 	query := `SELECT id, project_id, environment_id, alert_type, severity, title, summary,
-	                 status, triggered_at, resolved_at, snoozed_until, created_at
+	                 evidence_text, status, triggered_at, resolved_at, snoozed_until, created_at
 	          FROM alerts WHERE project_id = $1`
 	args := []any{projectID}
 	if status != "all" {
@@ -54,7 +55,7 @@ func (a *AlertEngine) HandleListAlerts(c *gin.Context) {
 	for rows.Next() {
 		var al models.Alert
 		if err := rows.Scan(&al.ID, &al.ProjectID, &al.EnvironmentID, &al.AlertType, &al.Severity,
-			&al.Title, &al.Summary, &al.Status, &al.TriggeredAt, &al.ResolvedAt, &al.SnoozedUntil,
+			&al.Title, &al.Summary, &al.EvidenceText, &al.Status, &al.TriggeredAt, &al.ResolvedAt, &al.SnoozedUntil,
 			&al.CreatedAt); err != nil {
 			continue
 		}

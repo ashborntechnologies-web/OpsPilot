@@ -13,6 +13,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { listProjects, deleteProject } from "@/lib/api";
+import { YesterdaySummaryCard } from "@/components/summary/yesterday-card";
 import type { Project } from "@/types/api";
 import { Plus, GitBranch, Rocket, Trash2, Loader2 } from "lucide-react";
 import { toast } from "sonner";
@@ -154,6 +155,7 @@ export default function ProjectsPage() {
       </Dialog>
 
       <main className="max-w-6xl mx-auto px-4 py-10">
+        <YesterdaySummaryCard />
         <div className="flex items-center justify-between mb-8">
           <div>
             <h1 className="text-2xl font-bold tracking-tight">Projects</h1>

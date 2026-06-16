@@ -2,9 +2,11 @@ package models
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -12,26 +14,40 @@ type DB struct {
 	Pool *pgxpool.Pool
 }
 
-// UserOwnsProject reports whether the given project belongs to the given user.
-// Used as the tenant-isolation guard on every /projects/:id/... handler so a user
-// cannot read or mutate another tenant's project by guessing its UUID.
-func (db *DB) UserOwnsProject(ctx context.Context, userID, projectID uuid.UUID) (bool, error) {
-	var exists bool
+// ErrNoMembership signals that a user is not a member of the relevant organization
+// (or the resource doesn't exist). Callers should map it to 404, not 403, so org
+// and resource existence is not leaked across tenants.
+var ErrNoMembership = errors.New("no organization membership")
+
+// UserOrgRole returns the user's role in the org, or ErrNoMembership if they are
+// not a member. This is the tenant-isolation primitive for /orgs/:orgId routes.
+func (db *DB) UserOrgRole(ctx context.Context, userID, orgID uuid.UUID) (string, error) {
+	var role string
 	err := db.Pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1 AND user_id = $2)`,
-		projectID, userID,
-	).Scan(&exists)
-	return exists, err
+		`SELECT role FROM organization_members WHERE org_id = $1 AND user_id = $2`,
+		orgID, userID,
+	).Scan(&role)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNoMembership
+	}
+	return role, err
 }
 
-// UserOwnsAccount reports whether the given AWS account belongs to the given user.
-func (db *DB) UserOwnsAccount(ctx context.Context, userID, accountID uuid.UUID) (bool, error) {
-	var exists bool
-	err := db.Pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM aws_accounts WHERE id = $1 AND user_id = $2)`,
-		accountID, userID,
-	).Scan(&exists)
-	return exists, err
+// ProjectOrgRole resolves the org that owns a project and the requesting user's
+// role in that org. Returns ErrNoMembership when the project doesn't exist, has no
+// org, or the user isn't a member — the tenant-isolation guard for /projects/:id.
+func (db *DB) ProjectOrgRole(ctx context.Context, userID, projectID uuid.UUID) (orgID uuid.UUID, role string, err error) {
+	err = db.Pool.QueryRow(ctx,
+		`SELECT p.org_id, m.role
+		   FROM projects p
+		   JOIN organization_members m ON m.org_id = p.org_id AND m.user_id = $2
+		  WHERE p.id = $1`,
+		projectID, userID,
+	).Scan(&orgID, &role)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.UUID{}, "", ErrNoMembership
+	}
+	return orgID, role, err
 }
 
 func NewDB(databaseURL string) (*DB, error) {
@@ -82,6 +98,27 @@ func RunMigrations(db *DB) error {
 		createProjectMemoryTable,
 		addNotificationAndPlanToUsers,
 		addBuildIDToDeployments,
+		createOrganizationsTable,
+		createOrganizationMembersTable,
+		createOrganizationInvitesTable,
+		addOrgIDColumns,
+		backfillPersonalOrgs,
+		createDiscoveredResourcesTable,
+		addLastScannedAtToAWSAccounts,
+		extendIncidentsForWarRoom,
+		createIncidentTimelineTable,
+		createIncidentActionsTable,
+		createSlackIntegrationsTable,
+		addSummaryConfigToOrganizations,
+		createDailySummariesTable,
+		addExplainabilityColumns,
+		addTrustLevelToEnvironments,
+		createAIActionsTable,
+		createPostmortemsTable,
+		addMonthlyFlagToDailySummaries,
+		createServiceSLAsTable,
+		createUptimeSnapshotsTable,
+		createOncallSchedulesTable,
 	}
 
 	for _, m := range migrations {
@@ -419,3 +456,358 @@ CREATE TABLE IF NOT EXISTS webhooks (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_webhooks_project ON webhooks(project_id);`
+
+// ─── Organizations & RBAC ────────────────────────────────────────────────────
+
+// createOrganizationsTable: a team workspace. slug is URL-safe and unique.
+const createOrganizationsTable = `
+CREATE TABLE IF NOT EXISTS organizations (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name       TEXT NOT NULL,
+    slug       TEXT UNIQUE NOT NULL,
+    created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);`
+
+// createOrganizationMembersTable: a user's role in an org. One row per (org,user).
+const createOrganizationMembersTable = `
+CREATE TABLE IF NOT EXISTS organization_members (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id     UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role       TEXT NOT NULL CHECK (role IN ('admin', 'engineer', 'viewer')),
+    invited_by UUID REFERENCES users(id),
+    joined_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (org_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_org_members_org  ON organization_members(org_id);`
+
+// createOrganizationInvitesTable: pending invitations redeemable by token.
+const createOrganizationInvitesTable = `
+CREATE TABLE IF NOT EXISTS organization_invites (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id      UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    email       TEXT NOT NULL,
+    role        TEXT NOT NULL CHECK (role IN ('admin', 'engineer', 'viewer')),
+    token       UUID NOT NULL DEFAULT gen_random_uuid(),
+    invited_by  UUID NOT NULL REFERENCES users(id),
+    expires_at  TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '7 days'),
+    accepted_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_org_invites_token ON organization_invites(token);
+CREATE INDEX IF NOT EXISTS idx_org_invites_org ON organization_invites(org_id);`
+
+// addOrgIDColumns: tenant ownership moves from user_id to org_id. Columns are
+// nullable here and backfilled by backfillPersonalOrgs below; the application
+// always sets org_id on new rows.
+const addOrgIDColumns = `
+ALTER TABLE projects     ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE aws_accounts ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE alerts       ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE incidents    ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_projects_org     ON projects(org_id);
+CREATE INDEX IF NOT EXISTS idx_aws_accounts_org ON aws_accounts(org_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_org       ON alerts(org_id);`
+
+// createDiscoveredResourcesTable stores AWS resources found by the discovery scanner
+// in connected accounts. is_managed marks OpsPilot-created resources (ManagedBy tag);
+// project_id is NULL until a user assigns the resource to a project. The unique key
+// (org_id, resource_type, resource_id) makes scans idempotent (upsert on re-scan).
+const createDiscoveredResourcesTable = `
+CREATE TABLE IF NOT EXISTS discovered_resources (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id         UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    aws_account_id UUID NOT NULL REFERENCES aws_accounts(id) ON DELETE CASCADE,
+    resource_type  TEXT NOT NULL,
+    resource_id    TEXT NOT NULL,
+    resource_name  TEXT NOT NULL DEFAULT '',
+    region         TEXT NOT NULL DEFAULT '',
+    metadata       JSONB NOT NULL DEFAULT '{}',
+    tags           JSONB NOT NULL DEFAULT '{}',
+    project_id     UUID REFERENCES projects(id) ON DELETE SET NULL,
+    is_managed     BOOLEAN NOT NULL DEFAULT false,
+    first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (org_id, resource_type, resource_id)
+);
+CREATE INDEX IF NOT EXISTS idx_discovered_org     ON discovered_resources(org_id, resource_type);
+CREATE INDEX IF NOT EXISTS idx_discovered_account ON discovered_resources(aws_account_id);
+CREATE INDEX IF NOT EXISTS idx_discovered_project ON discovered_resources(project_id);`
+
+// addLastScannedAtToAWSAccounts records when the discovery scanner last completed for
+// an account (surfaced in the UI).
+const addLastScannedAtToAWSAccounts = `
+ALTER TABLE aws_accounts ADD COLUMN IF NOT EXISTS last_scanned_at TIMESTAMPTZ;`
+
+// extendIncidentsForWarRoom turns incidents into first-class, lifecycle-tracked objects
+// for the incident war room: a title, status (open→investigating→resolved), severity,
+// who acknowledged/resolved and when, and an AI-generated postmortem. org_id was already
+// added by addOrgIDColumns; included here idempotently. The status CHECK is added as a
+// named constraint so it is skipped if already present.
+const extendIncidentsForWarRoom = `
+ALTER TABLE incidents
+    ADD COLUMN IF NOT EXISTS title           TEXT,
+    ADD COLUMN IF NOT EXISTS status          TEXT NOT NULL DEFAULT 'open',
+    ADD COLUMN IF NOT EXISTS severity        TEXT NOT NULL DEFAULT 'warn',
+    ADD COLUMN IF NOT EXISTS acknowledged_by UUID REFERENCES users(id),
+    ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS resolved_by     UUID REFERENCES users(id),
+    ADD COLUMN IF NOT EXISTS resolved_at     TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS postmortem      TEXT,
+    ADD COLUMN IF NOT EXISTS org_id          UUID REFERENCES organizations(id) ON DELETE CASCADE;
+DO $$ BEGIN
+    ALTER TABLE incidents ADD CONSTRAINT incidents_status_check
+        CHECK (status IN ('open', 'investigating', 'resolved'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS idx_incidents_org    ON incidents(org_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(project_id, status, created_at DESC);`
+
+// createIncidentTimelineTable stores the war-room feed: AI and human entries posted as
+// an incident is investigated. author_id is NULL for AI entries.
+const createIncidentTimelineTable = `
+CREATE TABLE IF NOT EXISTS incident_timeline (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id UUID NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    author_type TEXT NOT NULL CHECK (author_type IN ('ai', 'human')),
+    author_id   UUID REFERENCES users(id),
+    content     TEXT NOT NULL,
+    entry_type  TEXT NOT NULL DEFAULT 'update', -- diagnosis | update | action_taken | resolution
+    metadata    JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_incident_timeline ON incident_timeline(incident_id, created_at);`
+
+// createSlackIntegrationsTable stores one Slack workspace connection per org. The bot
+// token is encrypted at rest with ENCRYPTION_KEY (pkg/crypto). Channel IDs/names for
+// alerts, deploy notifications, and the daily summary are configurable.
+const createSlackIntegrationsTable = `
+CREATE TABLE IF NOT EXISTS slack_integrations (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id               UUID NOT NULL UNIQUE REFERENCES organizations(id) ON DELETE CASCADE,
+    team_id              TEXT NOT NULL DEFAULT '', -- Slack workspace ID (maps slash commands → org)
+    workspace_name       TEXT NOT NULL DEFAULT '',
+    bot_token            TEXT NOT NULL, -- encrypted
+    alert_channel_id     TEXT,
+    alert_channel_name   TEXT,
+    deploy_channel_id    TEXT,
+    deploy_channel_name  TEXT,
+    summary_channel_id   TEXT,
+    summary_channel_name TEXT,
+    installed_by         UUID REFERENCES users(id),
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_slack_team ON slack_integrations(team_id);`
+
+// addSummaryConfigToOrganizations: per-org delivery schedule for the AI daily summary.
+const addSummaryConfigToOrganizations = `
+ALTER TABLE organizations
+    ADD COLUMN IF NOT EXISTS summary_time     TIME NOT NULL DEFAULT '08:00:00',
+    ADD COLUMN IF NOT EXISTS summary_timezone TEXT NOT NULL DEFAULT 'UTC',
+    ADD COLUMN IF NOT EXISTS summary_enabled  BOOLEAN NOT NULL DEFAULT true;`
+
+// createDailySummariesTable stores one AI-generated morning briefing per org per day.
+// content_json holds the structured metrics; content_markdown the rendered briefing.
+const createDailySummariesTable = `
+CREATE TABLE IF NOT EXISTS daily_summaries (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id           UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    summary_date     DATE NOT NULL,
+    content_markdown TEXT NOT NULL DEFAULT '',
+    content_json     JSONB NOT NULL DEFAULT '{}',
+    generated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    delivered_slack  BOOLEAN NOT NULL DEFAULT false,
+    delivered_email  BOOLEAN NOT NULL DEFAULT false,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (org_id, summary_date)
+);
+CREATE INDEX IF NOT EXISTS idx_daily_summaries_org ON daily_summaries(org_id, summary_date DESC);`
+
+// addExplainabilityColumns adds AI confidence + structured evidence to incidents and a
+// short evidence sentence to alerts, so every AI decision can show why it concluded what
+// it did. evidence is a JSONB array of {type, description, data, weight} items.
+const addExplainabilityColumns = `
+ALTER TABLE incidents
+    ADD COLUMN IF NOT EXISTS confidence_score FLOAT,
+    ADD COLUMN IF NOT EXISTS evidence JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE alerts
+    ADD COLUMN IF NOT EXISTS evidence_text TEXT;`
+
+// addTrustLevelToEnvironments sets how much autonomy AI-initiated actions have per
+// environment. autonomous_boundaries (JSONB) bounds what may auto-execute in 'autonomous'
+// mode: {can_rollback, can_scale, min_replicas, max_replicas, can_change_resources}.
+const addTrustLevelToEnvironments = `
+ALTER TABLE environments
+    ADD COLUMN IF NOT EXISTS trust_level TEXT NOT NULL DEFAULT 'suggest',
+    ADD COLUMN IF NOT EXISTS autonomous_boundaries JSONB;
+DO $$ BEGIN
+    ALTER TABLE environments ADD CONSTRAINT environments_trust_level_check
+        CHECK (trust_level IN ('suggest', 'supervised', 'autonomous'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;`
+
+// createAIActionsTable records every AI-proposed action and its approval/execution
+// lifecycle. The trust service (internal/trust) is the only writer.
+const createAIActionsTable = `
+CREATE TABLE IF NOT EXISTS ai_actions (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id              UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    project_id          UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    environment_id      UUID REFERENCES environments(id) ON DELETE SET NULL,
+    incident_id         UUID REFERENCES incidents(id) ON DELETE SET NULL,
+    proposed_by_type    TEXT NOT NULL CHECK (proposed_by_type IN ('ai', 'human')),
+    proposed_by_user_id UUID REFERENCES users(id),
+    action_type         TEXT NOT NULL CHECK (action_type IN ('deploy','rollback','scale','change_resources','terminal_command')),
+    parameters          JSONB NOT NULL DEFAULT '{}',
+    confidence_score    FLOAT,
+    rationale           TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'pending_approval'
+                        CHECK (status IN ('pending_approval','approved','rejected','executed','failed')),
+    approved_by         UUID REFERENCES users(id),
+    approval_required   BOOLEAN NOT NULL DEFAULT true,
+    proposed_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    decided_at          TIMESTAMPTZ,
+    executed_at         TIMESTAMPTZ,
+    result              JSONB,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ai_actions_org     ON ai_actions(org_id, status, proposed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_actions_project ON ai_actions(project_id, proposed_at DESC);`
+
+// createPostmortemsTable stores one AI-generated, editable, exportable postmortem per
+// incident. action_items is a JSONB array of {item, owner, priority, due_date, status}.
+// The full incident history (published postmortems) doubles as a compliance/SOC2 record.
+const createPostmortemsTable = `
+CREATE TABLE IF NOT EXISTS postmortems (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id      UUID NOT NULL UNIQUE REFERENCES incidents(id) ON DELETE CASCADE,
+    org_id           UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    project_id       UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title            TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published')),
+    content_markdown TEXT NOT NULL DEFAULT '',
+    action_items     JSONB NOT NULL DEFAULT '[]',
+    generated_at     TIMESTAMPTZ,
+    published_at     TIMESTAMPTZ,
+    published_by     UUID REFERENCES users(id),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_postmortems_org ON postmortems(org_id, status, created_at DESC);`
+
+// addMonthlyFlagToDailySummaries lets daily_summaries also hold monthly operational health
+// reports (is_monthly = true). The original UNIQUE(org_id, summary_date) is replaced with a
+// unique index that also keys on is_monthly, so a monthly report and a daily summary can
+// share a date. The summary upsert's ON CONFLICT target is updated to match (3 columns).
+const addMonthlyFlagToDailySummaries = `
+ALTER TABLE daily_summaries ADD COLUMN IF NOT EXISTS is_monthly BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE daily_summaries DROP CONSTRAINT IF EXISTS daily_summaries_org_id_summary_date_key;
+CREATE UNIQUE INDEX IF NOT EXISTS daily_summaries_org_date_monthly_uniq
+    ON daily_summaries(org_id, summary_date, is_monthly);`
+
+// createServiceSLAsTable stores per-environment SLA targets used by the leadership/
+// analytics dashboard. One row per environment (UNIQUE); target_uptime_pct defaults to the
+// industry-common 99.9% ("three nines"). org_id/project_id are denormalized for scoped
+// aggregation queries.
+const createServiceSLAsTable = `
+CREATE TABLE IF NOT EXISTS service_slas (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id                  UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    project_id              UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    environment_id          UUID NOT NULL UNIQUE REFERENCES environments(id) ON DELETE CASCADE,
+    target_uptime_pct       FLOAT NOT NULL DEFAULT 99.9,
+    measurement_window_days INT NOT NULL DEFAULT 30,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_service_slas_org ON service_slas(org_id);`
+
+// createUptimeSnapshotsTable stores one computed uptime row per environment per day,
+// derived from runtime.service_down / runtime.service_recovered operational events
+// (ADR-015 — uptime is computed from events, not external probes). Idempotent per
+// (environment, date) via the UNIQUE constraint so the daily job can recompute safely.
+const createUptimeSnapshotsTable = `
+CREATE TABLE IF NOT EXISTS uptime_snapshots (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    environment_id   UUID NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+    snapshot_date    DATE NOT NULL,
+    total_minutes    INT NOT NULL DEFAULT 0,
+    downtime_minutes INT NOT NULL DEFAULT 0,
+    uptime_pct       FLOAT NOT NULL DEFAULT 100,
+    incident_count   INT NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (environment_id, snapshot_date)
+);
+CREATE INDEX IF NOT EXISTS idx_uptime_snapshots_env ON uptime_snapshots(environment_id, snapshot_date DESC);`
+
+// createOncallSchedulesTable stores per-org quiet-hours configuration used to suppress
+// non-critical (warn) alert notifications outside working hours, reducing alert fatigue.
+// One row per org. quiet_days holds lowercase weekday names (e.g. {saturday,sunday}).
+// Error-severity alerts always notify regardless of this schedule (ADR-016).
+const createOncallSchedulesTable = `
+CREATE TABLE IF NOT EXISTS oncall_schedules (
+    id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id                   UUID NOT NULL UNIQUE REFERENCES organizations(id) ON DELETE CASCADE,
+    timezone                 TEXT NOT NULL DEFAULT 'UTC',
+    quiet_hours_start        TIME NOT NULL DEFAULT '22:00',
+    quiet_hours_end          TIME NOT NULL DEFAULT '08:00',
+    quiet_days               TEXT[] NOT NULL DEFAULT '{}',
+    escalation_after_minutes INT NOT NULL DEFAULT 15,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);`
+
+// createIncidentActionsTable stores remediation actions proposed during an incident
+// (by the AI or a human) and their approval lifecycle.
+const createIncidentActionsTable = `
+CREATE TABLE IF NOT EXISTS incident_actions (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id UUID NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    proposed_by TEXT NOT NULL CHECK (proposed_by IN ('ai', 'human')),
+    action_type TEXT NOT NULL,
+    parameters  JSONB NOT NULL DEFAULT '{}',
+    status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'executed', 'rejected')),
+    approved_by UUID REFERENCES users(id),
+    executed_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_incident_actions ON incident_actions(incident_id, created_at);`
+
+// backfillPersonalOrgs migrates every existing user into a personal organization
+// (admin membership) and assigns all of their existing data to it. Idempotent:
+// users who already have a membership are skipped; only NULL org_id rows are
+// backfilled. New users (post-migration) get their personal org created in the
+// auth-middleware user-upsert path.
+const backfillPersonalOrgs = `
+DO $$
+DECLARE
+    u RECORD;
+    new_org UUID;
+    base TEXT;
+BEGIN
+    FOR u IN SELECT id, email FROM users LOOP
+        IF EXISTS (SELECT 1 FROM organization_members WHERE user_id = u.id) THEN
+            CONTINUE;
+        END IF;
+        base := NULLIF(regexp_replace(lower(split_part(u.email, '@', 1)), '[^a-z0-9]+', '-', 'g'), '');
+        INSERT INTO organizations (name, slug, created_by)
+        VALUES (
+            COALESCE(initcap(base), 'Personal') || ' (personal)',
+            'u-' || replace(u.id::text, '-', '')
+        , u.id)
+        RETURNING id INTO new_org;
+
+        INSERT INTO organization_members (org_id, user_id, role, invited_by)
+        VALUES (new_org, u.id, 'admin', u.id);
+
+        UPDATE projects     SET org_id = new_org WHERE user_id = u.id AND org_id IS NULL;
+        UPDATE aws_accounts SET org_id = new_org WHERE user_id = u.id AND org_id IS NULL;
+    END LOOP;
+
+    -- alerts / incidents inherit their project's org.
+    UPDATE alerts a    SET org_id = p.org_id FROM projects p WHERE a.project_id = p.id AND a.org_id IS NULL;
+    UPDATE incidents i SET org_id = p.org_id FROM projects p WHERE i.project_id = p.id AND i.org_id IS NULL;
+END $$;`

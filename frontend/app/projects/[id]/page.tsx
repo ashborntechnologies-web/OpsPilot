@@ -26,10 +26,18 @@ import {
   terminalWsURL, getProjectCosts, enablePreviews, disablePreviews,
   getHealthScore, listAlerts, snoozeAlert, resolveAlert, cancelDeployment,
   updateProject, getMe, updateNotificationPrefs, deleteProject,
+  listProjectResources, listProjectActions, approveAction, rejectAction,
+  getEnvironmentTrust, updateEnvironmentTrust,
 } from "@/lib/api";
+import { ActionRow } from "@/components/trust/actions";
+import { EnvTrustSettings } from "@/components/trust/env-trust-settings";
+import { EnvSLASettings } from "@/components/analytics/env-sla-settings";
 import { StatusSidebar } from "@/components/project/status-sidebar";
 import { AlertsPanel } from "@/components/project/alerts-panel";
-import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar, Webhook, CostSummary, Alert, RiskScore, UserMe } from "@/types/api";
+import { useActiveOrg } from "@/lib/use-org";
+import { RESOURCE_ICONS, resourceLabel, resourceStatus } from "@/lib/resources";
+import { ConfidenceBadge, EvidenceSection } from "@/components/ai/explainability";
+import type { Project, Environment, Deployment, OperationalEvent, WsMessage, EnvVar, Webhook, CostSummary, Alert, RiskScore, UserMe, DiscoveredResource, EvidenceItem, AIAction, TrustLevel, AutonomousBoundaries } from "@/types/api";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
@@ -37,7 +45,7 @@ import {
   CheckCircle2, XCircle, Clock, Loader2, Cloud,
   RefreshCw, Terminal, AlertTriangle, ChevronDown, ChevronRight,
   Trash2, Eye, EyeOff, KeyRound, Activity, Scaling, Webhook as WebhookIcon, ZapOff,
-  DollarSign, GitPullRequest, Zap,
+  DollarSign, GitPullRequest, Zap, ShieldAlert,
 } from "lucide-react";
 import "@xterm/xterm/css/xterm.css";
 
@@ -126,6 +134,15 @@ export default function ProjectPage() {
   const { id } = useParams<{ id: string }>();
   const { getToken } = useAuth();
 
+  // Role in the active workspace. Viewers get read-only UI; the backend enforces
+  // this regardless, so these guards are UX (clear messaging), not the security boundary.
+  const { isViewer, canAct, isAdmin } = useActiveOrg();
+  const VIEW_ONLY_MSG = "You have view-only (viewer) access to this workspace. Ask an admin for the engineer role to perform this action.";
+  function blockIfViewer(): boolean {
+    if (isViewer) { toast.error(VIEW_ONLY_MSG); return true; }
+    return false;
+  }
+
   const [project, setProject] = useState<Project | null>(null);
   const [environments, setEnvironments] = useState<Environment[]>([]);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
@@ -147,6 +164,8 @@ export default function ProjectPage() {
   const [currentRiskScore, setCurrentRiskScore] = useState<RiskScore | null>(null);
   // mobile/tablet status drawer
   const [statusDrawerOpen, setStatusDrawerOpen] = useState(false);
+  // mobile/tablet alerts drawer (the AlertsPanel is desktop-only at lg+)
+  const [alertsDrawerOpen, setAlertsDrawerOpen] = useState(false);
   // settings tab state
   const [settingsName, setSettingsName] = useState("");
   const [settingsBranch, setSettingsBranch] = useState("");
@@ -195,6 +214,8 @@ export default function ProjectPage() {
   // diagnose
   const [diagnosing, setDiagnosing] = useState<string | null>(null);
   const [diagnosisResult, setDiagnosisResult] = useState<string | null>(null);
+  const [diagnosisConfidence, setDiagnosisConfidence] = useState<number | null>(null);
+  const [diagnosisEvidence, setDiagnosisEvidence] = useState<EvidenceItem[]>([]);
 
   // health
   const [healthData, setHealthData] = useState<Record<string, { status: string; running: number; desired: number; pending: number; url?: string }>>({});
@@ -223,6 +244,13 @@ export default function ProjectPage() {
 
   // cost intelligence
   const [costs, setCosts] = useState<CostSummary | null>(null);
+  // infrastructure (assigned discovered + managed resources)
+  const [resources, setResources] = useState<DiscoveredResource[] | null>(null);
+  const [loadingResources, setLoadingResources] = useState(false);
+  // AI actions (trust/approval): all (history) + pending (right-column approvals)
+  const [actions, setActions] = useState<AIAction[] | null>(null);
+  const [actionBanner, setActionBanner] = useState(false);
+  const pendingActions = (actions ?? []).filter((a) => a.status === "pending_approval");
   const [loadingCosts, setLoadingCosts] = useState(false);
 
   // PR previews
@@ -259,6 +287,17 @@ export default function ProjectPage() {
       return listAlerts(token, id, "open");
     },
     { refreshInterval: 30_000, onSuccess: (data) => setAlerts(data ?? []) }
+  );
+
+  // AI actions (trust/approval) — initial load + 30s refresh; WS updates in between.
+  useSWR(
+    ["actions", id],
+    async () => {
+      const token = await getToken();
+      if (!token) return [];
+      return listProjectActions(token, id);
+    },
+    { refreshInterval: 30_000, onSuccess: (data) => setActions(data ?? []) }
   );
 
   // Settings form mirrors the project record; /users/me feeds notification toggles.
@@ -338,6 +377,11 @@ export default function ProjectPage() {
             try {
               setCurrentRiskScore(JSON.parse(msg.payload) as RiskScore);
             } catch {}
+          } else if (msg.type === "action_proposed") {
+            setActionBanner(true);
+            loadActions().catch(() => {});
+          } else if (msg.type === "action_updated") {
+            loadActions().catch(() => {});
           }
         } catch {}
       };
@@ -432,6 +476,7 @@ export default function ProjectPage() {
   );
 
   async function handleSnoozeAlert(alertId: string) {
+    if (blockIfViewer()) return;
     const token = await getToken();
     if (!token) return;
     try {
@@ -445,6 +490,7 @@ export default function ProjectPage() {
   }
 
   async function handleResolveAlert(alertId: string) {
+    if (blockIfViewer()) return;
     const token = await getToken();
     if (!token) return;
     try {
@@ -458,6 +504,7 @@ export default function ProjectPage() {
   }
 
   async function handleCancelDeployment(dep: Deployment) {
+    if (blockIfViewer()) return;
     if (!window.confirm(`Cancel the in-progress deployment of ${dep.commit_sha.slice(0, 8)}?`)) return;
     const token = await getToken();
     if (!token) return;
@@ -527,6 +574,7 @@ export default function ProjectPage() {
   }
 
   async function handleCreateEnv() {
+    if (blockIfViewer()) return;
     if (!envDialog) return;
     const token = await getToken();
     if (!token) return;
@@ -544,6 +592,7 @@ export default function ProjectPage() {
   }
 
   async function handleDeploy(env: Environment) {
+    if (blockIfViewer()) return;
     const branch = project?.branch || "default branch";
     if (!window.confirm(`Deploy the latest commit on ${branch} to ${env.name}?`)) {
       return;
@@ -578,6 +627,7 @@ export default function ProjectPage() {
   }
 
   async function handleRollback(dep: Deployment) {
+    if (blockIfViewer()) return;
     const token = await getToken();
     if (!token) return;
     try {
@@ -606,6 +656,7 @@ export default function ProjectPage() {
   }
 
   async function handleRedeploy(dep: Deployment) {
+    if (blockIfViewer()) return;
     const token = await getToken();
     if (!token) return;
     setRedeploying(dep.id);
@@ -709,6 +760,7 @@ export default function ProjectPage() {
   }
 
   async function handleSaveEnvVar() {
+    if (blockIfViewer()) return;
     if (!newKey.trim() || !newValue.trim() || !envVarEnvId) return;
     const token = await getToken();
     if (!token) return;
@@ -732,6 +784,7 @@ export default function ProjectPage() {
   }
 
   async function handleDeleteEnvVar(v: EnvVar) {
+    if (blockIfViewer()) return;
     const token = await getToken();
     if (!token) return;
     try {
@@ -749,8 +802,10 @@ export default function ProjectPage() {
     if (!token) return;
     setDiagnosing(dep.id);
     try {
-      const { diagnosis } = await diagnoseDeployment(token, id, dep.id);
-      setDiagnosisResult(diagnosis);
+      const res = await diagnoseDeployment(token, id, dep.id);
+      setDiagnosisResult(res.diagnosis);
+      setDiagnosisConfidence(res.confidence_score);
+      setDiagnosisEvidence(res.evidence ?? []);
     } catch (e: unknown) {
       toast.error((e as Error).message ?? "Diagnosis failed");
     } finally {
@@ -775,6 +830,7 @@ export default function ProjectPage() {
 
   // ── Scale ────────────────────────────────────────────────────────────────────
   async function handleScale() {
+    if (blockIfViewer()) return;
     if (!scaleTarget) return;
     const token = await getToken();
     if (!token) return;
@@ -864,7 +920,55 @@ export default function ProjectPage() {
     }
   }
 
+  async function loadResources() {
+    const token = await getToken();
+    if (!token) return;
+    setLoadingResources(true);
+    try {
+      setResources(await listProjectResources(token, id));
+    } catch {
+      toast.error("Failed to load infrastructure");
+    } finally {
+      setLoadingResources(false);
+    }
+  }
+
+  async function loadActions() {
+    const token = await getToken();
+    if (!token) return;
+    try {
+      setActions(await listProjectActions(token, id));
+    } catch {
+      toast.error("Failed to load actions");
+    }
+  }
+
+  async function handleApproveAction(actionId: string) {
+    const token = await getToken();
+    if (!token) return;
+    try {
+      await approveAction(token, actionId);
+      toast.success("Action approved");
+      await loadActions();
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+    }
+  }
+
+  async function handleRejectAction(actionId: string) {
+    const token = await getToken();
+    if (!token) return;
+    try {
+      await rejectAction(token, actionId);
+      toast.success("Action rejected");
+      await loadActions();
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+    }
+  }
+
   async function handleTogglePreviews() {
+    if (blockIfViewer()) return;
     const token = await getToken();
     if (!token) return;
     setTogglingPreviews(true);
@@ -955,12 +1059,16 @@ export default function ProjectPage() {
       <Dialog open={!!diagnosisResult} onOpenChange={(v) => !v && setDiagnosisResult(null)}>
         <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>AI Diagnosis</DialogTitle>
+            <DialogTitle className="flex items-center gap-2">
+              AI Diagnosis
+              <ConfidenceBadge score={diagnosisConfidence} />
+            </DialogTitle>
             <DialogDescription>Analysis of the last failed deployment</DialogDescription>
           </DialogHeader>
           <pre className="text-xs bg-zinc-950 text-zinc-100 rounded-lg p-4 whitespace-pre-wrap font-mono overflow-x-auto">
             {diagnosisResult}
           </pre>
+          <EvidenceSection items={diagnosisEvidence} />
           <DialogFooter>
             <Button variant="outline" onClick={() => setDiagnosisResult(null)}>Close</Button>
           </DialogFooter>
@@ -1089,6 +1197,25 @@ export default function ProjectPage() {
         </div>
       )}
 
+      {/* Mobile/tablet alerts drawer (slides in from the right) */}
+      {alertsDrawerOpen && (
+        <div className="lg:hidden fixed inset-0 z-50 flex justify-end">
+          <div className="absolute inset-0 bg-black/40" onClick={() => setAlertsDrawerOpen(false)} />
+          <div className="relative z-10 h-full overflow-y-auto bg-white shadow-xl">
+            <AlertsPanel
+              alerts={alerts}
+              latestInsight={diagnosisResult}
+              onSnooze={handleSnoozeAlert}
+              onResolve={handleResolveAlert}
+              pendingActions={pendingActions}
+              canAct={canAct}
+              onApproveAction={handleApproveAction}
+              onRejectAction={handleRejectAction}
+            />
+          </div>
+        </div>
+      )}
+
       <div className="flex items-stretch">
         {/* LEFT — live status (desktop only) */}
         <div className="hidden xl:block sticky top-0 self-start h-screen">
@@ -1112,20 +1239,45 @@ export default function ProjectPage() {
           </div>
           <div className="flex gap-2">
             <Button variant="outline" className="xl:hidden" onClick={() => setStatusDrawerOpen(true)}>
-              <Activity className="h-4 w-4 mr-2" />
-              Status
+              <Activity className="h-4 w-4 sm:mr-2" />
+              <span className="hidden sm:inline">Status</span>
               {alerts.length > 0 && (
                 <span className="ml-1.5 inline-flex items-center justify-center h-4 min-w-4 px-1 rounded-full bg-red-500 text-white text-[10px] font-semibold">
                   {alerts.length}
                 </span>
               )}
             </Button>
+            <Button variant="outline" className="lg:hidden" onClick={() => setAlertsDrawerOpen(true)}>
+              <ShieldAlert className="h-4 w-4 sm:mr-2" />
+              <span className="hidden sm:inline">Alerts</span>
+              {alerts.length > 0 && (
+                <span className="ml-1.5 inline-flex items-center justify-center h-4 min-w-4 px-1 rounded-full bg-amber-500 text-white text-[10px] font-semibold">
+                  {alerts.length}
+                </span>
+              )}
+            </Button>
             <Button variant="outline" nativeButton={false} render={<Link href={`/projects/${id}/chat`} />}>
-              <MessageSquare className="h-4 w-4 mr-2" />
-              Open Chat
+              <MessageSquare className="h-4 w-4 sm:mr-2" />
+              <span className="hidden sm:inline">Open Chat</span>
             </Button>
           </div>
         </div>
+
+        {/* AI proposed an action — persistent banner until reviewed. */}
+        {actionBanner && pendingActions.length > 0 && (
+          <div className="mb-6 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 flex items-center justify-between gap-2 text-sm text-amber-900">
+            <span>🤖 OpsPilot has proposed {pendingActions.length === 1 ? "an action" : `${pendingActions.length} actions`} — review and approve in the Pending Approvals panel.</span>
+            <button className="underline shrink-0" onClick={() => setActionBanner(false)}>Dismiss</button>
+          </div>
+        )}
+
+        {/* View-only banner — shown to viewers; action buttons are disabled. */}
+        {isViewer && (
+          <div className="mb-6 rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-3 flex items-center gap-2 text-sm text-zinc-600">
+            <EyeOff className="h-4 w-4 shrink-0" />
+            <span>You have <strong>view-only</strong> access to this workspace. Deploy, rollback, scale, and other actions are disabled — ask an admin for the engineer role.</span>
+          </div>
+        )}
 
         {/* No AWS account banner */}
         {!project.account_id && (
@@ -1143,10 +1295,15 @@ export default function ProjectPage() {
         {/* High-risk deploy banner (advisory, from the deploy_risk WS message) */}
         {currentRiskScore && (currentRiskScore.level === "high" || currentRiskScore.level === "critical") && (
           <div className="mb-6 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-            <p className="font-medium">
+            <p
+              className="font-medium"
+              title={`Score calculated from ${currentRiskScore.factors.filter((f) => f.points > 0).length} factor(s). See the breakdown below.`}
+            >
               ⚠️ {currentRiskScore.level === "critical" ? "Critical" : "High"} risk deploy (score {currentRiskScore.score}/100)
             </p>
-            {currentRiskScore.explanation && <p className="mt-0.5">{currentRiskScore.explanation}</p>}
+            {(currentRiskScore.explanation || currentRiskScore.top_factor) && (
+              <p className="mt-0.5">{currentRiskScore.explanation || currentRiskScore.top_factor}</p>
+            )}
             <ul className="mt-1.5 text-xs space-y-0.5 text-amber-800">
               {currentRiskScore.factors.filter((f) => f.points > 0).map((f) => (
                 <li key={f.name}>• {f.reason}</li>
@@ -1156,14 +1313,16 @@ export default function ProjectPage() {
         )}
 
         <Tabs defaultValue="overview">
-          <TabsList className="mb-6">
+          <TabsList className="mb-6 max-w-full overflow-x-auto justify-start">
             <TabsTrigger value="overview">Overview</TabsTrigger>
             <TabsTrigger value="logs">Live Logs</TabsTrigger>
             <TabsTrigger value="deployments">Deployments</TabsTrigger>
             <TabsTrigger value="env-vars" onClick={() => fetchEnvVars()}>Env Vars</TabsTrigger>
             <TabsTrigger value="terminal">Terminal</TabsTrigger>
             <TabsTrigger value="webhooks" onClick={() => loadHooks()}>Webhooks</TabsTrigger>
+            <TabsTrigger value="infrastructure" onClick={() => loadResources()}>Infrastructure</TabsTrigger>
             <TabsTrigger value="costs" onClick={() => loadCosts()}>Costs</TabsTrigger>
+            <TabsTrigger value="actions" onClick={() => loadActions()}>Actions</TabsTrigger>
             <TabsTrigger value="settings">Settings</TabsTrigger>
           </TabsList>
 
@@ -1308,6 +1467,45 @@ export default function ProjectPage() {
                           ))}
                         </ul>
                       )}
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+
+              {/* Pre-deploy risk score (advisory, from the deploy_risk WS message). Shown
+                  whenever a score is present, not just for high/critical (that's the banner). */}
+              {currentRiskScore && (
+                <Card>
+                  <CardContent className="py-4">
+                    <div className="flex items-start gap-3">
+                      <div
+                        className={cn(
+                          "flex h-12 w-12 shrink-0 items-center justify-center rounded-full text-base font-bold",
+                          currentRiskScore.level === "low" && "bg-green-100 text-green-700",
+                          currentRiskScore.level === "medium" && "bg-amber-100 text-amber-700",
+                          currentRiskScore.level === "high" && "bg-orange-100 text-orange-700",
+                          currentRiskScore.level === "critical" && "bg-red-100 text-red-700"
+                        )}
+                      >
+                        {currentRiskScore.score}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium">
+                          Pre-deploy risk: <span className="capitalize">{currentRiskScore.level}</span>
+                        </p>
+                        {(currentRiskScore.explanation || currentRiskScore.top_factor) && (
+                          <p className="text-xs text-muted-foreground mt-0.5">
+                            {currentRiskScore.explanation || currentRiskScore.top_factor}
+                          </p>
+                        )}
+                        {currentRiskScore.factors.filter((f) => f.points > 0).length > 0 && (
+                          <ul className="text-xs text-muted-foreground space-y-0.5 mt-2">
+                            {currentRiskScore.factors.filter((f) => f.points > 0).slice(0, 3).map((f) => (
+                              <li key={f.name}>• {f.reason}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
                     </div>
                   </CardContent>
                 </Card>
@@ -2051,6 +2249,66 @@ export default function ProjectPage() {
               )}
             </div>
           </TabsContent>
+
+          {/* ── Infrastructure (assigned managed + discovered resources) ── */}
+          <TabsContent value="infrastructure">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-medium">Infrastructure</p>
+                  <p className="text-xs text-muted-foreground">
+                    AWS resources assigned to this project — OpsPilot-managed and discovered.
+                    Assign more from the{" "}
+                    <Link href="/orgs/resources" className="text-indigo-600 hover:underline">inventory</Link>.
+                  </p>
+                </div>
+                <Button size="sm" variant="outline" onClick={loadResources} disabled={loadingResources}>
+                  {loadingResources ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5 mr-1" />}
+                  Refresh
+                </Button>
+              </div>
+
+              {loadingResources && resources === null ? (
+                <div className="flex items-center justify-center py-12">
+                  <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+                </div>
+              ) : (resources ?? []).length === 0 ? (
+                <Card className="border-dashed">
+                  <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+                    <Cloud className="h-10 w-10 text-zinc-300 mb-3" />
+                    <p className="font-medium text-sm">No infrastructure assigned</p>
+                    <p className="text-muted-foreground text-xs mt-1">
+                      Discovered AWS resources you assign to this project will show here.
+                    </p>
+                  </CardContent>
+                </Card>
+              ) : (
+                <div className="rounded-lg border bg-white divide-y">
+                  {(resources ?? []).map((r) => {
+                    const Icon = RESOURCE_ICONS[r.resource_type] ?? Cloud;
+                    return (
+                      <div key={r.id} className="flex items-center gap-3 px-4 py-2.5">
+                        <Icon className="h-4 w-4 text-zinc-500 shrink-0" />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium truncate">{r.resource_name || r.resource_id}</span>
+                            {r.is_managed && (
+                              <span className="rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700">OpsPilot</span>
+                            )}
+                          </div>
+                          <p className="text-xs text-muted-foreground">
+                            {resourceLabel(r.resource_type)} · {r.region || "global"}
+                          </p>
+                        </div>
+                        <Badge variant="outline" className="text-xs capitalize shrink-0">{resourceStatus(r)}</Badge>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </TabsContent>
+
           {/* ── Costs ── */}
           <TabsContent value="costs">
             <div className="space-y-5">
@@ -2140,6 +2398,34 @@ export default function ProjectPage() {
             </div>
           </TabsContent>
 
+          {/* ── Actions (AI + human action history) ── */}
+          <TabsContent value="actions">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-medium">Action history</p>
+                  <p className="text-xs text-muted-foreground">AI-proposed and approved actions, their status, and who approved them.</p>
+                </div>
+                <Button size="sm" variant="outline" onClick={loadActions}>
+                  <RefreshCw className="h-3.5 w-3.5 mr-1" /> Refresh
+                </Button>
+              </div>
+              {(actions ?? []).length === 0 ? (
+                <Card className="border-dashed">
+                  <CardContent className="py-12 text-center">
+                    <Activity className="h-10 w-10 text-zinc-300 mx-auto mb-3" />
+                    <p className="font-medium text-sm">No actions yet</p>
+                    <p className="text-muted-foreground text-xs mt-1">AI-proposed deploys, rollbacks, and scaling will appear here.</p>
+                  </CardContent>
+                </Card>
+              ) : (
+                <div className="rounded-lg border bg-white divide-y">
+                  {(actions ?? []).map((a) => <ActionRow key={a.id} action={a} />)}
+                </div>
+              )}
+            </div>
+          </TabsContent>
+
           {/* ── Settings ── */}
           <TabsContent value="settings">
             <div className="max-w-2xl space-y-6">
@@ -2225,6 +2511,18 @@ export default function ProjectPage() {
                 </CardContent>
               </Card>
 
+              {/* AI trust levels per environment */}
+              <div>
+                <h3 className="text-sm font-semibold mb-2">AI Trust Levels</h3>
+                <EnvTrustSettings projectId={id} environments={environments} canEdit={isAdmin} />
+              </div>
+
+              {/* SLA targets per environment (feeds the analytics dashboard) */}
+              <div>
+                <h3 className="text-sm font-semibold mb-2">SLA Targets</h3>
+                <EnvSLASettings projectId={id} environments={environments} canEdit={canAct} />
+              </div>
+
               <Card className="border-red-200">
                 <CardHeader>
                   <CardTitle className="text-base text-red-700">Danger Zone</CardTitle>
@@ -2251,6 +2549,10 @@ export default function ProjectPage() {
             latestInsight={diagnosisResult}
             onSnooze={handleSnoozeAlert}
             onResolve={handleResolveAlert}
+            pendingActions={pendingActions}
+            canAct={canAct}
+            onApproveAction={handleApproveAction}
+            onRejectAction={handleRejectAction}
           />
         </div>
       </div>

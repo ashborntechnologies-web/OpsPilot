@@ -1,16 +1,34 @@
 import type { Project, Environment, Deployment, GithubRepo, ConversationMessage, AWSAccount, OperationalEvent, CostSummary } from "@/types/api";
 
+// ACTIVE_ORG_KEY stores the workspace the user has selected in the navbar switcher.
+// It is sent as X-Org-Id on every request so org-scoped endpoints (list/create
+// projects, AWS accounts) target the right workspace. Absent → backend defaults to
+// the user's personal org.
+export const ACTIVE_ORG_KEY = "opspilot.activeOrgId";
+
+export function getActiveOrgId(): string | null {
+  if (typeof window === "undefined") return null;
+  return window.localStorage.getItem(ACTIVE_ORG_KEY);
+}
+
+export function setActiveOrgId(orgId: string) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(ACTIVE_ORG_KEY, orgId);
+}
+
 // HTTP requests use relative paths — Next.js rewrites /api/v1/* → backend, so no CORS needed.
 async function request<T>(
   path: string,
   token: string,
   options: RequestInit = {}
 ): Promise<T> {
+  const activeOrg = getActiveOrgId();
   const res = await fetch(`/api/v1${path}`, {
     ...options,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
+      ...(activeOrg ? { "X-Org-Id": activeOrg } : {}),
       ...(options.headers ?? {}),
     },
   });
@@ -164,7 +182,7 @@ export function getDeploymentEvents(token: string, projectId: string, deployment
 }
 
 export function diagnoseDeployment(token: string, projectId: string, deploymentId: string) {
-  return request<{ diagnosis: string }>(
+  return request<{ diagnosis: string; incident_id: string; confidence_score: number | null; evidence: import("@/types/api").EvidenceItem[] }>(
     `/projects/${projectId}/deployments/${deploymentId}/diagnose`,
     token
   );
@@ -443,4 +461,359 @@ export function submitDiagnosisFeedback(
 
 export function getProjectEvents(token: string, projectId: string, limit = 5) {
   return request<OperationalEvent[]>(`/projects/${projectId}/events?limit=${limit}`, token);
+}
+
+// ---- Trust levels & AI action approvals ----------------------------------------
+
+import type { EnvironmentTrust, AutonomousBoundaries, AIAction } from "@/types/api";
+
+export function getEnvironmentTrust(token: string, projectId: string, envId: string) {
+  return request<EnvironmentTrust>(`/projects/${projectId}/environments/${envId}/trust`, token);
+}
+
+export function updateEnvironmentTrust(
+  token: string,
+  projectId: string,
+  envId: string,
+  body: { trust_level?: string; autonomous_boundaries?: AutonomousBoundaries }
+) {
+  return request<{ message: string }>(`/projects/${projectId}/environments/${envId}/trust`, token, {
+    method: "PATCH", body: JSON.stringify(body),
+  });
+}
+
+export function listOrgActions(token: string, orgId: string, status = "pending") {
+  return request<AIAction[]>(`/orgs/${orgId}/actions?status=${status}`, token);
+}
+
+export function listProjectActions(token: string, projectId: string, limit = 50) {
+  return request<AIAction[]>(`/projects/${projectId}/actions?limit=${limit}`, token);
+}
+
+export function approveAction(token: string, actionId: string) {
+  return request<{ message: string }>(`/actions/${actionId}/approve`, token, { method: "POST" });
+}
+
+export function rejectAction(token: string, actionId: string) {
+  return request<{ message: string }>(`/actions/${actionId}/reject`, token, { method: "POST" });
+}
+
+// ---- Organizations (team workspaces) -------------------------------------------
+
+import type { Organization, OrganizationMember, OrgRole } from "@/types/api";
+
+export function listMyOrgs(token: string) {
+  return request<Organization[]>("/orgs/me", token);
+}
+
+export function createOrg(token: string, body: { name: string; slug?: string }) {
+  return request<Organization>("/orgs", token, { method: "POST", body: JSON.stringify(body) });
+}
+
+export function listOrgMembers(token: string, orgId: string) {
+  return request<OrganizationMember[]>(`/orgs/${orgId}/members`, token);
+}
+
+export function createOrgInvite(
+  token: string,
+  orgId: string,
+  body: { email: string; role: OrgRole }
+) {
+  return request<{ accept_url: string; email_sent: boolean }>(
+    `/orgs/${orgId}/invites`, token,
+    { method: "POST", body: JSON.stringify(body) }
+  );
+}
+
+export function updateMemberRole(token: string, orgId: string, userId: string, role: OrgRole) {
+  return request<{ message: string; role: OrgRole }>(
+    `/orgs/${orgId}/members/${userId}`, token,
+    { method: "PATCH", body: JSON.stringify({ role }) }
+  );
+}
+
+export function removeMember(token: string, orgId: string, userId: string) {
+  return request<{ message: string }>(
+    `/orgs/${orgId}/members/${userId}`, token,
+    { method: "DELETE" }
+  );
+}
+
+export function acceptInvite(token: string, inviteToken: string) {
+  return request<{ message: string; organization: Organization }>(
+    `/invites/${inviteToken}`, token
+  );
+}
+
+// ---- Infrastructure discovery --------------------------------------------------
+
+import type { DiscoveredResource, ResourceType } from "@/types/api";
+
+export function scanAccount(token: string, accountId: string) {
+  return request<{ job_id: string; message: string }>(
+    `/aws-accounts/${accountId}/scan`, token, { method: "POST" }
+  );
+}
+
+export function listOrgResources(
+  token: string,
+  orgId: string,
+  filters?: { resource_type?: ResourceType | ""; region?: string; project_id?: string }
+) {
+  const qs = new URLSearchParams();
+  if (filters?.resource_type) qs.set("resource_type", filters.resource_type);
+  if (filters?.region) qs.set("region", filters.region);
+  if (filters?.project_id) qs.set("project_id", filters.project_id);
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return request<DiscoveredResource[]>(`/orgs/${orgId}/resources${suffix}`, token);
+}
+
+export function listProjectResources(token: string, projectId: string) {
+  return request<DiscoveredResource[]>(`/projects/${projectId}/resources`, token);
+}
+
+export function assignResource(token: string, resourceId: string, projectId: string | null) {
+  return request<{ message: string; project_id: string | null }>(
+    `/resources/${resourceId}/assign`, token,
+    { method: "PATCH", body: JSON.stringify({ project_id: projectId }) }
+  );
+}
+
+// ---- Incident war room ---------------------------------------------------------
+
+import type { Incident, IncidentDetail, IncidentTimelineEntry } from "@/types/api";
+
+export function listOrgIncidents(token: string, orgId: string, limit = 100) {
+  return request<Incident[]>(`/orgs/${orgId}/incidents?limit=${limit}`, token);
+}
+
+export function listProjectIncidents(token: string, projectId: string) {
+  return request<Incident[]>(`/projects/${projectId}/incidents`, token);
+}
+
+export function getIncident(token: string, incidentId: string) {
+  return request<IncidentDetail>(`/incidents/${incidentId}`, token);
+}
+
+export function postIncidentTimeline(token: string, incidentId: string, content: string, entryType?: string) {
+  return request<IncidentTimelineEntry>(`/incidents/${incidentId}/timeline`, token, {
+    method: "POST", body: JSON.stringify({ content, entry_type: entryType }),
+  });
+}
+
+export function acknowledgeIncident(token: string, incidentId: string) {
+  return request<{ message: string; status: string }>(`/incidents/${incidentId}/acknowledge`, token, { method: "POST" });
+}
+
+export function resolveIncident(token: string, incidentId: string) {
+  // Postmortem generation is enqueued async (ADR-014); the war room polls
+  // getIncidentPostmortem afterwards.
+  return request<{ status: string; postmortem_generating: boolean }>(
+    `/incidents/${incidentId}/resolve`, token, { method: "POST" });
+}
+
+export function approveIncidentAction(token: string, incidentId: string, actionId: string) {
+  return request<{ message: string; status: string }>(`/incidents/${incidentId}/actions/${actionId}/approve`, token, { method: "POST" });
+}
+
+export function rejectIncidentAction(token: string, incidentId: string, actionId: string) {
+  return request<{ message: string; status: string }>(`/incidents/${incidentId}/actions/${actionId}/reject`, token, { method: "POST" });
+}
+
+// ---- Analytics / leadership dashboard --------------------------------------------
+
+import type { OrgAnalytics, ReliabilityMetrics, UptimePoint, ServiceSLA, OncallSchedule } from "@/types/api";
+
+export function getOrgAnalytics(token: string, orgId: string, days = 30) {
+  return request<OrgAnalytics>(`/orgs/${orgId}/analytics?days=${days}`, token);
+}
+
+export function getProjectAnalytics(token: string, projectId: string, days = 30) {
+  return request<{ metrics: ReliabilityMetrics }>(`/projects/${projectId}/analytics?days=${days}`, token);
+}
+
+export function getProjectUptime(token: string, projectId: string, days = 90) {
+  return request<{ uptime: UptimePoint[]; days: number }>(`/projects/${projectId}/uptime?days=${days}`, token);
+}
+
+export function getEnvironmentSLA(token: string, projectId: string, envId: string) {
+  return request<ServiceSLA>(`/projects/${projectId}/environments/${envId}/sla`, token);
+}
+
+export function setEnvironmentSLA(
+  token: string, projectId: string, envId: string,
+  body: { target_uptime_pct: number; measurement_window_days?: number }
+) {
+  return request<{ message: string }>(`/projects/${projectId}/environments/${envId}/sla`, token, {
+    method: "PUT", body: JSON.stringify(body),
+  });
+}
+
+export function listOrgReports(token: string, orgId: string) {
+  return request<DailySummaryRecord[]>(`/orgs/${orgId}/reports`, token);
+}
+
+export function getOncallSchedule(token: string, orgId: string) {
+  return request<OncallSchedule>(`/orgs/${orgId}/oncall-schedule`, token);
+}
+
+export function putOncallSchedule(
+  token: string, orgId: string,
+  body: { timezone: string; quiet_hours_start: string; quiet_hours_end: string; quiet_days: string[]; escalation_after_minutes?: number }
+) {
+  return request<{ message: string }>(`/orgs/${orgId}/oncall-schedule`, token, {
+    method: "PUT", body: JSON.stringify(body),
+  });
+}
+
+export function generateOrgReport(token: string, orgId: string, month?: string) {
+  const suffix = month ? `?month=${month}` : "";
+  return request<{ markdown_content: string }>(`/orgs/${orgId}/reports/generate${suffix}`, token, { method: "POST" });
+}
+
+// ---- Postmortems ----------------------------------------------------------------
+
+import type { Postmortem, ActionItem } from "@/types/api";
+
+// getIncidentPostmortem returns the postmortem, or null while it is still being
+// generated. It bypasses request() because a 404 with {generating:true} is an
+// expected polling state, not an error.
+export async function getIncidentPostmortem(
+  token: string, incidentId: string
+): Promise<{ postmortem: Postmortem | null; generating: boolean }> {
+  const activeOrg = getActiveOrgId();
+  const res = await fetch(`/api/v1/incidents/${incidentId}/postmortem`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(activeOrg ? { "X-Org-Id": activeOrg } : {}),
+    },
+  });
+  if (res.status === 404) {
+    const body = await res.json().catch(() => null);
+    return { postmortem: null, generating: Boolean((body as { generating?: boolean } | null)?.generating) };
+  }
+  if (!res.ok) throw new Error(`failed to load postmortem (HTTP ${res.status})`);
+  return { postmortem: (await res.json()) as Postmortem, generating: false };
+}
+
+export function getPostmortem(token: string, postmortemId: string) {
+  return request<Postmortem>(`/postmortems/${postmortemId}`, token);
+}
+
+export function updatePostmortem(
+  token: string, postmortemId: string,
+  body: { content_markdown?: string; title?: string; action_items?: ActionItem[] }
+) {
+  return request<{ message: string }>(`/postmortems/${postmortemId}`, token, {
+    method: "PATCH", body: JSON.stringify(body),
+  });
+}
+
+export function publishPostmortem(token: string, postmortemId: string) {
+  return request<{ message: string; status: string }>(`/postmortems/${postmortemId}/publish`, token, { method: "POST" });
+}
+
+// exportPostmortem fetches the export with auth (the endpoint requires a bearer
+// token, so a plain link/new-tab won't work). For "md" it downloads a file; for
+// "pdf" it opens the print-ready HTML in a new window which auto-triggers print.
+export async function exportPostmortem(
+  token: string, postmortemId: string, format: "md" | "pdf", filename = "postmortem"
+): Promise<void> {
+  const activeOrg = getActiveOrgId();
+  const res = await fetch(`/api/v1/postmortems/${postmortemId}/export?format=${format}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(activeOrg ? { "X-Org-Id": activeOrg } : {}),
+    },
+  });
+  if (!res.ok) throw new Error(`export failed (HTTP ${res.status})`);
+  const text = await res.text();
+  if (format === "pdf") {
+    const w = window.open("", "_blank");
+    if (w) { w.document.write(text); w.document.close(); }
+    return;
+  }
+  const blob = new Blob([text], { type: "text/markdown" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${filename}.md`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export function listOrgPostmortems(
+  token: string, orgId: string,
+  filters: { project_id?: string; severity?: string; from?: string; to?: string; q?: string } = {}
+) {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(filters)) if (v) qs.set(k, v);
+  const suffix = qs.toString() ? `?${qs}` : "";
+  return request<Postmortem[]>(`/orgs/${orgId}/postmortems${suffix}`, token);
+}
+
+export function incidentWsURL(incidentId: string) {
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
+  const base = apiUrl.replace(/^http/, "ws");
+  return `${base}/api/v1/ws/incidents/${incidentId}`;
+}
+
+// ---- Slack integration ---------------------------------------------------------
+
+import type { SlackStatus, SlackChannel } from "@/types/api";
+
+export function getSlackStatus(token: string, orgId: string) {
+  return request<SlackStatus>(`/orgs/${orgId}/slack`, token);
+}
+
+export function getSlackInstallURL(token: string, orgId: string) {
+  return request<{ url: string }>(`/orgs/${orgId}/slack/install`, token);
+}
+
+export function listSlackChannels(token: string, orgId: string) {
+  return request<SlackChannel[]>(`/orgs/${orgId}/slack/channels`, token);
+}
+
+export function updateSlackChannels(
+  token: string,
+  orgId: string,
+  body: {
+    alert_channel_id?: string | null; alert_channel_name?: string | null;
+    deploy_channel_id?: string | null; deploy_channel_name?: string | null;
+    summary_channel_id?: string | null; summary_channel_name?: string | null;
+  }
+) {
+  return request<{ message: string }>(`/orgs/${orgId}/slack`, token, {
+    method: "PATCH", body: JSON.stringify(body),
+  });
+}
+
+export function disconnectSlack(token: string, orgId: string) {
+  return request<{ message: string }>(`/orgs/${orgId}/slack`, token, { method: "DELETE" });
+}
+
+// ---- Daily operational summary -------------------------------------------------
+
+import type { DailySummaryRecord } from "@/types/api";
+
+export function listSummaries(token: string, orgId: string, limit = 30) {
+  return request<DailySummaryRecord[]>(`/orgs/${orgId}/summaries?limit=${limit}`, token);
+}
+
+export function getLatestSummary(token: string, orgId: string) {
+  return request<{ summary: DailySummaryRecord | null }>(`/orgs/${orgId}/summaries/latest`, token);
+}
+
+export function generateSummaryNow(token: string, orgId: string) {
+  return request<unknown>(`/orgs/${orgId}/summaries/generate`, token, { method: "POST" });
+}
+
+export function updateSummaryConfig(
+  token: string,
+  orgId: string,
+  body: { summary_time?: string; summary_timezone?: string; summary_enabled?: boolean }
+) {
+  return request<{ message: string }>(`/orgs/${orgId}/summary-config`, token, {
+    method: "PATCH", body: JSON.stringify(body),
+  });
 }

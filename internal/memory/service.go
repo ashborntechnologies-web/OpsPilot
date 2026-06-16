@@ -130,6 +130,15 @@ func (s *Service) RecordRecurringFailure(ctx context.Context, projectID uuid.UUI
 	}
 }
 
+// RecordSuccessfulFix records a resolved incident's root cause + fix as a long-term
+// memory so future diagnoses for this project benefit from what worked. Called when a
+// postmortem is generated.
+func (s *Service) RecordSuccessfulFix(ctx context.Context, projectID uuid.UUID, content string) {
+	if err := s.upsert(ctx, projectID, models.MemorySuccessfulFix, content, models.MemorySourceDiagnosis, 1.0); err != nil {
+		slog.Warn("memory: failed to record successful fix", "component", "memory", "project_id", projectID, "error", err)
+	}
+}
+
 // RecordDeployPattern recomputes the project's deploy timing/success profile
 // from the last 10 deployments. Called after every completed deploy.
 func (s *Service) RecordDeployPattern(ctx context.Context, projectID uuid.UUID) {

@@ -28,11 +28,21 @@ type AlertEngine struct {
 	llm      *llm.Client
 	hub      *ws.Hub
 	emailSvc *notify.EmailService
+	slack    SlackAlertNotifier
+}
+
+// SlackAlertNotifier posts alerts to an org's Slack channel. Implemented by
+// *slack.Service; injected to avoid a monitor↔slack import cycle. Best-effort.
+type SlackAlertNotifier interface {
+	PostAlert(ctx context.Context, orgID uuid.UUID, alert models.Alert, projectName, envName, incidentURL string) error
 }
 
 func NewAlertEngine(db *models.DB, llmClient *llm.Client, hub *ws.Hub, emailSvc *notify.EmailService) *AlertEngine {
 	return &AlertEngine{db: db, llm: llmClient, hub: hub, emailSvc: emailSvc}
 }
+
+// SetSlackNotifier wires Slack alert notifications (optional).
+func (a *AlertEngine) SetSlackNotifier(n SlackAlertNotifier) { a.slack = n }
 
 // MapEventToAlert returns the alert type for an operational event, or "" when
 // the event does not produce an alert. Pure function — unit tested.
@@ -138,15 +148,16 @@ func (a *AlertEngine) EvaluateEvent(ctx context.Context, ev models.OperationalEv
 	// Context for the title/summary.
 	envName, projectName := a.names(ctx, ev.ProjectID, ev.EnvironmentID)
 	title := alertTitle(alertType, envName)
-	summary := a.generateSummary(ctx, ev, envName, projectName, title)
+	summary, evidenceText := a.generateSummary(ctx, ev, envName, projectName, title)
 
 	alert := models.Alert{
-		ProjectID: ev.ProjectID,
-		AlertType: alertType,
-		Severity:  ev.Severity,
-		Title:     title,
-		Summary:   summary,
-		Status:    models.AlertStatusOpen,
+		ProjectID:    ev.ProjectID,
+		AlertType:    alertType,
+		Severity:     ev.Severity,
+		Title:        title,
+		Summary:      summary,
+		EvidenceText: &evidenceText,
+		Status:       models.AlertStatusOpen,
 	}
 	alert.EnvironmentID = ev.EnvironmentID
 
@@ -156,11 +167,11 @@ func (a *AlertEngine) EvaluateEvent(ctx context.Context, ev models.OperationalEv
 	}
 
 	err = a.db.Pool.QueryRow(ctx, `
-		INSERT INTO alerts (project_id, environment_id, alert_type, severity, title, summary, source_event_ids)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO alerts (project_id, org_id, environment_id, alert_type, severity, title, summary, evidence_text, source_event_ids)
+		VALUES ($1, (SELECT org_id FROM projects WHERE id = $1), $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id, triggered_at, created_at`,
 		alert.ProjectID, alert.EnvironmentID, alert.AlertType, alert.Severity,
-		alert.Title, alert.Summary, sourceIDs,
+		alert.Title, alert.Summary, evidenceText, sourceIDs,
 	).Scan(&alert.ID, &alert.TriggeredAt, &alert.CreatedAt)
 	if err != nil {
 		slog.Error("alert engine: failed to insert alert", "component", "monitor.alerts",
@@ -232,7 +243,12 @@ func (a *AlertEngine) names(ctx context.Context, projectID uuid.UUID, envID *uui
 
 // generateSummary asks the LLM for a one-sentence description, falling back to
 // a deterministic summary when the LLM is unavailable.
-func (a *AlertEngine) generateSummary(ctx context.Context, ev models.OperationalEvent, envName, projectName, title string) string {
+// generateSummary returns an LLM one-sentence summary plus a deterministic
+// evidence_text (1–2 sentences) explaining what in the event payload triggered the alert
+// — the alert's explainability, derived from real data rather than the model.
+func (a *AlertEngine) generateSummary(ctx context.Context, ev models.OperationalEvent, envName, projectName, title string) (summary, evidenceText string) {
+	evidenceText = alertEvidence(ev)
+
 	payloadJSON, _ := json.Marshal(ev.Payload)
 	prompt := fmt.Sprintf(
 		"In one sentence, describe this infrastructure alert for a developer. "+
@@ -246,31 +262,170 @@ func (a *AlertEngine) generateSummary(ctx context.Context, ev models.Operational
 	defer cancel()
 	summary, err := a.llm.Complete(llmCtx, "", prompt, 100)
 	if err != nil || strings.TrimSpace(summary) == "" {
-		return fmt.Sprintf("%s in %s/%s", title, projectName, envName)
+		return fmt.Sprintf("%s in %s/%s", title, projectName, envName), evidenceText
 	}
 	summary = strings.TrimSpace(summary)
 	if len(summary) > 200 {
 		summary = summary[:200]
 	}
-	return summary
+	return summary, evidenceText
 }
 
-// notifyOwner emails the project owner if their notification preferences allow it.
+// alertEvidence builds a short, factual explanation of what triggered an alert from the
+// operational event payload (no LLM) — e.g. error rate, task counts, matched log pattern.
+func alertEvidence(ev models.OperationalEvent) string {
+	p := ev.Payload
+	num := func(k string) (float64, bool) {
+		if v, ok := p[k]; ok {
+			switch n := v.(type) {
+			case float64:
+				return n, true
+			case int:
+				return float64(n), true
+			case int32:
+				return float64(n), true
+			}
+		}
+		return 0, false
+	}
+	switch ev.EventType {
+	case models.EventRuntimeServiceDown:
+		return "Triggered because the service has 0 running tasks while the desired count is above zero."
+	case models.EventRuntimeTasksDegraded:
+		r, ok1 := num("running")
+		d, ok2 := num("desired")
+		if ok1 && ok2 {
+			return fmt.Sprintf("Triggered because only %.0f of %.0f desired tasks are running.", r, d)
+		}
+		return "Triggered because fewer tasks are running than desired."
+	case models.EventRuntimeHighErrorRate:
+		if pct, ok := num("error_rate_pct"); ok {
+			return fmt.Sprintf("Triggered by an elevated 5xx error rate of %.1f%% over the sampling window.", pct)
+		}
+		return "Triggered by an elevated 5xx error rate from the load balancer."
+	case models.EventRuntimeHighLatency:
+		if ms, ok := num("p99_latency_ms"); ok {
+			return fmt.Sprintf("Triggered by p99 latency of %.0f ms exceeding the threshold.", ms)
+		}
+		return "Triggered by p99 latency exceeding the threshold."
+	case models.EventRuntimeLogAnomaly:
+		pt, _ := p["pattern_type"].(string)
+		if n, ok := num("line_count"); ok && pt != "" {
+			return fmt.Sprintf("Matched the %q anomaly pattern in %.0f recent log line(s).", pt, n)
+		}
+		if pt != "" {
+			return fmt.Sprintf("Matched the %q anomaly pattern in recent application logs.", pt)
+		}
+		return "Matched an anomaly pattern in recent application logs."
+	default:
+		return fmt.Sprintf("Triggered by a %s event from continuous monitoring.", strings.ReplaceAll(ev.EventType, ".", " "))
+	}
+}
+
+// notifyOwner emails the project owner (if their preferences allow) and posts to the
+// org's Slack alert channel (if connected). Both are best-effort.
 func (a *AlertEngine) notifyOwner(ctx context.Context, alert models.Alert, projectName, envName string) {
+	// Link to the incident war room. The specific incident is opened by the auto-
+	// diagnosis job that follows this alert, so we link to the org incident list where
+	// the in-progress incident appears (open incidents are surfaced first).
+	alertURL := strings.TrimRight(os.Getenv("FRONTEND_URL"), "/") + "/incidents"
+
 	var email string
 	var enabled bool
+	var orgID *uuid.UUID
 	err := a.db.Pool.QueryRow(ctx, `
-		SELECT u.email, u.notifications_enabled AND u.notify_alert_fired
+		SELECT u.email, u.notifications_enabled AND u.notify_alert_fired, p.org_id
 		FROM users u JOIN projects p ON p.user_id = u.id
 		WHERE p.id = $1`, alert.ProjectID,
-	).Scan(&email, &enabled)
-	if err != nil || !enabled {
+	).Scan(&email, &enabled, &orgID)
+	if err != nil {
 		return
 	}
 
-	alertURL := strings.TrimRight(os.Getenv("FRONTEND_URL"), "/") + "/projects/" + alert.ProjectID.String()
-	if err := a.emailSvc.SendAlert(ctx, email, projectName, envName, alert.Title, alert.Summary, alertURL); err != nil {
-		slog.Warn("alert engine: email failed", "component", "monitor.alerts",
-			"project_id", alert.ProjectID, "error", err)
+	// On-call quiet hours (ADR-016): during quiet hours, warn-severity alerts are
+	// suppressed from email + Slack (the DB row + WS broadcast already happened, so an
+	// engineer at their desk still sees it). Error-severity alerts always break through —
+	// critical issues wake people up — with a note on the Slack message.
+	quiet := false
+	if orgID != nil {
+		quiet, _ = a.CheckQuietHours(ctx, *orgID)
 	}
+	if quiet && alert.Severity != models.SeverityError {
+		slog.Info(fmt.Sprintf("alert suppressed during quiet hours: %s", alert.ID),
+			"component", "monitor.alerts", "alert_id", alert.ID, "org_id", orgID, "severity", alert.Severity)
+		return
+	}
+
+	if enabled {
+		if err := a.emailSvc.SendAlert(ctx, email, projectName, envName, alert.Title, alert.Summary, alertURL); err != nil {
+			slog.Warn("alert engine: email failed", "component", "monitor.alerts",
+				"project_id", alert.ProjectID, "error", err)
+		}
+	}
+
+	// Slack — independent of email preferences (channel-level opt-in via connecting Slack).
+	if a.slack != nil && orgID != nil {
+		slackAlert := alert
+		if quiet {
+			// Reaching here with quiet == true means error severity broke through.
+			slackAlert.Summary = strings.TrimSpace(alert.Summary + "\n⚠️ Sent outside quiet hours due to error severity")
+		}
+		if err := a.slack.PostAlert(ctx, *orgID, slackAlert, projectName, envName, alertURL); err != nil {
+			slog.Warn("alert engine: slack notify failed", "component", "monitor.alerts",
+				"project_id", alert.ProjectID, "error", err)
+		}
+	}
+}
+
+// CheckQuietHours reports whether the org is currently within its configured on-call quiet
+// window (quiet hours or a quiet day, evaluated in the org's timezone). Returns false when no
+// schedule is configured or on any error — failing open so alerts are never silently lost.
+func (a *AlertEngine) CheckQuietHours(ctx context.Context, orgID uuid.UUID) (bool, error) {
+	var tz, startStr, endStr string
+	var quietDays []string
+	err := a.db.Pool.QueryRow(ctx, `
+		SELECT timezone, to_char(quiet_hours_start, 'HH24:MI'), to_char(quiet_hours_end, 'HH24:MI'), quiet_days
+		FROM oncall_schedules WHERE org_id = $1`, orgID).Scan(&tz, &startStr, &endStr, &quietDays)
+	if err != nil {
+		return false, err // no schedule (or error) → not quiet
+	}
+
+	loc, lerr := time.LoadLocation(tz)
+	if lerr != nil {
+		loc = time.UTC
+	}
+	now := time.Now().In(loc)
+
+	// Quiet day? (weekday names are stored lowercase, e.g. "saturday")
+	today := strings.ToLower(now.Weekday().String())
+	for _, d := range quietDays {
+		if strings.ToLower(strings.TrimSpace(d)) == today {
+			return true, nil
+		}
+	}
+
+	// Quiet hours? Supports overnight windows (start > end, e.g. 22:00–08:00).
+	start, ok1 := parseHHMM(startStr)
+	end, ok2 := parseHHMM(endStr)
+	if !ok1 || !ok2 || start == end {
+		return false, nil // unset/degenerate window → only quiet days apply
+	}
+	nowMin := now.Hour()*60 + now.Minute()
+	if start < end {
+		return nowMin >= start && nowMin < end, nil
+	}
+	// Overnight window wraps past midnight.
+	return nowMin >= start || nowMin < end, nil
+}
+
+// parseHHMM parses "HH:MM" into minutes-since-midnight.
+func parseHHMM(s string) (int, bool) {
+	var h, m int
+	if _, err := fmt.Sscanf(strings.TrimSpace(s), "%d:%d", &h, &m); err != nil {
+		return 0, false
+	}
+	if h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, false
+	}
+	return h*60 + m, true
 }

@@ -17,36 +17,44 @@ func TestRunMigrations_Idempotent(t *testing.T) {
 	assert.NoError(t, err, "second RunMigrations call must be a no-op")
 }
 
-// TestUserOwnsProject verifies the tenant-isolation ownership check.
-func TestUserOwnsProject(t *testing.T) {
+// TestProjectOrgRole verifies the org-based tenant-isolation guard: a member of
+// the project's org resolves their role; a non-member gets ErrNoMembership.
+func TestProjectOrgRole(t *testing.T) {
 	db := testutil.NewTestDB(t)
 
 	ownerID := testutil.CreateUser(t, db)
 	otherID := testutil.CreateUser(t, db)
 	projectID := testutil.CreateProject(t, db, ownerID)
 
-	owned, err := db.UserOwnsProject(t.Context(), ownerID, projectID)
+	orgID, role, err := db.ProjectOrgRole(t.Context(), ownerID, projectID)
 	require.NoError(t, err)
-	assert.True(t, owned, "owner should own their own project")
+	assert.Equal(t, models.RoleAdmin, role, "creator is admin of their personal org")
+	assert.Equal(t, testutil.UserOrg(t, db, ownerID), orgID)
 
-	notOwned, err := db.UserOwnsProject(t.Context(), otherID, projectID)
-	require.NoError(t, err)
-	assert.False(t, notOwned, "other user should not own the project")
+	_, _, err = db.ProjectOrgRole(t.Context(), otherID, projectID)
+	assert.ErrorIs(t, err, models.ErrNoMembership, "non-member must not access the project")
 }
 
-// TestUserOwnsAccount verifies the account-level ownership check.
-func TestUserOwnsAccount(t *testing.T) {
+// TestUserOrgRole verifies role resolution and the membership-hierarchy roles.
+func TestUserOrgRole(t *testing.T) {
 	db := testutil.NewTestDB(t)
 
-	ownerID := testutil.CreateUser(t, db)
-	otherID := testutil.CreateUser(t, db)
-	accountID := testutil.CreateAWSAccount(t, db, ownerID)
+	adminID := testutil.CreateUser(t, db)
+	orgID := testutil.UserOrg(t, db, adminID)
 
-	owned, err := db.UserOwnsAccount(t.Context(), ownerID, accountID)
+	role, err := db.UserOrgRole(t.Context(), adminID, orgID)
 	require.NoError(t, err)
-	assert.True(t, owned)
+	assert.Equal(t, models.RoleAdmin, role)
 
-	notOwned, err := db.UserOwnsAccount(t.Context(), otherID, accountID)
+	// A second user added as a viewer resolves to viewer; a non-member errors.
+	viewerID := testutil.CreateUser(t, db)
+	testutil.AddOrgMember(t, db, orgID, viewerID, models.RoleViewer)
+	role, err = db.UserOrgRole(t.Context(), viewerID, orgID)
 	require.NoError(t, err)
-	assert.False(t, notOwned)
+	assert.Equal(t, models.RoleViewer, role)
+	assert.Less(t, models.RoleRank(role), models.RoleRank(models.RoleEngineer))
+
+	strangerID := testutil.CreateUser(t, db)
+	_, err = db.UserOrgRole(t.Context(), strangerID, orgID)
+	assert.ErrorIs(t, err, models.ErrNoMembership)
 }

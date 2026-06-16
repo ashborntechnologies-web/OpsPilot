@@ -21,7 +21,7 @@ func NewService(db *models.DB) *Service {
 }
 
 // resolveEnv parses :id and :envId and verifies the environment belongs to the project.
-// RequireProjectOwnership guards the project; this guards the cross-reference so a caller
+// LoadProjectMembership guards the project; this guards the cross-reference so a caller
 // cannot operate on another tenant's environment by passing a foreign envId.
 func (s *Service) resolveEnv(c *gin.Context) (envID uuid.UUID, ok bool) {
 	projectID, err := uuid.Parse(c.Param("id"))

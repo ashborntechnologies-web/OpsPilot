@@ -59,7 +59,7 @@ func newTestRouter(t *testing.T, db *models.DB, awsMock *testutil.MockAWSProvide
 
 	// Project-ownership guard (real middleware — exercises the actual DB check).
 	proj := r.Group("/projects/:id")
-	proj.Use(middleware.RequireProjectOwnership(db))
+	proj.Use(middleware.LoadProjectMembership(db))
 	{
 		proj.GET("", svc.HandleGetProject)
 		proj.GET("/deployments", svc.HandleListDeployments)

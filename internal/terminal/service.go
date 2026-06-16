@@ -92,9 +92,15 @@ func (s *Service) HandleTerminal(c *gin.Context) {
 		return
 	}
 
-	owned, err := s.db.UserOwnsProject(c.Request.Context(), userID, projectID)
-	if err != nil || !owned {
+	// Opening a shell into a running task is an engineer-level action. Verify the
+	// caller is a member of the project's org with at least the engineer role.
+	_, role, err := s.db.ProjectOrgRole(c.Request.Context(), userID, projectID)
+	if err != nil {
 		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","payload":"forbidden"}`))
+		return
+	}
+	if models.RoleRank(role) < models.RoleRank(models.RoleEngineer) {
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","payload":"forbidden: terminal access requires the engineer or admin role"}`))
 		return
 	}
 

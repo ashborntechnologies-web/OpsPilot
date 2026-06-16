@@ -15,6 +15,7 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/prompts"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/trust"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/ws"
@@ -29,10 +30,15 @@ type Service struct {
 	llm          *llm.Client
 	hub          *ws.Hub
 	billing      *billing.Service
+	trust        *trust.Service
 }
 
 // SetBillingService enables AI-action metering (set once at startup).
 func (s *Service) SetBillingService(b *billing.Service) { s.billing = b }
+
+// SetTrustService routes AI-mediated actions (deploy/rollback/scale/change_resources)
+// through the trust/approval layer instead of executing directly.
+func (s *Service) SetTrustService(t *trust.Service) { s.trust = t }
 
 type IntentResult struct {
 	Intent     string                 `json:"intent"`
@@ -178,13 +184,33 @@ func (s *Service) ProcessMessage(ctx context.Context, projectID uuid.UUID, userI
 		return fallback, nil
 	}
 
-	// Route to the matching workflow — Go code executes, Claude never touches AWS
+	// RBAC: viewers may read/ask but cannot trigger actions over chat. The WS layer
+	// only verifies membership, so action enforcement happens here.
+	if isActionIntent(intent.Intent) {
+		if _, role, rerr := s.db.ProjectOrgRole(ctx, userID, projectID); rerr == nil &&
+			models.RoleRank(role) < models.RoleRank(models.RoleEngineer) {
+			msg := "You have view-only (viewer) access to this workspace, so I can't run that action. " +
+				"I can still show you logs, health, costs, or diagnose issues. Ask an admin to grant you the engineer role to deploy, roll back, or scale."
+			s.saveMessage(ctx, projectID, userID, "assistant", msg, &intent.Intent)
+			return msg, nil
+		}
+	}
+
+	// Route to the matching workflow — Go code executes, Claude never touches AWS.
+	// Action intents (deploy/rollback/scale/change_resources) are AI-mediated, so they go
+	// through the trust/approval layer when wired; read intents run directly.
 	var response string
 	switch intent.Intent {
 	case models.IntentDeploy, models.IntentRedeploy:
-		response, err = s.deploySvc.TriggerDeploy(ctx, projectID, targetEnv(intent.Params))
+		response, err = s.act(ctx, projectID, userID, models.ActionDeploy, targetEnv(intent.Params), nil,
+			"User asked to deploy via chat.", func() (string, error) {
+				return s.deploySvc.TriggerDeploy(ctx, projectID, targetEnv(intent.Params))
+			})
 	case models.IntentRollback:
-		response, err = s.deploySvc.TriggerRollback(ctx, projectID, targetEnv(intent.Params))
+		response, err = s.act(ctx, projectID, userID, models.ActionRollback, targetEnv(intent.Params), nil,
+			"User asked to roll back via chat.", func() (string, error) {
+				return s.deploySvc.TriggerRollback(ctx, projectID, targetEnv(intent.Params))
+			})
 	case models.IntentLogs:
 		response, err = s.deploySvc.FetchLogsForProject(ctx, projectID)
 	case models.IntentHealth:
@@ -196,7 +222,9 @@ func (s *Service) ProcessMessage(ctx context.Context, projectID uuid.UUID, userI
 		if !ok {
 			response = "How many replicas would you like? For example: \"scale to 3\" or \"scale to 0\" to stop the service."
 		} else {
-			response, err = s.deploySvc.ScaleService(ctx, projectID, replicas)
+			response, err = s.act(ctx, projectID, userID, models.ActionScale, targetEnv(intent.Params),
+				map[string]any{"replicas": replicas}, fmt.Sprintf("User asked to scale to %d replicas via chat.", replicas),
+				func() (string, error) { return s.deploySvc.ScaleService(ctx, projectID, replicas) })
 		}
 	case models.IntentDiagnose:
 		response, err = s.diagnosisSvc.DiagnoseProject(ctx, projectID)
@@ -205,7 +233,9 @@ func (s *Service) ProcessMessage(ctx context.Context, projectID uuid.UUID, userI
 	case models.IntentChangeResources:
 		cpu := paramString(intent.Params, "cpu")
 		memory := paramString(intent.Params, "memory")
-		response, err = s.deploySvc.ProposeResourceChange(ctx, projectID, userID, cpu, memory)
+		response, err = s.act(ctx, projectID, userID, models.ActionChangeResources, targetEnv(intent.Params),
+			map[string]any{"cpu": cpu, "memory": memory}, "User asked to change compute resources via chat.",
+			func() (string, error) { return s.deploySvc.ProposeResourceChange(ctx, projectID, userID, cpu, memory) })
 	case models.IntentConfirm:
 		response, err = s.deploySvc.ApplyPendingMutation(ctx, projectID, userID)
 	default:
@@ -220,6 +250,45 @@ func (s *Service) ProcessMessage(ctx context.Context, projectID uuid.UUID, userI
 	s.saveMessage(ctx, projectID, userID, "assistant", response, &intent.Intent)
 
 	return response, nil
+}
+
+// act routes an AI-mediated action through the trust/approval layer. When trust is wired,
+// it proposes the action (which auto-executes only if the environment's trust level +
+// boundaries allow it) and returns a status-appropriate chat reply. When trust is not
+// wired, it falls back to executing directly (direct) for backward compatibility.
+func (s *Service) act(ctx context.Context, projectID, userID uuid.UUID, actionType, envName string, params map[string]any, rationale string, direct func() (string, error)) (string, error) {
+	if s.trust == nil {
+		return direct()
+	}
+	orgID, _, _ := s.db.ProjectOrgRole(ctx, userID, projectID)
+	uid := userID
+	a, err := s.trust.ProposeAction(ctx, trust.ActionProposal{
+		OrgID:            orgID,
+		ProjectID:        projectID,
+		EnvName:          envName,
+		ProposedByType:   models.ProposerAI,
+		ProposedByUserID: &uid,
+		ActionType:       actionType,
+		Parameters:       params,
+		Rationale:        rationale,
+	})
+	if err != nil {
+		return "", err
+	}
+	switch a.Status {
+	case models.ActionStatusExecuted:
+		msg, _ := a.Result["message"].(string)
+		if msg == "" {
+			msg = fmt.Sprintf("Done — %s executed on %s.", actionType, envName)
+		}
+		return msg, nil
+	case models.ActionStatusFailed:
+		errMsg, _ := a.Result["error"].(string)
+		return fmt.Sprintf("The %s action failed: %s", actionType, errMsg), nil
+	default:
+		return fmt.Sprintf("I've proposed a %s action on %s — it needs approval before it runs. "+
+			"An engineer or admin can approve it from the Pending Approvals panel.", actionType, envName), nil
+	}
 }
 
 // recentContext renders the last N conversation turns oldest-first as a compact
@@ -247,6 +316,17 @@ func (s *Service) recentContext(ctx context.Context, projectID uuid.UUID, limit 
 		fmt.Fprintf(&b, "[%s]: %s\n", role, msg)
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// isActionIntent reports whether an intent triggers an infrastructure action
+// (forbidden for viewers). Read-only intents (logs/health/diagnose/cost) are allowed.
+func isActionIntent(intent string) bool {
+	switch intent {
+	case models.IntentDeploy, models.IntentRedeploy, models.IntentRollback,
+		models.IntentScale, models.IntentChangeResources, models.IntentConfirm:
+		return true
+	}
+	return false
 }
 
 // targetEnv returns the environment named in the intent params, defaulting to

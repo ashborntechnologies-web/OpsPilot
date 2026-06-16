@@ -13,23 +13,31 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ashborntechnologies-web/OpsPilot/internal/analytics"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/auth"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/aws"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/billing"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/conversation"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/discovery"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/envvars"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/events"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/export"
 	githubsvc "github.com/ashborntechnologies-web/OpsPilot/internal/github"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/incidents"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/memory"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/monitor"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/notify"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/orgs"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/postmortem"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/prompts"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/queue"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/slack"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/summary"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/terminal"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/trust"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/users"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/webhooks"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/middleware"
@@ -125,6 +133,9 @@ func validateEnv() {
 	if os.Getenv("ADMIN_API_KEY") == "" {
 		log.Println("WARNING: ADMIN_API_KEY not set — admin training-data export endpoints are disabled")
 	}
+	if os.Getenv("SLACK_CLIENT_ID") == "" || os.Getenv("SLACK_CLIENT_SECRET") == "" || os.Getenv("SLACK_SIGNING_SECRET") == "" {
+		log.Println("WARNING: SLACK_CLIENT_ID/SLACK_CLIENT_SECRET/SLACK_SIGNING_SECRET not all set — Slack integration (notifications, slash commands) is disabled")
+	}
 }
 
 func main() {
@@ -181,12 +192,11 @@ func main() {
 		if err != nil {
 			return uuid.UUID{}, err
 		}
-		owned, err := db.UserOwnsProject(ctx, userID, pid)
-		if err != nil {
-			return uuid.UUID{}, err
-		}
-		if !owned {
-			return uuid.UUID{}, errors.New("forbidden: user does not own project")
+		// Any member of the project's org may open the socket (viewers receive live
+		// deploy/alert broadcasts). Action enforcement happens per-message in the
+		// conversation engine, which blocks viewers from triggering actions.
+		if _, _, err := db.ProjectOrgRole(ctx, userID, pid); err != nil {
+			return uuid.UUID{}, errors.New("forbidden: not a member of this project's workspace")
 		}
 		return userID, nil
 	})
@@ -232,6 +242,20 @@ func main() {
 	billingSvc := billing.NewService(db)
 	usersSvc := users.NewService(db, billingSvc)
 
+	// Organizations (team workspaces) + RBAC.
+	orgsSvc := orgs.NewService(db, emailSvc, os.Getenv("FRONTEND_URL"))
+
+	// Infrastructure discovery — scans connected AWS accounts for existing resources.
+	discoverySvc := discovery.NewService(db, awsSvc)
+	discoverySvc.SetEnqueuer(queueClient)
+
+	// When an AWS account is connected, kick off an initial discovery scan.
+	awsSvc.SetOnAccountConnected(func(orgID, accountID uuid.UUID) {
+		if _, err := queueClient.EnqueueScan(accountID.String()); err != nil {
+			slog.Error(fmt.Sprintf("failed to enqueue initial scan for account %s: %v", accountID, err))
+		}
+	})
+
 	deploySvc.SetEmailService(emailSvc)
 	deploySvc.SetMemoryService(memorySvc)
 	deploySvc.SetRiskLLM(llm.New(os.Getenv("ANTHROPIC_API_KEY")))
@@ -243,16 +267,59 @@ func main() {
 			slog.Error(fmt.Sprintf("failed to enqueue provision job for env %s: %v", environmentID, err))
 		}
 	})
+	// Incident war room — incidents service is injected into diagnosis so completed
+	// diagnoses open a shared, real-time incident with an AI+human timeline.
+	incidentsSvc := incidents.NewService(db, llm.New(os.Getenv("ANTHROPIC_API_KEY")), hub)
+
+	// Postmortems — generated asynchronously when an incident is resolved (ADR-014).
+	postmortemSvc := postmortem.NewService(db, llm.New(os.Getenv("ANTHROPIC_API_KEY")), memorySvc)
+	incidentsSvc.SetPostmortemEnqueuer(queueClient)
+
 	diagnosisSvc := diagnosis.NewService(db, awsSvc, eventSvc, os.Getenv("ANTHROPIC_API_KEY"))
 	diagnosisSvc.SetMemoryService(memorySvc)
+	diagnosisSvc.SetIncidentService(incidentsSvc)
 	conversationSvc := conversation.NewService(db, deploySvc, diagnosisSvc, os.Getenv("ANTHROPIC_API_KEY"), hub)
 	conversationSvc.SetBillingService(billingSvc)
+
+	// Slack integration — alert/deploy notifications, daily summary, slash commands.
+	slackSvc := slack.NewService(
+		db,
+		os.Getenv("ENCRYPTION_KEY"), os.Getenv("ENCRYPTION_KEY_PREV"),
+		os.Getenv("SLACK_CLIENT_ID"), os.Getenv("SLACK_CLIENT_SECRET"), os.Getenv("SLACK_SIGNING_SECRET"),
+		os.Getenv("PUBLIC_API_URL"), os.Getenv("FRONTEND_URL"),
+	)
+	slackSvc.SetDeployer(deploySvc)
+	deploySvc.SetSlackNotifier(slackSvc)
+	alertEngine.SetSlackNotifier(slackSvc)
+
+	// Trust levels + AI-action approval workflow. AI-initiated actions (chat, diagnosis)
+	// route through ProposeAction, which auto-executes or registers a pending approval
+	// based on the environment's trust level.
+	trustSvc := trust.NewService(db, deploySvc, hub, os.Getenv("FRONTEND_URL"))
+	trustSvc.SetSlack(slackSvc)
+	trustSvc.SetIncidents(incidentsSvc)
+	conversationSvc.SetTrustService(trustSvc)
+	diagnosisSvc.SetTrustService(trustSvc)
+
+	// Daily operational summary — AI morning briefing posted to Slack + emailed.
+	summarySvc := summary.NewService(db, llm.New(os.Getenv("ANTHROPIC_API_KEY")), emailSvc, awsSvc, os.Getenv("FRONTEND_URL"))
+	summarySvc.SetSlack(slackSvc)
+	summarySvc.SetEnqueuer(queueClient)
+
+	// Engineering leadership dashboard — SLA/uptime, MTTD/MTTR, reliability trends, and the
+	// monthly operational health report (ADR-015).
+	analyticsSvc := analytics.NewService(db, llm.New(os.Getenv("ANTHROPIC_API_KEY")), emailSvc, awsSvc, os.Getenv("FRONTEND_URL"))
+	analyticsSvc.SetSlack(slackSvc)
 
 	// Init job queue server
 	queueServer := queue.NewServer(
 		os.Getenv("REDIS_URL"),
 		deploySvc,
 		diagnosisSvc,
+		discoverySvc,
+		summarySvc,
+		postmortemSvc,
+		analyticsSvc,
 	)
 	go queueServer.Start()
 	defer queueServer.Stop()
@@ -337,94 +404,164 @@ func main() {
 		protected.GET("/github/repos/:owner/:repo/branches", githubSvc.HandleListBranches)
 		protected.GET("/github/repos/:owner/:repo/detect", githubSvc.HandleDetectFramework)
 
-		// Projects (collection — ownership enforced inside the handlers)
+		// Projects (collection — org-scoped via the X-Org-Id header inside the handlers)
 		protected.POST("/projects", deploySvc.HandleCreateProject)
 		protected.GET("/projects", deploySvc.HandleListProjects)
 
-		// AWS Accounts (user-level — ownership enforced inside the handlers)
 		// Account (plan, usage, notification preferences)
 		protected.GET("/users/me", usersSvc.HandleGetMe)
 		protected.PATCH("/users/me/notifications", usersSvc.HandleUpdateNotifications)
 
+		// AWS Accounts (active-workspace-scoped; connect/delete are admin-only,
+		// enforced inside the handlers via the active org role).
 		protected.GET("/aws-accounts", awsSvc.HandleListAWSAccounts)
 		protected.POST("/aws-accounts", awsSvc.HandleConnectAWSAccount)
 		protected.DELETE("/aws-accounts/:id", awsSvc.HandleDeleteAWSAccount)
+
+		// Infrastructure discovery (org/role enforced inside the handlers).
+		protected.POST("/aws-accounts/:id/scan", discoverySvc.HandleScanAccount)
+		protected.PATCH("/resources/:resourceId/assign", discoverySvc.HandleAssignResource)
+
+		// AI action approvals (engineer+ enforced against the action's org in the handler).
+		protected.POST("/actions/:actionId/approve", trustSvc.HandleApprove)
+		protected.POST("/actions/:actionId/reject", trustSvc.HandleReject)
+
+		// Postmortems — edit/publish/export. Org membership + role checked inside each
+		// handler (the postmortem resolves its own org).
+		protected.GET("/postmortems/:postmortemId", postmortemSvc.HandleGet)
+		protected.PATCH("/postmortems/:postmortemId", postmortemSvc.HandleUpdate)
+		protected.POST("/postmortems/:postmortemId/publish", postmortemSvc.HandlePublish)
+		protected.GET("/postmortems/:postmortemId/export", postmortemSvc.HandleExport)
+
+		// Organizations (team workspaces)
+		protected.POST("/orgs", orgsSvc.HandleCreateOrg)
+		protected.GET("/orgs/me", orgsSvc.HandleListMyOrgs)
+		// Invite acceptance — any authenticated user with the token can redeem it.
+		protected.GET("/invites/:token", orgsSvc.HandleAcceptInvite)
 	}
 
-	// Project-scoped routes — every handler here operates on a single project the
-	// caller must own. RequireProjectOwnership is the single tenant-isolation guard
-	// so individual handlers no longer need to re-check ownership of ":id".
+	// Organization management — scoped to a single org the caller belongs to.
+	// RequireOrgMembership loads the caller's role and stores org context; member
+	// management is admin-only, listing is open to any member.
+	org := v1.Group("/orgs/:orgId")
+	org.Use(middleware.RequireAuth(authSvc, db))
+	org.Use(middleware.RequireOrgMembership(db)) // any member; per-route role below
+	{
+		org.GET("/members", orgsSvc.HandleListMembers)
+		org.GET("/resources", discoverySvc.HandleListOrgResources) // discovered resource inventory
+		org.GET("/incidents", incidentsSvc.HandleListOrgIncidents) // war-room incident list
+		org.GET("/postmortems", postmortemSvc.HandleListOrg)       // published postmortem library (SOC2)
+		org.GET("/actions", trustSvc.HandleListOrgActions)         // pending AI-action approvals
+
+		// Engineering leadership dashboard — org-wide reliability metrics + monthly reports.
+		org.GET("/analytics", analyticsSvc.HandleOrgAnalytics)
+		org.GET("/reports", analyticsSvc.HandleListReports)
+		org.POST("/reports/generate", middleware.RequireRole(models.RoleAdmin), analyticsSvc.HandleGenerateReport)
+
+		// On-call schedule — quiet hours that suppress warn-level alert notifications (ADR-016).
+		org.GET("/oncall-schedule", alertEngine.HandleGetOncallSchedule)
+		org.PUT("/oncall-schedule", middleware.RequireRole(models.RoleAdmin), alertEngine.HandlePutOncallSchedule)
+
+		// Slack integration — read for any member; install/config/disconnect are admin.
+		org.GET("/slack", slackSvc.HandleGetIntegration)
+		org.GET("/slack/channels", slackSvc.HandleListChannels)
+		org.GET("/slack/install", middleware.RequireRole(models.RoleAdmin), slackSvc.HandleInstallURL)
+		org.PATCH("/slack", middleware.RequireRole(models.RoleAdmin), slackSvc.HandleUpdateChannels)
+		org.DELETE("/slack", middleware.RequireRole(models.RoleAdmin), slackSvc.HandleDisconnect)
+
+		// Daily operational summaries — reads for any member; generate/config are admin.
+		org.GET("/summaries", summarySvc.HandleListSummaries)
+		org.GET("/summaries/latest", summarySvc.HandleLatestSummary)
+		org.POST("/summaries/generate", middleware.RequireRole(models.RoleAdmin), summarySvc.HandleGenerateNow)
+		org.PATCH("/summary-config", middleware.RequireRole(models.RoleAdmin), summarySvc.HandleUpdateConfig)
+
+		org.POST("/invites", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleCreateInvite)
+		org.PATCH("/members/:userId", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleUpdateMemberRole)
+		org.DELETE("/members/:userId", middleware.RequireRole(models.RoleAdmin), orgsSvc.HandleRemoveMember)
+	}
+
+	// Project-scoped routes — every handler operates on a single project owned by an
+	// org the caller belongs to. LoadProjectMembership resolves project→org→role and
+	// is the tenant-isolation guard (404 for non-members). RequireRole then enforces
+	// the role hierarchy per action:
+	//   viewer   — all reads (no extra guard)
+	//   engineer — deploy, rollback, scale, env-var writes, alert ack, chat, webhooks
+	//   admin    — create/delete environment, delete project, settings, AWS-linked ops
+	requireEngineer := middleware.RequireRole(models.RoleEngineer)
+	requireAdmin := middleware.RequireRole(models.RoleAdmin)
+
 	proj := v1.Group("/projects/:id")
 	proj.Use(middleware.RequireAuth(authSvc, db))
-	proj.Use(middleware.RequireProjectOwnership(db))
+	proj.Use(middleware.LoadProjectMembership(db))
 	{
+		// Reads — any member (viewer+).
 		proj.GET("", deploySvc.HandleGetProject)
-		proj.DELETE("", deploySvc.HandleDeleteProject)
-
-		// Environments
-		proj.POST("/environments", awsSvc.HandleCreateEnvironment)
 		proj.GET("/environments", awsSvc.HandleListEnvironments)
-		proj.POST("/environments/:envId/retry-provision", awsSvc.HandleRetryProvision)
 		proj.GET("/environments/:envId/logs", deploySvc.HandleGetLogs)
-
-		// Env vars (injected into the ECS task definition at deploy time)
 		proj.GET("/environments/:envId/env-vars", envVarSvc.HandleList)
-		proj.PUT("/environments/:envId/env-vars", envVarSvc.HandleUpsert)
-		proj.DELETE("/environments/:envId/env-vars/:varId", envVarSvc.HandleDelete)
-		proj.GET("/environments/:envId/env-vars/:varId/reveal", envVarSvc.HandleReveal)
-
-		// Health check + scaling
 		proj.GET("/environments/:envId/health", deploySvc.HandleCheckHealth)
-		proj.POST("/environments/:envId/scale", deploySvc.HandleScaleService)
-
-		// Webhooks
 		proj.GET("/webhooks", webhookSvc.HandleList)
-		proj.POST("/webhooks", webhookSvc.HandleCreate)
-		proj.PATCH("/webhooks/:webhookId", webhookSvc.HandleUpdate)
-		proj.DELETE("/webhooks/:webhookId", webhookSvc.HandleDelete)
-
-		// Deployments
-		proj.POST("/environments/:envId/deploy", deployRL.Middleware(), deploySvc.HandleDeploy)
 		proj.GET("/deployments", deploySvc.HandleListDeployments)
-		proj.POST("/deployments/:deployId/rollback", deploySvc.HandleRollback)
-		proj.POST("/deployments/:deployId/redeploy", deploySvc.HandleRedeploy)
-		proj.DELETE("/deployments/:deployId", deploySvc.HandleDeleteDeployment)
-
-		// Deployment events (operational timeline)
 		proj.GET("/deployments/:deployId/events", eventSvc.HandleGetDeploymentEvents)
-
-		// Project-wide recent events (sidebar activity feed)
 		proj.GET("/events", eventSvc.HandleGetProjectEvents)
-
-		// Alerts
 		proj.GET("/alerts", alertEngine.HandleListAlerts)
-		proj.POST("/alerts/:alertId/snooze", alertEngine.HandleSnooze)
-		proj.POST("/alerts/:alertId/resolve", alertEngine.HandleResolve)
-
-		// Deploy cancellation
-		proj.POST("/deployments/:deployId/cancel", deploySvc.HandleCancelDeployment)
-
-		// Project settings
-		proj.PATCH("", deploySvc.HandleUpdateProject)
-
-		// Diagnosis
 		proj.GET("/deployments/:deployId/diagnose", diagnosisSvc.HandleDiagnose)
-		proj.POST("/deployments/:deployId/diagnose/feedback", diagnosisSvc.HandleSubmitFeedback)
 		proj.GET("/diagnose/feedback-summary", diagnosisSvc.HandleFeedbackSummary)
-
-		// Cost intelligence
 		proj.GET("/costs", deploySvc.HandleGetCosts)
-
-		// Deployment health score (computed from platform data, no AWS calls)
 		proj.GET("/health-score", deploySvc.HandleGetHealthScore)
-
-		// PR Preview Environments
-		proj.POST("/previews/enable", deploySvc.HandleEnablePreviews)
-		proj.POST("/previews/disable", deploySvc.HandleDisablePreviews)
-
-		// Conversation (REST fallback — primary is WebSocket)
-		proj.POST("/conversation", conversationRL.Middleware(), conversationSvc.HandleMessage)
+		proj.GET("/resources", discoverySvc.HandleListProjectResources)
+		proj.GET("/incidents", incidentsSvc.HandleListProjectIncidents)
+		proj.GET("/actions", trustSvc.HandleListProjectActions)
+		proj.GET("/environments/:envId/trust", trustSvc.HandleGetTrust)
+		proj.PATCH("/environments/:envId/trust", requireAdmin, trustSvc.HandleUpdateTrust)
 		proj.GET("/conversation/history", conversationSvc.HandleHistory)
+
+		// Project-level analytics (leadership dashboard) + per-environment SLA config.
+		proj.GET("/analytics", analyticsSvc.HandleProjectAnalytics)
+		proj.GET("/uptime", analyticsSvc.HandleProjectUptime)
+		proj.GET("/environments/:envId/sla", analyticsSvc.HandleGetSLA)
+		proj.PUT("/environments/:envId/sla", requireEngineer, analyticsSvc.HandleSetSLA)
+
+		// Engineer actions — deploy, rollback, scale, env vars, alerts, chat, webhooks.
+		proj.POST("/environments/:envId/deploy", requireEngineer, deployRL.Middleware(), deploySvc.HandleDeploy)
+		proj.POST("/deployments/:deployId/rollback", requireEngineer, deploySvc.HandleRollback)
+		proj.POST("/deployments/:deployId/redeploy", requireEngineer, deploySvc.HandleRedeploy)
+		proj.POST("/deployments/:deployId/cancel", requireEngineer, deploySvc.HandleCancelDeployment)
+		proj.DELETE("/deployments/:deployId", requireEngineer, deploySvc.HandleDeleteDeployment)
+		proj.POST("/environments/:envId/scale", requireEngineer, deploySvc.HandleScaleService)
+		proj.PUT("/environments/:envId/env-vars", requireEngineer, envVarSvc.HandleUpsert)
+		proj.DELETE("/environments/:envId/env-vars/:varId", requireEngineer, envVarSvc.HandleDelete)
+		proj.GET("/environments/:envId/env-vars/:varId/reveal", requireEngineer, envVarSvc.HandleReveal)
+		proj.POST("/alerts/:alertId/snooze", requireEngineer, alertEngine.HandleSnooze)
+		proj.POST("/alerts/:alertId/resolve", requireEngineer, alertEngine.HandleResolve)
+		proj.POST("/deployments/:deployId/diagnose/feedback", requireEngineer, diagnosisSvc.HandleSubmitFeedback)
+		proj.POST("/conversation", requireEngineer, conversationRL.Middleware(), conversationSvc.HandleMessage)
+		proj.POST("/webhooks", requireEngineer, webhookSvc.HandleCreate)
+		proj.PATCH("/webhooks/:webhookId", requireEngineer, webhookSvc.HandleUpdate)
+		proj.DELETE("/webhooks/:webhookId", requireEngineer, webhookSvc.HandleDelete)
+		proj.POST("/previews/enable", requireEngineer, deploySvc.HandleEnablePreviews)
+		proj.POST("/previews/disable", requireEngineer, deploySvc.HandleDisablePreviews)
+
+		// Admin actions — provisioning, deletion, settings.
+		proj.POST("/environments", requireAdmin, awsSvc.HandleCreateEnvironment)
+		proj.POST("/environments/:envId/retry-provision", requireAdmin, awsSvc.HandleRetryProvision)
+		proj.DELETE("", requireAdmin, deploySvc.HandleDeleteProject)
+		proj.PATCH("", requireAdmin, deploySvc.HandleUpdateProject)
+	}
+
+	// Incident war room — single-incident routes. Auth is RequireAuth; org membership +
+	// role are checked inside each handler (the incident resolves its own org). Reads
+	// need any member; timeline/ack/resolve/actions need engineer+.
+	inc := v1.Group("/incidents/:incidentId")
+	inc.Use(middleware.RequireAuth(authSvc, db))
+	{
+		inc.GET("", incidentsSvc.HandleGetIncident)
+		inc.POST("/timeline", incidentsSvc.HandlePostTimeline)
+		inc.POST("/acknowledge", incidentsSvc.HandleAcknowledge)
+		inc.POST("/resolve", incidentsSvc.HandleResolve)
+		inc.GET("/postmortem", postmortemSvc.HandleGetByIncident) // 404 {generating} while async generation runs
+		inc.POST("/actions/:actionId/approve", incidentsSvc.HandleApproveAction)
+		inc.POST("/actions/:actionId/reject", incidentsSvc.HandleRejectAction)
 	}
 
 	// Admin — training data exports (trade secret datasets). Protected by a static
@@ -439,6 +576,12 @@ func main() {
 	// GitHub webhook — public; authentication via HMAC-SHA256 signature.
 	v1.POST("/github/webhook", deploySvc.HandleGithubWebhook)
 
+	// Slack — public endpoints. OAuth callback (trust = signed state); slash commands and
+	// interactive components (trust = X-Slack-Signature HMAC).
+	v1.GET("/slack/callback", slackSvc.HandleCallback)
+	v1.POST("/slack/commands", slackSvc.HandleCommand)
+	v1.POST("/slack/interactivity", slackSvc.HandleInteractivity)
+
 	// WebSocket — outside the auth middleware; auth + project-ownership are verified
 	// via the first-message token (see wsAuthFn).
 	v1.GET("/ws/:projectId", func(c *gin.Context) {
@@ -447,6 +590,31 @@ func main() {
 
 	// Terminal WebSocket — auth via first-message token (browsers cannot set custom headers).
 	v1.GET("/ws/:projectId/terminal/:envId", terminalSvc.HandleTerminal)
+
+	// Incident war-room WebSocket — broadcast-only stream of timeline entries + status
+	// updates. Auth via first-message token; access requires membership of the incident's
+	// org (any role — viewers watch live).
+	incidentWsAuthFn := pkgws.RoomAuthFunc(func(ctx context.Context, token, incidentID string) (uuid.UUID, error) {
+		userID, err := middleware.ResolveToken(ctx, db, authSvc, token)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
+		iid, err := uuid.Parse(incidentID)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
+		var orgID *uuid.UUID
+		if err := db.Pool.QueryRow(ctx, `SELECT org_id FROM incidents WHERE id = $1`, iid).Scan(&orgID); err != nil || orgID == nil {
+			return uuid.UUID{}, errors.New("forbidden: incident not found")
+		}
+		if _, err := db.UserOrgRole(ctx, userID, *orgID); err != nil {
+			return uuid.UUID{}, errors.New("forbidden: not a member of this incident's workspace")
+		}
+		return userID, nil
+	})
+	v1.GET("/ws/incidents/:incidentId", func(c *gin.Context) {
+		hub.HandleIncidentUpgrade(c, incidentWsAuthFn)
+	})
 
 	// Start server
 	port := os.Getenv("PORT")

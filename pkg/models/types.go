@@ -16,22 +16,26 @@ type User struct {
 }
 
 type AWSAccount struct {
-	ID           uuid.UUID `json:"id" db:"id"`
-	UserID       uuid.UUID `json:"user_id" db:"user_id"`
-	Label        string    `json:"label" db:"label"`
-	AWSAccountID string    `json:"aws_account_id" db:"aws_account_id"`
-	IAMRoleARN   string    `json:"iam_role_arn" db:"iam_role_arn"`
-	ExternalID   string    `json:"-" db:"external_id"` // STS external ID; per-tenant, not exposed in JSON
+	ID           uuid.UUID  `json:"id" db:"id"`
+	UserID       uuid.UUID  `json:"user_id" db:"user_id"`
+	OrgID        *uuid.UUID `json:"org_id" db:"org_id"`
+	Label        string     `json:"label" db:"label"`
+	AWSAccountID string     `json:"aws_account_id" db:"aws_account_id"`
+	IAMRoleARN   string     `json:"iam_role_arn" db:"iam_role_arn"`
+	ExternalID   string     `json:"-" db:"external_id"` // STS external ID; per-tenant, not exposed in JSON
 	// CertificateARN is an optional ACM cert that enables HTTPS on the shared ALB
 	// for platform stacks provisioned in this account.
-	CertificateARN *string   `json:"certificate_arn,omitempty" db:"certificate_arn"`
-	CreatedAt      time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
+	CertificateARN *string `json:"certificate_arn,omitempty" db:"certificate_arn"`
+	// LastScannedAt is when the discovery scanner last ran for this account.
+	LastScannedAt *time.Time `json:"last_scanned_at" db:"last_scanned_at"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at" db:"updated_at"`
 }
 
 type Project struct {
 	ID                  uuid.UUID  `json:"id" db:"id"`
 	UserID              uuid.UUID  `json:"user_id" db:"user_id"`
+	OrgID               *uuid.UUID `json:"org_id" db:"org_id"`
 	Name                string     `json:"name" db:"name"`
 	RepoURL             string     `json:"repo_url" db:"repo_url"`
 	RepoOwner           string     `json:"repo_owner" db:"repo_owner"`
@@ -107,6 +111,9 @@ type Environment struct {
 	PRHeadSHA         *string `json:"pr_head_sha,omitempty" db:"pr_head_sha"`
 	GithubPRCommentID *int64  `json:"github_pr_comment_id,omitempty" db:"github_pr_comment_id"`
 
+	// Trust level for AI-initiated actions on this environment.
+	TrustLevel string `json:"trust_level" db:"trust_level"` // suggest | supervised | autonomous
+
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
 }
@@ -127,13 +134,105 @@ type Deployment struct {
 type Incident struct {
 	ID            uuid.UUID  `json:"id" db:"id"`
 	ProjectID     uuid.UUID  `json:"project_id" db:"project_id"`
+	OrgID         *uuid.UUID `json:"org_id" db:"org_id"`
 	DeploymentID  *uuid.UUID `json:"deployment_id" db:"deployment_id"`
 	EnvironmentID *uuid.UUID `json:"environment_id" db:"environment_id"`
 	Trigger       string     `json:"trigger" db:"trigger"` // deploy_failure | runtime_anomaly | user_request
 	RootCause     *string    `json:"root_cause" db:"root_cause"`
 	Resolution    *string    `json:"resolution" db:"resolution"`
 	RawLogs       *string    `json:"-" db:"raw_logs"`
-	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+
+	// Explainability: AI confidence (0.0–1.0) + the structured evidence behind the
+	// diagnosis. Evidence is db:"-" (scanned from the JSONB column into the slice).
+	ConfidenceScore *float64       `json:"confidence_score" db:"confidence_score"`
+	Evidence        []EvidenceItem `json:"evidence" db:"-"`
+
+	// War-room lifecycle fields.
+	Title          *string    `json:"title" db:"title"`
+	Status         string     `json:"status" db:"status"` // open | investigating | resolved
+	Severity       string     `json:"severity" db:"severity"`
+	AcknowledgedBy *uuid.UUID `json:"acknowledged_by" db:"acknowledged_by"`
+	AcknowledgedAt *time.Time `json:"acknowledged_at" db:"acknowledged_at"`
+	ResolvedBy     *uuid.UUID `json:"resolved_by" db:"resolved_by"`
+	ResolvedAt     *time.Time `json:"resolved_at" db:"resolved_at"`
+	Postmortem     *string    `json:"postmortem" db:"postmortem"`
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+
+	// Joined/derived fields (not columns) — populated by list/get queries.
+	EnvironmentName    string `json:"environment_name,omitempty" db:"-"`
+	ProjectName        string `json:"project_name,omitempty" db:"-"`
+	AcknowledgedByName string `json:"acknowledged_by_name,omitempty" db:"-"`
+}
+
+// EvidenceItem is one structured signal the AI used in its reasoning, surfaced so
+// engineers can see *why* a conclusion was reached. Stored as a JSONB array on incidents.
+type EvidenceItem struct {
+	// Type ∈ log_pattern | metric_spike | deploy_correlation | memory_match | similar_incident
+	Type        string         `json:"type"`
+	Description string         `json:"description"` // human-readable explanation
+	Data        map[string]any `json:"data,omitempty"`
+	Weight      float64        `json:"weight"` // 0.0–1.0, how much this contributed
+}
+
+// Incident status + severity constants.
+const (
+	IncidentStatusOpen          = "open"
+	IncidentStatusInvestigating = "investigating"
+	IncidentStatusResolved      = "resolved"
+)
+
+// Incident trigger constants.
+const (
+	IncidentTriggerDeployFailure  = "deploy_failure"
+	IncidentTriggerRuntimeAnomaly = "runtime_anomaly"
+	IncidentTriggerUserRequest    = "user_request"
+)
+
+// Incident author + entry-type + action-status constants.
+const (
+	IncidentAuthorAI    = "ai"
+	IncidentAuthorHuman = "human"
+
+	IncidentEntryDiagnosis   = "diagnosis"
+	IncidentEntryUpdate      = "update"
+	IncidentEntryActionTaken = "action_taken"
+	IncidentEntryResolution  = "resolution"
+
+	IncidentActionPending  = "pending"
+	IncidentActionApproved = "approved"
+	IncidentActionExecuted = "executed"
+	IncidentActionRejected = "rejected"
+)
+
+// IncidentTimelineEntry is one post in the war-room feed — an AI diagnosis/update or a
+// human comment. author_id is nil for AI entries.
+type IncidentTimelineEntry struct {
+	ID         uuid.UUID      `json:"id" db:"id"`
+	IncidentID uuid.UUID      `json:"incident_id" db:"incident_id"`
+	AuthorType string         `json:"author_type" db:"author_type"`
+	AuthorID   *uuid.UUID     `json:"author_id" db:"author_id"`
+	Content    string         `json:"content" db:"content"`
+	EntryType  string         `json:"entry_type" db:"entry_type"`
+	Metadata   map[string]any `json:"metadata" db:"metadata"`
+	CreatedAt  time.Time      `json:"created_at" db:"created_at"`
+	// AuthorName is the human author's email — populated by the timeline query.
+	AuthorName string `json:"author_name,omitempty" db:"-"`
+}
+
+// IncidentAction is a remediation step proposed during an incident, with an approval
+// lifecycle (pending → approved/executed | rejected).
+type IncidentAction struct {
+	ID         uuid.UUID      `json:"id" db:"id"`
+	IncidentID uuid.UUID      `json:"incident_id" db:"incident_id"`
+	ProposedBy string         `json:"proposed_by" db:"proposed_by"`
+	ActionType string         `json:"action_type" db:"action_type"`
+	Parameters map[string]any `json:"parameters" db:"parameters"`
+	Status     string         `json:"status" db:"status"`
+	ApprovedBy *uuid.UUID     `json:"approved_by" db:"approved_by"`
+	ExecutedAt *time.Time     `json:"executed_at" db:"executed_at"`
+	CreatedAt  time.Time      `json:"created_at" db:"created_at"`
+	// ApprovedByName is the approver's email — populated by the actions query.
+	ApprovedByName string `json:"approved_by_name,omitempty" db:"-"`
 }
 
 type Conversation struct {
@@ -404,11 +503,13 @@ const (
 type Alert struct {
 	ID             uuid.UUID   `json:"id" db:"id"`
 	ProjectID      uuid.UUID   `json:"project_id" db:"project_id"`
+	OrgID          *uuid.UUID  `json:"org_id" db:"org_id"`
 	EnvironmentID  *uuid.UUID  `json:"environment_id" db:"environment_id"`
 	AlertType      string      `json:"alert_type" db:"alert_type"`
 	Severity       string      `json:"severity" db:"severity"`
 	Title          string      `json:"title" db:"title"`
 	Summary        string      `json:"summary" db:"summary"`
+	EvidenceText   *string     `json:"evidence_text" db:"evidence_text"` // 1-2 sentences: what triggered this
 	Status         string      `json:"status" db:"status"`
 	TriggeredAt    time.Time   `json:"triggered_at" db:"triggered_at"`
 	ResolvedAt     *time.Time  `json:"resolved_at" db:"resolved_at"`
@@ -454,6 +555,362 @@ const (
 	PlanPro  = "pro"
 	PlanTeam = "team"
 )
+
+// ─── Organizations & RBAC ────────────────────────────────────────────────────
+
+// Organization is a team workspace. All projects, AWS accounts, alerts, and
+// incidents belong to an organization; users access them via membership + role.
+// Every user gets a personal organization on first login (created_by themselves).
+type Organization struct {
+	ID        uuid.UUID `json:"id" db:"id"`
+	Name      string    `json:"name" db:"name"`
+	Slug      string    `json:"slug" db:"slug"`
+	CreatedBy uuid.UUID `json:"created_by" db:"created_by"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
+	// Daily-summary delivery config.
+	SummaryTime     string `json:"summary_time" db:"summary_time"`         // "HH:MM:SS"
+	SummaryTimezone string `json:"summary_timezone" db:"summary_timezone"` // IANA name
+	SummaryEnabled  bool   `json:"summary_enabled" db:"summary_enabled"`
+	// Role is the requesting user's role in this org — populated by list queries,
+	// not a column.
+	Role string `json:"role,omitempty" db:"-"`
+}
+
+// OrganizationMember links a user to an organization with a role.
+type OrganizationMember struct {
+	ID        uuid.UUID  `json:"id" db:"id"`
+	OrgID     uuid.UUID  `json:"org_id" db:"org_id"`
+	UserID    uuid.UUID  `json:"user_id" db:"user_id"`
+	Role      string     `json:"role" db:"role"`
+	InvitedBy *uuid.UUID `json:"invited_by" db:"invited_by"`
+	JoinedAt  time.Time  `json:"joined_at" db:"joined_at"`
+	CreatedAt time.Time  `json:"created_at" db:"created_at"`
+	// Email is the member's email — populated by the members-list join, not a column.
+	Email string `json:"email,omitempty" db:"-"`
+}
+
+// OrganizationInvite is a pending invitation to join an org, redeemable via token.
+type OrganizationInvite struct {
+	ID         uuid.UUID  `json:"id" db:"id"`
+	OrgID      uuid.UUID  `json:"org_id" db:"org_id"`
+	Email      string     `json:"email" db:"email"`
+	Role       string     `json:"role" db:"role"`
+	Token      uuid.UUID  `json:"-" db:"token"` // never exposed in list responses
+	InvitedBy  uuid.UUID  `json:"invited_by" db:"invited_by"`
+	ExpiresAt  time.Time  `json:"expires_at" db:"expires_at"`
+	AcceptedAt *time.Time `json:"accepted_at" db:"accepted_at"`
+	CreatedAt  time.Time  `json:"created_at" db:"created_at"`
+}
+
+// Organization role constants. Hierarchical: admin > engineer > viewer.
+const (
+	RoleAdmin    = "admin"    // invite/remove members, connect AWS, delete projects, change settings
+	RoleEngineer = "engineer" // deploy, rollback, scale, terminal, env vars, ack alerts, resolve incidents
+	RoleViewer   = "viewer"   // read-only; cannot trigger any action
+)
+
+// RoleRank maps a role to a privilege level; a higher rank satisfies any lower
+// requirement. Unknown roles rank 0 (no access).
+func RoleRank(role string) int {
+	switch role {
+	case RoleAdmin:
+		return 3
+	case RoleEngineer:
+		return 2
+	case RoleViewer:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// ValidRole reports whether the string is an assignable org role.
+func ValidRole(r string) bool {
+	return r == RoleAdmin || r == RoleEngineer || r == RoleViewer
+}
+
+// ─── Infrastructure discovery ────────────────────────────────────────────────
+
+// Discovered resource type constants.
+const (
+	ResourceECSService  = "ecs_service"
+	ResourceECSCluster  = "ecs_cluster"
+	ResourceRDSInstance = "rds_instance"
+	ResourceElastiCache = "elasticache_cluster"
+	ResourceLambda      = "lambda_function"
+	ResourceS3Bucket    = "s3_bucket"
+	ResourceALB         = "alb"
+	ResourceCloudFront  = "cloudfront_distribution"
+	ResourceSQSQueue    = "sqs_queue"
+	ResourceEC2Instance = "ec2_instance"
+)
+
+// DiscoveredResource is an AWS resource found in a connected account by the
+// discovery scanner. It may be OpsPilot-managed (is_managed, tagged ManagedBy=OpsPilot)
+// or pre-existing. project_id is nil until a user assigns it to a project.
+type DiscoveredResource struct {
+	ID           uuid.UUID      `json:"id" db:"id"`
+	OrgID        uuid.UUID      `json:"org_id" db:"org_id"`
+	AWSAccountID uuid.UUID      `json:"aws_account_id" db:"aws_account_id"`
+	ResourceType string         `json:"resource_type" db:"resource_type"`
+	ResourceID   string         `json:"resource_id" db:"resource_id"` // AWS ARN or native ID
+	ResourceName string         `json:"resource_name" db:"resource_name"`
+	Region       string         `json:"region" db:"region"`
+	Metadata     map[string]any `json:"metadata" db:"metadata"`
+	Tags         map[string]any `json:"tags" db:"tags"`
+	ProjectID    *uuid.UUID     `json:"project_id" db:"project_id"`
+	IsManaged    bool           `json:"is_managed" db:"is_managed"`
+	FirstSeenAt  time.Time      `json:"first_seen_at" db:"first_seen_at"`
+	LastSeenAt   time.Time      `json:"last_seen_at" db:"last_seen_at"`
+}
+
+// ─── Slack integration ───────────────────────────────────────────────────────
+
+// SlackIntegration is an org's connected Slack workspace and its channel routing.
+// BotToken is encrypted at rest (never exposed in JSON).
+type SlackIntegration struct {
+	ID                 uuid.UUID  `json:"id" db:"id"`
+	OrgID              uuid.UUID  `json:"org_id" db:"org_id"`
+	TeamID             string     `json:"team_id" db:"team_id"`
+	WorkspaceName      string     `json:"workspace_name" db:"workspace_name"`
+	BotToken           string     `json:"-" db:"bot_token"` // encrypted; never exposed
+	AlertChannelID     *string    `json:"alert_channel_id" db:"alert_channel_id"`
+	AlertChannelName   *string    `json:"alert_channel_name" db:"alert_channel_name"`
+	DeployChannelID    *string    `json:"deploy_channel_id" db:"deploy_channel_id"`
+	DeployChannelName  *string    `json:"deploy_channel_name" db:"deploy_channel_name"`
+	SummaryChannelID   *string    `json:"summary_channel_id" db:"summary_channel_id"`
+	SummaryChannelName *string    `json:"summary_channel_name" db:"summary_channel_name"`
+	InstalledBy        *uuid.UUID `json:"installed_by" db:"installed_by"`
+	CreatedAt          time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// DailySummaryRecord is a stored daily summary row (the rich generation logic lives in
+// internal/summary). content_json holds the structured metrics; content_markdown the
+// rendered briefing.
+type DailySummaryRecord struct {
+	ID              uuid.UUID      `json:"id" db:"id"`
+	OrgID           uuid.UUID      `json:"org_id" db:"org_id"`
+	SummaryDate     string         `json:"summary_date" db:"summary_date"` // YYYY-MM-DD
+	ContentMarkdown string         `json:"content_markdown" db:"content_markdown"`
+	ContentJSON     map[string]any `json:"content_json" db:"content_json"`
+	GeneratedAt     time.Time      `json:"generated_at" db:"generated_at"`
+	DeliveredSlack  bool           `json:"delivered_slack" db:"delivered_slack"`
+	DeliveredEmail  bool           `json:"delivered_email" db:"delivered_email"`
+	IsMonthly       bool           `json:"is_monthly" db:"is_monthly"`
+	CreatedAt       time.Time      `json:"created_at" db:"created_at"`
+}
+
+// ─── Analytics / leadership dashboard ────────────────────────────────────────
+
+// SLA status constants — how an environment/scope is tracking against its uptime target.
+const (
+	SLAMeeting  = "meeting"
+	SLAAtRisk   = "at_risk"
+	SLABreached = "breached"
+)
+
+// ServiceSLA is the per-environment uptime target used by the analytics dashboard.
+type ServiceSLA struct {
+	ID                    uuid.UUID `json:"id" db:"id"`
+	OrgID                 uuid.UUID `json:"org_id" db:"org_id"`
+	ProjectID             uuid.UUID `json:"project_id" db:"project_id"`
+	EnvironmentID         uuid.UUID `json:"environment_id" db:"environment_id"`
+	TargetUptimePct       float64   `json:"target_uptime_pct" db:"target_uptime_pct"`
+	MeasurementWindowDays int       `json:"measurement_window_days" db:"measurement_window_days"`
+	CreatedAt             time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// UptimeSnapshot is one computed uptime row per environment per day (derived from
+// runtime.service_down/recovered operational events — ADR-015).
+type UptimeSnapshot struct {
+	ID              uuid.UUID `json:"id" db:"id"`
+	EnvironmentID   uuid.UUID `json:"environment_id" db:"environment_id"`
+	SnapshotDate    string    `json:"snapshot_date" db:"snapshot_date"` // YYYY-MM-DD
+	TotalMinutes    int       `json:"total_minutes" db:"total_minutes"`
+	DowntimeMinutes int       `json:"downtime_minutes" db:"downtime_minutes"`
+	UptimePct       float64   `json:"uptime_pct" db:"uptime_pct"`
+	IncidentCount   int       `json:"incident_count" db:"incident_count"`
+	CreatedAt       time.Time `json:"created_at" db:"created_at"`
+}
+
+// UptimePoint is a daily uptime data point for trend charts.
+type UptimePoint struct {
+	Date      string  `json:"date"` // YYYY-MM-DD
+	UptimePct float64 `json:"uptime_pct"`
+}
+
+// IncidentPoint is a weekly incident count for the incidents-per-week chart.
+type IncidentPoint struct {
+	WeekStart string `json:"week_start"` // YYYY-MM-DD (Monday)
+	Count     int    `json:"count"`
+}
+
+// FailurePattern is a recurring failure from project memory ranked by reference count.
+type FailurePattern struct {
+	Pattern string `json:"pattern"`
+	Count   int    `json:"count"`
+}
+
+// ReliabilityMetrics is the engineering-leadership view of reliability for an org (or a
+// single project) over a window. Computed by internal/analytics.
+type ReliabilityMetrics struct {
+	UptimePct         float64 `json:"uptime_pct"`
+	SLATarget         float64 `json:"sla_target"`
+	SLAStatus         string  `json:"sla_status"` // meeting | at_risk | breached
+	MTTD              float64 `json:"mttd"`       // minutes: first anomaly → acknowledged
+	MTTR              float64 `json:"mttr"`       // minutes: acknowledged → resolved
+	IncidentCount     int     `json:"incident_count"`
+	DeployCount       int     `json:"deploy_count"`
+	DeploySuccessRate float64 `json:"deploy_success_rate"` // percent
+	ChangeFailureRate float64 `json:"change_failure_rate"` // percent of deploys that caused an incident
+
+	// Previous-period scalars (same-length window immediately before) for trend arrows.
+	PrevUptimePct         float64 `json:"prev_uptime_pct"`
+	PrevMTTD              float64 `json:"prev_mttd"`
+	PrevMTTR              float64 `json:"prev_mttr"`
+	PrevDeploySuccessRate float64 `json:"prev_deploy_success_rate"`
+
+	UptimeTrend        []UptimePoint    `json:"uptime_trend"`
+	IncidentTrend      []IncidentPoint  `json:"incident_trend"`
+	TopFailurePatterns []FailurePattern `json:"top_failure_patterns"`
+	Days               int              `json:"days"`
+}
+
+// ProjectReliabilityRow is one row of the org dashboard's project/environment breakdown.
+type ProjectReliabilityRow struct {
+	ProjectID       uuid.UUID `json:"project_id"`
+	ProjectName     string    `json:"project_name"`
+	EnvironmentID   uuid.UUID `json:"environment_id"`
+	EnvironmentName string    `json:"environment_name"`
+	UptimePct       float64   `json:"uptime_pct"`
+	MTTR            float64   `json:"mttr"`
+	IncidentCount   int       `json:"incident_count"`
+	SLATarget       float64   `json:"sla_target"`
+	SLAStatus       string    `json:"sla_status"`
+}
+
+// OncallSchedule is an org's quiet-hours configuration. Times are stored as "HH:MM"
+// strings (rendered from the TIME columns); quiet_days holds lowercase weekday names.
+type OncallSchedule struct {
+	ID                     uuid.UUID `json:"id" db:"id"`
+	OrgID                  uuid.UUID `json:"org_id" db:"org_id"`
+	Timezone               string    `json:"timezone" db:"timezone"`
+	QuietHoursStart        string    `json:"quiet_hours_start" db:"quiet_hours_start"` // "HH:MM"
+	QuietHoursEnd          string    `json:"quiet_hours_end" db:"quiet_hours_end"`     // "HH:MM"
+	QuietDays              []string  `json:"quiet_days" db:"quiet_days"`
+	EscalationAfterMinutes int       `json:"escalation_after_minutes" db:"escalation_after_minutes"`
+	CreatedAt              time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// ─── Trust levels & AI action approval ───────────────────────────────────────
+
+// Trust level constants — how much autonomy AI-initiated actions have per environment.
+const (
+	TrustSuggest    = "suggest"    // AI only suggests; every action needs human approval
+	TrustSupervised = "supervised" // every action needs approval, surfaced prominently
+	TrustAutonomous = "autonomous" // actions within boundaries auto-execute; others need approval
+)
+
+// AI action type + status + proposer constants.
+const (
+	ActionDeploy          = "deploy"
+	ActionRollback        = "rollback"
+	ActionScale           = "scale"
+	ActionChangeResources = "change_resources"
+	ActionTerminalCommand = "terminal_command"
+
+	ActionStatusPending  = "pending_approval"
+	ActionStatusApproved = "approved"
+	ActionStatusRejected = "rejected"
+	ActionStatusExecuted = "executed"
+	ActionStatusFailed   = "failed"
+
+	ProposerAI    = "ai"
+	ProposerHuman = "human"
+)
+
+// AutonomousBoundaries bounds what may auto-execute in 'autonomous' trust mode. A nil
+// boundaries (or a false flag) means that action type always requires approval. There is
+// deliberately no can_deploy — deploys always require approval (see ADR-013).
+type AutonomousBoundaries struct {
+	CanRollback        bool `json:"can_rollback"`
+	CanScale           bool `json:"can_scale"`
+	MinReplicas        int  `json:"min_replicas"`
+	MaxReplicas        int  `json:"max_replicas"`
+	CanChangeResources bool `json:"can_change_resources"`
+}
+
+// AIAction is one AI-proposed action and its approval/execution lifecycle.
+type AIAction struct {
+	ID               uuid.UUID      `json:"id" db:"id"`
+	OrgID            uuid.UUID      `json:"org_id" db:"org_id"`
+	ProjectID        uuid.UUID      `json:"project_id" db:"project_id"`
+	EnvironmentID    *uuid.UUID     `json:"environment_id" db:"environment_id"`
+	IncidentID       *uuid.UUID     `json:"incident_id" db:"incident_id"`
+	ProposedByType   string         `json:"proposed_by_type" db:"proposed_by_type"`
+	ProposedByUserID *uuid.UUID     `json:"proposed_by_user_id" db:"proposed_by_user_id"`
+	ActionType       string         `json:"action_type" db:"action_type"`
+	Parameters       map[string]any `json:"parameters" db:"parameters"`
+	ConfidenceScore  *float64       `json:"confidence_score" db:"confidence_score"`
+	Rationale        string         `json:"rationale" db:"rationale"`
+	Status           string         `json:"status" db:"status"`
+	ApprovedBy       *uuid.UUID     `json:"approved_by" db:"approved_by"`
+	ApprovalRequired bool           `json:"approval_required" db:"approval_required"`
+	ProposedAt       time.Time      `json:"proposed_at" db:"proposed_at"`
+	DecidedAt        *time.Time     `json:"decided_at" db:"decided_at"`
+	ExecutedAt       *time.Time     `json:"executed_at" db:"executed_at"`
+	Result           map[string]any `json:"result" db:"result"`
+	CreatedAt        time.Time      `json:"created_at" db:"created_at"`
+	// Joined/derived (not columns).
+	EnvironmentName string `json:"environment_name,omitempty" db:"-"`
+	ProjectName     string `json:"project_name,omitempty" db:"-"`
+	ProposedByName  string `json:"proposed_by_name,omitempty" db:"-"`
+	ApprovedByName  string `json:"approved_by_name,omitempty" db:"-"`
+}
+
+// ─── Postmortems ──────────────────────────────────────────────────────────────
+
+// Postmortem status constants.
+const (
+	PostmortemDraft     = "draft"
+	PostmortemPublished = "published"
+)
+
+// ActionItem is one follow-up from a postmortem.
+type ActionItem struct {
+	Item     string `json:"item"`
+	Owner    string `json:"owner"`
+	Priority string `json:"priority,omitempty"` // HIGH | MED | LOW
+	DueDate  string `json:"due_date,omitempty"`
+	Status   string `json:"status"` // open | done
+}
+
+// Postmortem is the AI-generated, editable, exportable writeup for a resolved incident.
+type Postmortem struct {
+	ID              uuid.UUID    `json:"id" db:"id"`
+	IncidentID      uuid.UUID    `json:"incident_id" db:"incident_id"`
+	OrgID           uuid.UUID    `json:"org_id" db:"org_id"`
+	ProjectID       uuid.UUID    `json:"project_id" db:"project_id"`
+	Title           string       `json:"title" db:"title"`
+	Status          string       `json:"status" db:"status"`
+	ContentMarkdown string       `json:"content_markdown" db:"content_markdown"`
+	ActionItems     []ActionItem `json:"action_items" db:"-"`
+	GeneratedAt     *time.Time   `json:"generated_at" db:"generated_at"`
+	PublishedAt     *time.Time   `json:"published_at" db:"published_at"`
+	PublishedBy     *uuid.UUID   `json:"published_by" db:"published_by"`
+	CreatedAt       time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time    `json:"updated_at" db:"updated_at"`
+	// Joined/derived (not columns) — populated by list/library queries.
+	ProjectName    string     `json:"project_name,omitempty" db:"-"`
+	IncidentTitle  string     `json:"incident_title,omitempty" db:"-"`
+	Severity       string     `json:"severity,omitempty" db:"-"`
+	IncidentOpened *time.Time `json:"incident_opened,omitempty" db:"-"`
+	IncidentClosed *time.Time `json:"incident_closed,omitempty" db:"-"`
+}
 
 // ValidFramework reports whether the string is a supported framework identifier.
 func ValidFramework(f string) bool {
