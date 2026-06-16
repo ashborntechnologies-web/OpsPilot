@@ -349,6 +349,56 @@ users). `ai_actions` coexists with the advisory `incident_actions`.
 
 ---
 
+## ADR-015 — Uptime computed from operational events, not external probes
+**Date:** 2026-06-16 · **Status:** Accepted
+
+**Decision.** The leadership dashboard's uptime/SLA tracking is computed from the
+`runtime.service_down` / `runtime.service_recovered` operational events the monitor already
+emits, snapshotted daily into `uptime_snapshots` (one row per environment per day) by an
+Asynq job. There is no separate external uptime-probing system (no synthetic HTTP checks
+from outside AWS).
+
+**Context.** A reliability dashboard needs an uptime number. The two obvious sources are
+(a) external blackbox probes (a prober hits the app URL every N seconds from outside and
+records pass/fail) or (b) the platform's own continuous monitoring, which already polls ECS
+service health + ALB metrics every 60s and emits structured `runtime.*` events into
+`operational_events` — the same substrate diagnosis, alerts, and health scores reason over.
+
+**Why events, not probes.**
+- **The signal already exists.** The Poller already detects service-down/recovered and
+  writes timestamped events. Computing uptime from them is a SQL walk, not a new subsystem —
+  no prober fleet, scheduling, egress, or per-environment URL/health-path config to manage.
+- **One source of truth.** Uptime, alerts, incidents, and MTTD all derive from the same
+  events, so the dashboard can't disagree with the alerts that fired. An external prober
+  would introduce a second, independently-wrong notion of "down" to reconcile.
+- **BYOC fit.** Probing customer apps from our infrastructure means egress to their
+  environments, auth to private endpoints, and false positives from network paths we don't
+  control. The in-account Poller already has the assumed-role access and sees real ECS/ALB
+  state.
+- **Honest partial days.** Snapshots clip downtime to the day and cap "today" at now, and
+  outages spanning midnight are split across days — so a day's `uptime_pct` is accurate even
+  mid-day.
+
+**Trade-offs (accepted).** Uptime reflects *ECS/ALB health as the Poller sees it*, not true
+end-user reachability — a CDN/DNS/region outage upstream of the ALB won't register, and a
+service with no monitoring events reads as 100% (no observed downtime, not "proven up"). The
+60s poll interval bounds resolution. These are documented in CURRENT_STATE; an external
+synthetic-probe option can be added later as an additional event source without changing the
+storage or aggregation (it would just emit the same `service_down`/`recovered` events).
+
+**Why store daily snapshots** (vs. computing from raw events on every dashboard load):
+bounded, indexable rows keep dashboard queries cheap and stable as event volume grows, give
+trends a natural grain, and let the monthly report read a small fixed set of rows. The job is
+idempotent per `(environment, date)` and recomputes yesterday+today each run to absorb
+late-arriving recovery events.
+
+**Impact.** New `internal/analytics` package; `uptime_snapshots` + `service_slas` tables;
+`analytics:snapshot` (daily) and `analytics:monthly` (1st) scheduler jobs; org/project
+analytics + SLA + report endpoints; monthly report stored in `daily_summaries`
+(`is_monthly`). Dashboard charts are dependency-free SVG (recharts not installed).
+
+---
+
 ## ADR-014 — Postmortems generated asynchronously, in their own package
 **Date:** 2026-06-15 · **Status:** Accepted
 

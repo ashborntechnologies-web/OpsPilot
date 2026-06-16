@@ -72,7 +72,10 @@ Frontend client: [`frontend/lib/api.ts`](../../frontend/lib/api.ts). Errors are
 | GET | `/orgs/:orgId/slack/install` | — | `{url}` (signed-state OAuth URL) | **admin** |
 | PATCH | `/orgs/:orgId/slack` | `{alert/deploy/summary_channel_id+name}` | `{message}` | **admin** |
 | DELETE | `/orgs/:orgId/slack` | — | `{message}` (disconnect) | **admin** |
-| GET | `/orgs/:orgId/summaries?limit=30` | — | `DailySummaryRecord[]` | member |
+| GET | `/orgs/:orgId/analytics?days=30` | — | `{metrics: ReliabilityMetrics, breakdown: ProjectReliabilityRow[]}` (org-wide leadership dashboard) | member |
+| GET | `/orgs/:orgId/reports` | — | `DailySummaryRecord[]` (monthly health reports, `is_monthly=true`) | member |
+| POST | `/orgs/:orgId/reports/generate?month=YYYY-MM` | — | `MonthlyReport` (generate + email admins; month defaults to current) | **admin** |
+| GET | `/orgs/:orgId/summaries?limit=30` | — | `DailySummaryRecord[]` (daily only, `is_monthly=false`) | member |
 | GET | `/orgs/:orgId/summaries/latest` | — | `{summary}` (most recent or null) | member |
 | POST | `/orgs/:orgId/summaries/generate` | — | `DailySummary` (generate + deliver today; testing) | **admin** |
 | PATCH | `/orgs/:orgId/summary-config` | `{summary_time?,summary_timezone?,summary_enabled?}` | `{message}` | **admin** |
@@ -141,6 +144,10 @@ intents.
 | POST | `/alerts/:alertId/resolve` | — | `{message}` |
 | GET | `/costs` | — | `CostSummary` (30-day, Cost Explorer) |
 | GET | `/health-score` | — | `HealthScore{score,grade,components,insights}` |
+| GET | `/analytics?days=30` | — | `{metrics: ReliabilityMetrics}` (project reliability) |
+| GET | `/uptime?days=90` | — | `{uptime: UptimePoint[], days}` (daily uptime for charts) |
+| GET | `/environments/:envId/sla` | — | `ServiceSLA` (default 99.9% when unset) |
+| PUT | `/environments/:envId/sla` *(engineer+)* | `{target_uptime_pct, measurement_window_days?}` | `{message}` |
 | GET | `/resources` | — | `DiscoveredResource[]` (assigned to this project; managed + discovered) |
 | GET | `/actions?limit=50` | — | `AIAction[]` (action history) |
 | GET | `/environments/:envId/trust` | — | `{trust_level, autonomous_boundaries}` |

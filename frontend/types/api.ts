@@ -295,6 +295,73 @@ export interface IncidentDetail {
   actions: IncidentAction[];
 }
 
+// ─── Analytics / leadership dashboard ───────────────────────────────────────
+
+export type SLAStatus = "meeting" | "at_risk" | "breached";
+
+export interface UptimePoint {
+  date: string; // YYYY-MM-DD
+  uptime_pct: number;
+}
+
+export interface IncidentPoint {
+  week_start: string; // YYYY-MM-DD
+  count: number;
+}
+
+export interface FailurePattern {
+  pattern: string;
+  count: number;
+}
+
+export interface ReliabilityMetrics {
+  uptime_pct: number;
+  sla_target: number;
+  sla_status: SLAStatus;
+  mttd: number; // minutes
+  mttr: number; // minutes
+  incident_count: number;
+  deploy_count: number;
+  deploy_success_rate: number; // percent
+  change_failure_rate: number; // percent
+  prev_uptime_pct: number;
+  prev_mttd: number;
+  prev_mttr: number;
+  prev_deploy_success_rate: number;
+  uptime_trend: UptimePoint[];
+  incident_trend: IncidentPoint[];
+  top_failure_patterns: FailurePattern[];
+  days: number;
+}
+
+export interface ProjectReliabilityRow {
+  project_id: string;
+  project_name: string;
+  environment_id: string;
+  environment_name: string;
+  uptime_pct: number;
+  mttr: number;
+  incident_count: number;
+  sla_target: number;
+  sla_status: SLAStatus;
+}
+
+export interface OrgAnalytics {
+  metrics: ReliabilityMetrics;
+  breakdown: ProjectReliabilityRow[];
+}
+
+export interface ServiceSLA {
+  id: string;
+  org_id: string;
+  project_id: string;
+  environment_id: string;
+  target_uptime_pct: number;
+  measurement_window_days: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export type PostmortemStatus = "draft" | "published";
 
 export interface ActionItem {

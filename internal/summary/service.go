@@ -120,10 +120,13 @@ func (s *Service) GenerateDailySummary(ctx context.Context, orgID uuid.UUID, dat
 
 	// 8. Persist (idempotent per org+date).
 	contentJSON, _ := json.Marshal(sum)
+	// is_monthly = false: this is the daily briefing. Monthly operational health reports
+	// (internal/analytics) share this table with is_monthly = true; the unique index keys on
+	// all three columns (see addMonthlyFlagToDailySummaries), so the conflict target matches.
 	_, perr := s.db.Pool.Exec(ctx, `
-		INSERT INTO daily_summaries (org_id, summary_date, content_markdown, content_json, generated_at)
-		VALUES ($1, $2, $3, $4, NOW())
-		ON CONFLICT (org_id, summary_date) DO UPDATE SET
+		INSERT INTO daily_summaries (org_id, summary_date, content_markdown, content_json, generated_at, is_monthly)
+		VALUES ($1, $2, $3, $4, NOW(), false)
+		ON CONFLICT (org_id, summary_date, is_monthly) DO UPDATE SET
 		    content_markdown = EXCLUDED.content_markdown,
 		    content_json = EXCLUDED.content_json,
 		    generated_at = NOW()`,
@@ -254,7 +257,8 @@ func (s *Service) DeliverSummary(ctx context.Context, sum *DailySummary) {
 	}
 
 	_, _ = s.db.Pool.Exec(ctx,
-		`UPDATE daily_summaries SET delivered_slack = $1, delivered_email = $2 WHERE org_id = $3 AND summary_date = $4`,
+		`UPDATE daily_summaries SET delivered_slack = $1, delivered_email = $2
+		 WHERE org_id = $3 AND summary_date = $4 AND is_monthly = false`,
 		deliveredSlack, deliveredEmail, sum.OrgID, sum.Date.Format("2006-01-02"))
 }
 

@@ -698,7 +698,98 @@ type DailySummaryRecord struct {
 	GeneratedAt     time.Time      `json:"generated_at" db:"generated_at"`
 	DeliveredSlack  bool           `json:"delivered_slack" db:"delivered_slack"`
 	DeliveredEmail  bool           `json:"delivered_email" db:"delivered_email"`
+	IsMonthly       bool           `json:"is_monthly" db:"is_monthly"`
 	CreatedAt       time.Time      `json:"created_at" db:"created_at"`
+}
+
+// ─── Analytics / leadership dashboard ────────────────────────────────────────
+
+// SLA status constants — how an environment/scope is tracking against its uptime target.
+const (
+	SLAMeeting  = "meeting"
+	SLAAtRisk   = "at_risk"
+	SLABreached = "breached"
+)
+
+// ServiceSLA is the per-environment uptime target used by the analytics dashboard.
+type ServiceSLA struct {
+	ID                    uuid.UUID `json:"id" db:"id"`
+	OrgID                 uuid.UUID `json:"org_id" db:"org_id"`
+	ProjectID             uuid.UUID `json:"project_id" db:"project_id"`
+	EnvironmentID         uuid.UUID `json:"environment_id" db:"environment_id"`
+	TargetUptimePct       float64   `json:"target_uptime_pct" db:"target_uptime_pct"`
+	MeasurementWindowDays int       `json:"measurement_window_days" db:"measurement_window_days"`
+	CreatedAt             time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// UptimeSnapshot is one computed uptime row per environment per day (derived from
+// runtime.service_down/recovered operational events — ADR-015).
+type UptimeSnapshot struct {
+	ID              uuid.UUID `json:"id" db:"id"`
+	EnvironmentID   uuid.UUID `json:"environment_id" db:"environment_id"`
+	SnapshotDate    string    `json:"snapshot_date" db:"snapshot_date"` // YYYY-MM-DD
+	TotalMinutes    int       `json:"total_minutes" db:"total_minutes"`
+	DowntimeMinutes int       `json:"downtime_minutes" db:"downtime_minutes"`
+	UptimePct       float64   `json:"uptime_pct" db:"uptime_pct"`
+	IncidentCount   int       `json:"incident_count" db:"incident_count"`
+	CreatedAt       time.Time `json:"created_at" db:"created_at"`
+}
+
+// UptimePoint is a daily uptime data point for trend charts.
+type UptimePoint struct {
+	Date      string  `json:"date"` // YYYY-MM-DD
+	UptimePct float64 `json:"uptime_pct"`
+}
+
+// IncidentPoint is a weekly incident count for the incidents-per-week chart.
+type IncidentPoint struct {
+	WeekStart string `json:"week_start"` // YYYY-MM-DD (Monday)
+	Count     int    `json:"count"`
+}
+
+// FailurePattern is a recurring failure from project memory ranked by reference count.
+type FailurePattern struct {
+	Pattern string `json:"pattern"`
+	Count   int    `json:"count"`
+}
+
+// ReliabilityMetrics is the engineering-leadership view of reliability for an org (or a
+// single project) over a window. Computed by internal/analytics.
+type ReliabilityMetrics struct {
+	UptimePct         float64 `json:"uptime_pct"`
+	SLATarget         float64 `json:"sla_target"`
+	SLAStatus         string  `json:"sla_status"` // meeting | at_risk | breached
+	MTTD              float64 `json:"mttd"`       // minutes: first anomaly → acknowledged
+	MTTR              float64 `json:"mttr"`       // minutes: acknowledged → resolved
+	IncidentCount     int     `json:"incident_count"`
+	DeployCount       int     `json:"deploy_count"`
+	DeploySuccessRate float64 `json:"deploy_success_rate"` // percent
+	ChangeFailureRate float64 `json:"change_failure_rate"` // percent of deploys that caused an incident
+
+	// Previous-period scalars (same-length window immediately before) for trend arrows.
+	PrevUptimePct         float64 `json:"prev_uptime_pct"`
+	PrevMTTD              float64 `json:"prev_mttd"`
+	PrevMTTR              float64 `json:"prev_mttr"`
+	PrevDeploySuccessRate float64 `json:"prev_deploy_success_rate"`
+
+	UptimeTrend        []UptimePoint    `json:"uptime_trend"`
+	IncidentTrend      []IncidentPoint  `json:"incident_trend"`
+	TopFailurePatterns []FailurePattern `json:"top_failure_patterns"`
+	Days               int              `json:"days"`
+}
+
+// ProjectReliabilityRow is one row of the org dashboard's project/environment breakdown.
+type ProjectReliabilityRow struct {
+	ProjectID       uuid.UUID `json:"project_id"`
+	ProjectName     string    `json:"project_name"`
+	EnvironmentID   uuid.UUID `json:"environment_id"`
+	EnvironmentName string    `json:"environment_name"`
+	UptimePct       float64   `json:"uptime_pct"`
+	MTTR            float64   `json:"mttr"`
+	IncidentCount   int       `json:"incident_count"`
+	SLATarget       float64   `json:"sla_target"`
+	SLAStatus       string    `json:"sla_status"`
 }
 
 // ─── Trust levels & AI action approval ───────────────────────────────────────

@@ -426,6 +426,52 @@ graph TB
   (time/timezone/enabled) lives on the `organizations` row.
 - *(Supersedes the simpler Slack-only daily digest from the Slack feature.)*
 
+## Engineering leadership analytics (ADR-015)
+
+`internal/analytics` computes the leadership/reliability view — SLA & uptime, MTTD/MTTR,
+deploy success & change-failure rates, trends — and the monthly operational health report.
+
+```mermaid
+graph TB
+  POLL["monitor Poller"] -->|runtime.service_down / service_recovered| EV[(operational_events)]
+  SNAP["scheduler @daily 00:00 UTC\nanalytics:snapshot"] --> CUS["ComputeUptimeSnapshot per env"]
+  EV --> CUS
+  CUS -->|downtime/day, clamped| US[(uptime_snapshots)]
+  US --> METRICS["GetReliabilityMetrics\n(uptime, MTTD, MTTR, CFR, trends)"]
+  INC[(incidents)] --> METRICS
+  DEP[(deployments)] --> METRICS
+  MEM[(project_memory)] --> METRICS
+  SLA[(service_slas)] --> METRICS
+  METRICS -->|GET /orgs/:id/analytics| DASH["leadership dashboard\n/orgs/:id/analytics"]
+  METRICS -->|GET /projects/:id/analytics| PDASH["project analytics"]
+  MONTH["scheduler @monthly 1st 06:00 UTC\nanalytics:monthly"] --> GMR["GenerateMonthlyReport per org"]
+  METRICS --> GMR
+  GMR -->|Claude exec summary| REP[(daily_summaries is_monthly=true)]
+  GMR --> EMAIL["email org admins"]
+  GMR --> SLACK["Slack summary channel"]
+```
+
+- **Uptime is computed from operational events, not external probes (ADR-015):** a daily
+  job (`analytics:snapshot`) walks each environment's `runtime.service_down` /
+  `runtime.service_recovered` events and writes one `uptime_snapshots` row per env per day
+  (downtime clipped to the day; outages spanning midnight are split correctly). Idempotent
+  per `(environment, snapshot_date)`, so it recomputes yesterday + today on each run.
+- **`GetReliabilityMetrics(orgID, projectID?, days)`** aggregates snapshots (minutes-weighted
+  uptime) plus incidents (MTTD = first error event → `acknowledged_at`; MTTR =
+  `acknowledged_at` → `resolved_at`), deployments (success rate; change-failure rate =
+  deploys with an incident opened within 30 min of completion), recurring-failure patterns
+  from memory, and daily uptime / weekly incident trends. It also computes the previous
+  equal-length window for trend arrows. SLA status (`meeting`/`at_risk`/`breached`) compares
+  uptime to the configured `service_slas` target (default 99.9%).
+- **Monthly report** (`analytics:monthly`, 1st of month, or `POST /orgs/:id/reports/generate`):
+  reliability metrics + per-project breakdown + incident/postmortem/deploy counts + best-effort
+  cost → Claude executive summary (factual, no fluff) → stored in `daily_summaries` with
+  `is_monthly = true` → emailed to admins + posted to Slack. The report email links to
+  `/orgs/:id/analytics`.
+- **Seam:** `analytics.SlackPoster` (satisfied by `*slack.Service`, injected via `SetSlack`),
+  matching the daily-summary pattern. Per-environment SLA targets are set in the project
+  Settings tab (`PUT /projects/:id/environments/:envId/sla`).
+
 ## Slack integration
 
 Per-org Slack workspace connection (`internal/slack`, ADR-011) for notifications and

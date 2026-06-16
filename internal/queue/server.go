@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/ashborntechnologies-web/OpsPilot/internal/analytics"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/deploy"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/diagnosis"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/discovery"
@@ -30,6 +31,8 @@ const (
 	TaskSummaryTick     = "summary:tick"        // hourly — enqueue generation for orgs due now
 	TaskGenerateSummary = "summary:generate"    // generate + deliver one org's daily summary
 	TaskPostmortem      = "postmortem:generate" // generate a postmortem for a resolved incident
+	TaskSnapshotUptime  = "analytics:snapshot"  // daily — compute uptime snapshots for all envs
+	TaskMonthlyReport   = "analytics:monthly"   // monthly — generate the health report for all orgs
 )
 
 type GenerateSummaryPayload struct {
@@ -84,9 +87,10 @@ type Server struct {
 	discoverySvc  *discovery.Service
 	summarySvc    *summary.Service
 	postmortemSvc *postmortem.Service
+	analyticsSvc  *analytics.AnalyticsService
 }
 
-func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnosis.Service, discoverySvc *discovery.Service, summarySvc *summary.Service, postmortemSvc *postmortem.Service) *Server {
+func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnosis.Service, discoverySvc *discovery.Service, summarySvc *summary.Service, postmortemSvc *postmortem.Service, analyticsSvc *analytics.AnalyticsService) *Server {
 	srv := asynq.NewServer(
 		asynq.RedisClientOpt{Addr: redisURL},
 		asynq.Config{
@@ -106,6 +110,7 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 		discoverySvc:  discoverySvc,
 		summarySvc:    summarySvc,
 		postmortemSvc: postmortemSvc,
+		analyticsSvc:  analyticsSvc,
 	}
 
 	s.mux.HandleFunc(TaskDeploy, s.handleDeploy)
@@ -119,6 +124,8 @@ func NewServer(redisURL string, deploySvc *deploy.Service, diagnosisSvc *diagnos
 	s.mux.HandleFunc(TaskSummaryTick, s.handleSummaryTick)
 	s.mux.HandleFunc(TaskGenerateSummary, s.handleGenerateSummary)
 	s.mux.HandleFunc(TaskPostmortem, s.handlePostmortem)
+	s.mux.HandleFunc(TaskSnapshotUptime, s.handleSnapshotUptime)
+	s.mux.HandleFunc(TaskMonthlyReport, s.handleMonthlyReport)
 
 	return s
 }
@@ -298,6 +305,24 @@ func (s *Server) handlePostmortem(ctx context.Context, t *asynq.Task) error {
 	return err
 }
 
+// handleSnapshotUptime computes the daily uptime snapshot for every environment. Enqueued
+// daily by the Scheduler (midnight UTC).
+func (s *Server) handleSnapshotUptime(ctx context.Context, _ *asynq.Task) error {
+	if s.analyticsSvc == nil {
+		return nil
+	}
+	return s.analyticsSvc.SnapshotAllEnvironments(ctx)
+}
+
+// handleMonthlyReport generates the monthly operational health report for every org.
+// Enqueued monthly by the Scheduler (1st of the month).
+func (s *Server) handleMonthlyReport(ctx context.Context, _ *asynq.Task) error {
+	if s.analyticsSvc == nil {
+		return nil
+	}
+	return s.analyticsSvc.GenerateAllMonthlyReports(ctx)
+}
+
 // handleGenerateSummary generates + delivers one org's daily summary.
 func (s *Server) handleGenerateSummary(ctx context.Context, t *asynq.Task) error {
 	if s.summarySvc == nil {
@@ -412,6 +437,16 @@ func NewSummaryTickTask() *asynq.Task {
 	return asynq.NewTask(TaskSummaryTick, nil, asynq.Queue("default"), asynq.MaxRetry(0))
 }
 
+func NewSnapshotUptimeTask() *asynq.Task {
+	// Idempotent (upsert per env+date) — never retry; the next daily tick covers any miss.
+	return asynq.NewTask(TaskSnapshotUptime, nil, asynq.Queue("default"), asynq.MaxRetry(0))
+}
+
+func NewMonthlyReportTask() *asynq.Task {
+	// Idempotent (upsert per org+month) — never retry; manual regeneration is available.
+	return asynq.NewTask(TaskMonthlyReport, nil, asynq.Queue("default"), asynq.MaxRetry(0))
+}
+
 func NewGenerateSummaryTask(orgID string) (*asynq.Task, error) {
 	payload, err := json.Marshal(GenerateSummaryPayload{OrgID: orgID})
 	if err != nil {
@@ -468,6 +503,14 @@ func (sc *Scheduler) Start() error {
 	// Hourly daily-summary tick — enqueues generation for orgs whose configured delivery
 	// hour matches the current hour in their timezone.
 	if _, err := sc.s.Register("0 * * * *", NewSummaryTickTask()); err != nil {
+		return err
+	}
+	// Daily uptime snapshot at midnight UTC (analytics dashboard substrate — ADR-015).
+	if _, err := sc.s.Register("0 0 * * *", NewSnapshotUptimeTask()); err != nil {
+		return err
+	}
+	// Monthly operational health report on the 1st at 06:00 UTC (covers the prior month).
+	if _, err := sc.s.Register("0 6 1 * *", NewMonthlyReportTask()); err != nil {
 		return err
 	}
 	return sc.s.Start()

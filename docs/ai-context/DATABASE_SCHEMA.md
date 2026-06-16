@@ -247,6 +247,28 @@ One AI-generated morning briefing per org per day (`UNIQUE(org_id, summary_date)
 Delivery schedule lives on **`organizations`**: `summary_time` (TIME), `summary_timezone`
 (IANA), `summary_enabled` (bool) — added by `addSummaryConfigToOrganizations`.
 
+> **Monthly reports share this table** (`addMonthlyFlagToDailySummaries`): `is_monthly`
+> (BOOL, default false) distinguishes the AI daily briefing (false) from the monthly
+> operational health report (true, written by `internal/analytics`). The original
+> `UNIQUE(org_id, summary_date)` was replaced with a unique index on
+> `(org_id, summary_date, is_monthly)` so a monthly report and a daily summary can share a
+> date; both upserts target that 3-column conflict.
+
+### `service_slas`
+Per-environment uptime SLA target for the analytics dashboard (`createServiceSLAsTable`).
+`environment_id UNIQUE` (one SLA per env), with denormalized `org_id`/`project_id` for
+scoped aggregation. `target_uptime_pct` (default **99.9**), `measurement_window_days`
+(default 30). Set via the project Settings tab (`PUT /projects/:id/environments/:envId/sla`,
+engineer+); read with a 99.9% default when unset.
+
+### `uptime_snapshots`
+One computed uptime row per environment per day (`createUptimeSnapshotsTable`), derived from
+`runtime.service_down` / `runtime.service_recovered` operational events (ADR-015 — computed
+from events, **not** external probes). `total_minutes`, `downtime_minutes`, `uptime_pct`,
+`incident_count`. **`UNIQUE(environment_id, snapshot_date)`** makes the daily job idempotent
+(upsert). Written by `analytics.ComputeUptimeSnapshot`; aggregated (minutes-weighted) into
+the dashboard's reliability metrics and uptime trend.
+
 ### `conversations`
 Chat history per project. `role` (`user`/`assistant`), `message`, classified `intent`,
 `metadata` (JSONB). Source for the intent-classifier training export.

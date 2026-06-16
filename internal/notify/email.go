@@ -116,6 +116,15 @@ func (e *EmailService) SendDailySummary(ctx context.Context, toEmail, orgName, d
 	return e.send(ctx, toEmail, subject, body)
 }
 
+// SendMonthlyReport emails the monthly operational health report's executive summary with a
+// link to the analytics dashboard. Sent to org admins.
+func (e *EmailService) SendMonthlyReport(ctx context.Context, toEmail, orgName, month, summary, url string) error {
+	subject := fmt.Sprintf("📊 OpsPilot monthly health report — %s (%s)", orgName, month)
+	detail := fmt.Sprintf("Operational health for <strong>%s</strong> · %s", html.EscapeString(orgName), html.EscapeString(month))
+	body := e.renderBody("#4f46e5", "Monthly operational health report", detail, summary, url, "View full dashboard")
+	return e.send(ctx, toEmail, subject, body)
+}
+
 // renderBody produces a minimal HTML email in the OpsPilot zinc/indigo theme.
 func (e *EmailService) renderBody(accentColor, headline, detail, summary, linkURL, linkLabel string) string {
 	var b strings.Builder

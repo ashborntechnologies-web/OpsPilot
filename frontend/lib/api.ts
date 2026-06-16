@@ -620,6 +620,44 @@ export function rejectIncidentAction(token: string, incidentId: string, actionId
   return request<{ message: string; status: string }>(`/incidents/${incidentId}/actions/${actionId}/reject`, token, { method: "POST" });
 }
 
+// ---- Analytics / leadership dashboard --------------------------------------------
+
+import type { OrgAnalytics, ReliabilityMetrics, UptimePoint, ServiceSLA } from "@/types/api";
+
+export function getOrgAnalytics(token: string, orgId: string, days = 30) {
+  return request<OrgAnalytics>(`/orgs/${orgId}/analytics?days=${days}`, token);
+}
+
+export function getProjectAnalytics(token: string, projectId: string, days = 30) {
+  return request<{ metrics: ReliabilityMetrics }>(`/projects/${projectId}/analytics?days=${days}`, token);
+}
+
+export function getProjectUptime(token: string, projectId: string, days = 90) {
+  return request<{ uptime: UptimePoint[]; days: number }>(`/projects/${projectId}/uptime?days=${days}`, token);
+}
+
+export function getEnvironmentSLA(token: string, projectId: string, envId: string) {
+  return request<ServiceSLA>(`/projects/${projectId}/environments/${envId}/sla`, token);
+}
+
+export function setEnvironmentSLA(
+  token: string, projectId: string, envId: string,
+  body: { target_uptime_pct: number; measurement_window_days?: number }
+) {
+  return request<{ message: string }>(`/projects/${projectId}/environments/${envId}/sla`, token, {
+    method: "PUT", body: JSON.stringify(body),
+  });
+}
+
+export function listOrgReports(token: string, orgId: string) {
+  return request<DailySummaryRecord[]>(`/orgs/${orgId}/reports`, token);
+}
+
+export function generateOrgReport(token: string, orgId: string, month?: string) {
+  const suffix = month ? `?month=${month}` : "";
+  return request<{ markdown_content: string }>(`/orgs/${orgId}/reports/generate${suffix}`, token, { method: "POST" });
+}
+
 // ---- Postmortems ----------------------------------------------------------------
 
 import type { Postmortem, ActionItem } from "@/types/api";

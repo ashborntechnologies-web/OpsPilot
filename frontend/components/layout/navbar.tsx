@@ -5,7 +5,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import useSWR from "swr";
 import { UserButton, useAuth } from "@clerk/nextjs";
-import { Rocket, CheckCircle2, ChevronDown, Building2, Check, Siren, ShieldCheck, FileText } from "lucide-react";
+import { Rocket, CheckCircle2, ChevronDown, Building2, Check, Siren, ShieldCheck, FileText, Activity } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from "@/components/ui/dialog";
@@ -147,6 +147,15 @@ export function Navbar() {
               </span>
             )}
           </Link>
+          {activeOrg && (
+            <Link
+              href={`/orgs/${activeOrg.id}/analytics`}
+              className={cn("hidden md:inline-flex items-center gap-1", path.includes("/analytics") ? "text-foreground font-medium" : "hover:text-foreground")}
+            >
+              <Activity className="h-3.5 w-3.5" />
+              Analytics
+            </Link>
+          )}
           <Link
             href="/orgs/postmortems"
             className={cn("hidden md:inline-flex items-center gap-1", path.startsWith("/orgs/postmortems") || path.startsWith("/postmortems") ? "text-foreground font-medium" : "hover:text-foreground")}

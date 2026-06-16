@@ -224,6 +224,23 @@ account/ARN for the bootstrap template + same-account AssumeRole.
   `TaskGenerateSummary` → `GenerateAndDeliver`). Reads project memory, incidents, alerts,
   deployments. (Replaced the simpler `slack.PostDailySummaries` digest.)
 
+## `internal/analytics` — engineering leadership dashboard
+- **Purpose:** SLA/uptime tracking, MTTD/MTTR, reliability trends, and the monthly
+  operational health report. See ADR-015 and the ARCHITECTURE analytics flow.
+- **Files:** `service.go` (`ComputeUptimeSnapshot` + `SnapshotAllEnvironments`;
+  `GetReliabilityMetrics` with per-metric helpers `windowUptime`/`mttd`/`mttr`/`deployStats`/
+  `uptimeTrend`/`incidentTrend`/`topFailurePatterns`; `GetProjectBreakdown`;
+  `GetUptimeHistory`; `GetSLA`/`UpsertSLA`; `SLAStatus`), `report.go` (`GenerateMonthlyReport`
+  + `GenerateAllMonthlyReports` + Claude `executiveSummary` + markdown render + email/Slack
+  delivery), `handlers.go` (org/project analytics, uptime history, SLA get/set, list/generate
+  reports).
+- **Key type:** `AnalyticsService` (deps: db, llm, email, awsSvc, frontendURL; `SlackPoster`
+  via `SetSlack`). Uptime is computed from `runtime.service_down`/`service_recovered`
+  operational events (idempotent `uptime_snapshots` upsert), never external probes.
+- **Consumed by:** `queue` (`analytics:snapshot` daily, `analytics:monthly` on the 1st).
+  Writes `uptime_snapshots`, `service_slas`, and monthly rows in `daily_summaries`
+  (`is_monthly = true`). **Depends on:** `llm`, `notify`, `aws` (cost), `models`.
+
 ## `internal/notify` — email
 - `EmailService` over SMTP+STARTTLS. `SendAlert`, `SendDeployResult`. A logging no-op
   when SMTP env is unset (rest of platform never nil-checks).
@@ -263,7 +280,9 @@ account/ARN for the bootstrap template + same-account AssumeRole.
 - **`Server`** handlers: `handleDeploy`, `handleProvision`, `handleRollback`,
   `handleDeleteProject`, `handleDiagnose`, `handleWatchdog`, `handleGenerateSummary`,
   `handlePostmortem` (`postmortem:generate` → `postmortem.GeneratePostmortem`, `MaxRetry(1)`,
-  idempotent). **`Client`**: `Enqueue*` methods (implements `deploy.Enqueuer`,
+  idempotent), `handleSnapshotUptime` (`analytics:snapshot`, daily 00:00 UTC →
+  `analytics.SnapshotAllEnvironments`), `handleMonthlyReport` (`analytics:monthly`, 1st 06:00
+  UTC → `analytics.GenerateAllMonthlyReports`). **`Client`**: `Enqueue*` methods (implements `deploy.Enqueuer`,
   `events.DiagnosisEnqueuer`, and `incidents.PostmortemEnqueuer` via
   `EnqueueGeneratePostmortem`) + Redis pending-mutation store
   (`SetPendingMutation`/`GetPendingMutation`). **`Scheduler`**: periodic watchdog

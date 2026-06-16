@@ -31,6 +31,7 @@ import {
 } from "@/lib/api";
 import { ActionRow } from "@/components/trust/actions";
 import { EnvTrustSettings } from "@/components/trust/env-trust-settings";
+import { EnvSLASettings } from "@/components/analytics/env-sla-settings";
 import { StatusSidebar } from "@/components/project/status-sidebar";
 import { AlertsPanel } from "@/components/project/alerts-panel";
 import { useActiveOrg } from "@/lib/use-org";
@@ -2445,6 +2446,12 @@ export default function ProjectPage() {
               <div>
                 <h3 className="text-sm font-semibold mb-2">AI Trust Levels</h3>
                 <EnvTrustSettings projectId={id} environments={environments} canEdit={isAdmin} />
+              </div>
+
+              {/* SLA targets per environment (feeds the analytics dashboard) */}
+              <div>
+                <h3 className="text-sm font-semibold mb-2">SLA Targets</h3>
+                <EnvSLASettings projectId={id} environments={environments} canEdit={canAct} />
               </div>
 
               <Card className="border-red-200">

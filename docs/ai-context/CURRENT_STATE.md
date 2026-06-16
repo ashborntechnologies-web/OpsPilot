@@ -92,6 +92,22 @@ Status is derived from the code on `main`, not from plans.
   exportable as markdown or print-ready HTML (Save-as-PDF). Generation also writes the fix
   to project memory (`successful_fix`) so future diagnoses improve. Navbar "Postmortems" link.
 
+**Engineering leadership dashboard**
+- `/orgs/[orgId]/analytics`: org-wide reliability — average uptime (color-coded vs SLA),
+  MTTR & MTTD (with trend arrows vs the previous period), deploy success rate; a daily
+  uptime line chart with an SLA reference line + a 12-week incident bar chart (dependency-free
+  inline SVG); a per-project/environment breakdown table with SLA status badges
+  (Meeting/At Risk/Breached); and top recurring failure patterns from project memory.
+- Uptime is computed from `runtime.service_down`/`service_recovered` operational events
+  (ADR-015) by a daily Asynq snapshot job → `uptime_snapshots`. MTTD = first error event →
+  acknowledged; MTTR = acknowledged → resolved; change-failure rate = deploys with an
+  incident within 30 min of completion. Per-environment SLA targets (default 99.9%) set in
+  the project Settings tab. Also exposed per-project (`GET /projects/:id/analytics`).
+- **Monthly operational health report:** generated for every org on the 1st (and on demand,
+  admin) — Claude executive summary + reliability/cost/deploy/incident metrics, stored
+  (`daily_summaries.is_monthly`), emailed to admins, posted to Slack; links back to the
+  dashboard. Navbar "Analytics" link.
+
 **Infrastructure discovery**
 - Scans connected AWS accounts for existing resources (ECS services/clusters, RDS,
   ElastiCache, Lambda, S3, ALBs, SQS) so users onboard without migration. Parallel,
@@ -165,6 +181,12 @@ Status is derived from the code on `main`, not from plans.
 - Email requires SMTP config; without it, notifications are logged no-ops.
 - **Billing is still per-user** (`CheckProjectLimit`/AI metering key off `user_id`), not
   per-org — a known seam now that projects are org-owned.
+- **Analytics charts are dependency-free inline SVG** (`components/analytics/charts.tsx`),
+  not recharts (which is not installed) — they cover the uptime line + SLA reference line and
+  the weekly incident bars, but have no interactive tooltips/zoom. Uptime accuracy depends on
+  the monitor Poller emitting `service_down`/`service_recovered` events; environments with no
+  events report 100% (no observed downtime). The monthly report's cost line is best-effort
+  (first account via Cost Explorer) and omitted when unavailable.
 - **Daily-summary cost-change is stubbed** — `summary.costChange` returns 0 (the
   `CostChangePct` field + 7d-vs-prior-7d Cost Explorer comparison are not yet implemented;
   it's omitted from output when 0). Everything else in the summary is real DB data.

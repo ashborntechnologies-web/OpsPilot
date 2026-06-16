@@ -21,7 +21,8 @@ func (s *Service) HandleListSummaries(c *gin.Context) {
 	rows, err := s.db.Pool.Query(c.Request.Context(), `
 		SELECT id, org_id, summary_date::text, content_markdown, content_json,
 		       generated_at, delivered_slack, delivered_email, created_at
-		FROM daily_summaries WHERE org_id = $1 ORDER BY summary_date DESC LIMIT $2`, orgID, limit)
+		FROM daily_summaries WHERE org_id = $1 AND is_monthly = false
+		ORDER BY summary_date DESC LIMIT $2`, orgID, limit)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list summaries"})
 		return
@@ -36,7 +37,8 @@ func (s *Service) HandleLatestSummary(c *gin.Context) {
 	rows, err := s.db.Pool.Query(c.Request.Context(), `
 		SELECT id, org_id, summary_date::text, content_markdown, content_json,
 		       generated_at, delivered_slack, delivered_email, created_at
-		FROM daily_summaries WHERE org_id = $1 ORDER BY summary_date DESC LIMIT 1`, orgID)
+		FROM daily_summaries WHERE org_id = $1 AND is_monthly = false
+		ORDER BY summary_date DESC LIMIT 1`, orgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load summary"})
 		return

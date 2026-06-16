@@ -115,6 +115,9 @@ func RunMigrations(db *DB) error {
 		addTrustLevelToEnvironments,
 		createAIActionsTable,
 		createPostmortemsTable,
+		addMonthlyFlagToDailySummaries,
+		createServiceSLAsTable,
+		createUptimeSnapshotsTable,
 	}
 
 	for _, m := range migrations {
@@ -693,6 +696,51 @@ CREATE TABLE IF NOT EXISTS postmortems (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_postmortems_org ON postmortems(org_id, status, created_at DESC);`
+
+// addMonthlyFlagToDailySummaries lets daily_summaries also hold monthly operational health
+// reports (is_monthly = true). The original UNIQUE(org_id, summary_date) is replaced with a
+// unique index that also keys on is_monthly, so a monthly report and a daily summary can
+// share a date. The summary upsert's ON CONFLICT target is updated to match (3 columns).
+const addMonthlyFlagToDailySummaries = `
+ALTER TABLE daily_summaries ADD COLUMN IF NOT EXISTS is_monthly BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE daily_summaries DROP CONSTRAINT IF EXISTS daily_summaries_org_id_summary_date_key;
+CREATE UNIQUE INDEX IF NOT EXISTS daily_summaries_org_date_monthly_uniq
+    ON daily_summaries(org_id, summary_date, is_monthly);`
+
+// createServiceSLAsTable stores per-environment SLA targets used by the leadership/
+// analytics dashboard. One row per environment (UNIQUE); target_uptime_pct defaults to the
+// industry-common 99.9% ("three nines"). org_id/project_id are denormalized for scoped
+// aggregation queries.
+const createServiceSLAsTable = `
+CREATE TABLE IF NOT EXISTS service_slas (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id                  UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    project_id              UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    environment_id          UUID NOT NULL UNIQUE REFERENCES environments(id) ON DELETE CASCADE,
+    target_uptime_pct       FLOAT NOT NULL DEFAULT 99.9,
+    measurement_window_days INT NOT NULL DEFAULT 30,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_service_slas_org ON service_slas(org_id);`
+
+// createUptimeSnapshotsTable stores one computed uptime row per environment per day,
+// derived from runtime.service_down / runtime.service_recovered operational events
+// (ADR-015 — uptime is computed from events, not external probes). Idempotent per
+// (environment, date) via the UNIQUE constraint so the daily job can recompute safely.
+const createUptimeSnapshotsTable = `
+CREATE TABLE IF NOT EXISTS uptime_snapshots (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    environment_id   UUID NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+    snapshot_date    DATE NOT NULL,
+    total_minutes    INT NOT NULL DEFAULT 0,
+    downtime_minutes INT NOT NULL DEFAULT 0,
+    uptime_pct       FLOAT NOT NULL DEFAULT 100,
+    incident_count   INT NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (environment_id, snapshot_date)
+);
+CREATE INDEX IF NOT EXISTS idx_uptime_snapshots_env ON uptime_snapshots(environment_id, snapshot_date DESC);`
 
 // createIncidentActionsTable stores remediation actions proposed during an incident
 // (by the AI or a human) and their approval lifecycle.

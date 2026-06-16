@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ashborntechnologies-web/OpsPilot/internal/analytics"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/auth"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/aws"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/billing"
@@ -305,6 +306,11 @@ func main() {
 	summarySvc.SetSlack(slackSvc)
 	summarySvc.SetEnqueuer(queueClient)
 
+	// Engineering leadership dashboard — SLA/uptime, MTTD/MTTR, reliability trends, and the
+	// monthly operational health report (ADR-015).
+	analyticsSvc := analytics.NewService(db, llm.New(os.Getenv("ANTHROPIC_API_KEY")), emailSvc, awsSvc, os.Getenv("FRONTEND_URL"))
+	analyticsSvc.SetSlack(slackSvc)
+
 	// Init job queue server
 	queueServer := queue.NewServer(
 		os.Getenv("REDIS_URL"),
@@ -313,6 +319,7 @@ func main() {
 		discoverySvc,
 		summarySvc,
 		postmortemSvc,
+		analyticsSvc,
 	)
 	go queueServer.Start()
 	defer queueServer.Stop()
@@ -446,6 +453,11 @@ func main() {
 		org.GET("/postmortems", postmortemSvc.HandleListOrg)       // published postmortem library (SOC2)
 		org.GET("/actions", trustSvc.HandleListOrgActions)         // pending AI-action approvals
 
+		// Engineering leadership dashboard — org-wide reliability metrics + monthly reports.
+		org.GET("/analytics", analyticsSvc.HandleOrgAnalytics)
+		org.GET("/reports", analyticsSvc.HandleListReports)
+		org.POST("/reports/generate", middleware.RequireRole(models.RoleAdmin), analyticsSvc.HandleGenerateReport)
+
 		// Slack integration — read for any member; install/config/disconnect are admin.
 		org.GET("/slack", slackSvc.HandleGetIntegration)
 		org.GET("/slack/channels", slackSvc.HandleListChannels)
@@ -499,6 +511,12 @@ func main() {
 		proj.GET("/environments/:envId/trust", trustSvc.HandleGetTrust)
 		proj.PATCH("/environments/:envId/trust", requireAdmin, trustSvc.HandleUpdateTrust)
 		proj.GET("/conversation/history", conversationSvc.HandleHistory)
+
+		// Project-level analytics (leadership dashboard) + per-environment SLA config.
+		proj.GET("/analytics", analyticsSvc.HandleProjectAnalytics)
+		proj.GET("/uptime", analyticsSvc.HandleProjectUptime)
+		proj.GET("/environments/:envId/sla", analyticsSvc.HandleGetSLA)
+		proj.PUT("/environments/:envId/sla", requireEngineer, analyticsSvc.HandleSetSLA)
 
 		// Engineer actions — deploy, rollback, scale, env vars, alerts, chat, webhooks.
 		proj.POST("/environments/:envId/deploy", requireEngineer, deployRL.Middleware(), deploySvc.HandleDeploy)

@@ -16,6 +16,50 @@ Format:
 
 ---
 
+## 2026-06-16 — Engineering leadership dashboard (SLA/uptime, MTTD/MTTR, monthly report)
+- **What:** A leadership/reliability dashboard plus a monthly operational health report —
+  the VP/CTO-facing view of the platform.
+  - **New `internal/analytics` package:** `ComputeUptimeSnapshot`/`SnapshotAllEnvironments`
+    (daily, from `runtime.service_down`/`service_recovered` events → `uptime_snapshots`,
+    idempotent per env/day, midnight-spanning outages split correctly);
+    `GetReliabilityMetrics` (minutes-weighted uptime, SLA status, MTTD = first error event →
+    acknowledged, MTTR = acknowledged → resolved, deploy success rate, change-failure rate =
+    deploys with an incident within 30 min of completion, daily uptime + 12-week incident
+    trends, top failure patterns from memory, previous-period scalars for trend arrows);
+    `GetProjectBreakdown`; `GetUptimeHistory`; `GetSLA`/`UpsertSLA`; `GenerateMonthlyReport`
+    /`GenerateAllMonthlyReports` (Claude executive summary → `daily_summaries` is_monthly,
+    email admins + Slack).
+  - **Data model:** `service_slas` (per-env target, default 99.9%), `uptime_snapshots`
+    (per env/day), `daily_summaries.is_monthly` (+ unique index swapped to
+    `(org_id, summary_date, is_monthly)`; daily-summary upsert conflict target updated to
+    match). New models: `ServiceSLA`, `UptimeSnapshot`, `ReliabilityMetrics`, `UptimePoint`,
+    `IncidentPoint`, `FailurePattern`, `ProjectReliabilityRow`; SLA status consts.
+  - **queue:** `analytics:snapshot` (daily 00:00 UTC) + `analytics:monthly` (1st 06:00 UTC)
+    tasks/handlers/scheduler; `NewServer` takes `analyticsSvc`.
+  - **notify:** `SendMonthlyReport` email. **summary:** daily list/latest now filter
+    `is_monthly = false`.
+  - **HTTP:** `GET /orgs/:id/analytics`, `GET /orgs/:id/reports`,
+    `POST /orgs/:id/reports/generate` (admin); `GET /projects/:id/analytics`,
+    `GET /projects/:id/uptime`, `GET|PUT /projects/:id/environments/:envId/sla`.
+  - **Frontend:** `/orgs/[orgId]/analytics` dashboard (4 stat cards with trend arrows, two
+    dependency-free SVG charts — uptime line with SLA reference line + weekly incident bars —
+    project breakdown table, top failure patterns); per-environment SLA-target inputs in the
+    project Settings tab; navbar "Analytics" link. Types + API client.
+- **Files:** `internal/analytics/{service,report,handlers}.go`, `internal/notify/email.go`,
+  `internal/summary/{service,handlers}.go`, `internal/queue/server.go`, `cmd/api/main.go`,
+  `pkg/models/{db,types}.go`, `frontend/{types/api.ts,lib/api.ts,lib/analytics.ts}`,
+  `frontend/components/analytics/{charts.tsx,env-sla-settings.tsx}`,
+  `frontend/app/orgs/[orgId]/analytics/page.tsx`, `frontend/components/layout/navbar.tsx`,
+  `frontend/app/projects/[id]/page.tsx`.
+- **Why:** give engineering leadership a durable, factual reliability view (SLA, MTTD/MTTR,
+  trends) and a monthly report — the surface that keeps VPs/CTOs engaged — reusing the
+  operational-event substrate rather than standing up external probing.
+- **Assumptions changed:** `daily_summaries` is no longer one-row-per-org-per-day; it now
+  also holds monthly reports keyed by `is_monthly`. Uptime is defined as ECS/ALB health per
+  the monitor's events (ADR-015), not external reachability.
+- **Docs updated:** ARCHITECTURE, BACKEND, DATABASE_SCHEMA, API_CONTRACTS, CURRENT_STATE,
+  DECISIONS (ADR-015), CHANGELOG_AI.
+
 ## 2026-06-15 — Automated postmortem generation (async)
 - **What:** When an incident is resolved, OpsPilot generates a structured postmortem from
   the incident data, makes it editable, publishable to an org library, and exportable.
