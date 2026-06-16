@@ -196,8 +196,12 @@ account/ARN for the bootstrap template + same-account AssumeRole.
   pure Go — no AI) → `runtime.log_anomaly` / crash-loop events.
 - **`AlertEngine`:** `EvaluateEvent` maps events → deduplicated `alerts` (AI summary via
   `generateSummary`), respects snoozes, auto-resolves on recovery, broadcasts WS +
-  emails owner. **HTTP:** `HandleListAlerts`, `HandleSnooze`, `HandleResolve`.
-- **Depends on:** `aws`, `events`, `llm`, `notify`, `ws`, `models`.
+  emails/Slacks owner. **On-call quiet hours (ADR-016, `oncall.go`):** `notifyOwner` calls
+  `CheckQuietHours(orgID)` (`alerts.go`) — during quiet hours, warn alerts are suppressed
+  from email/Slack (DB row + WS broadcast still happen); error alerts always notify with a
+  Slack note. **HTTP:** `HandleListAlerts`, `HandleSnooze`, `HandleResolve`,
+  `HandleGetOncallSchedule`/`HandlePutOncallSchedule` (org-tier, `oncall.go`).
+- **Depends on:** `aws`, `events`, `llm`, `notify`, `ws`, `middleware`, `models`.
 
 ## `internal/slack` — Slack integration
 - **Purpose:** per-org Slack notifications (alerts, deploys, daily digest) + `/opspilot`

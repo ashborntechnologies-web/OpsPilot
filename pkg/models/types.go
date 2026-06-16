@@ -792,6 +792,20 @@ type ProjectReliabilityRow struct {
 	SLAStatus       string    `json:"sla_status"`
 }
 
+// OncallSchedule is an org's quiet-hours configuration. Times are stored as "HH:MM"
+// strings (rendered from the TIME columns); quiet_days holds lowercase weekday names.
+type OncallSchedule struct {
+	ID                     uuid.UUID `json:"id" db:"id"`
+	OrgID                  uuid.UUID `json:"org_id" db:"org_id"`
+	Timezone               string    `json:"timezone" db:"timezone"`
+	QuietHoursStart        string    `json:"quiet_hours_start" db:"quiet_hours_start"` // "HH:MM"
+	QuietHoursEnd          string    `json:"quiet_hours_end" db:"quiet_hours_end"`     // "HH:MM"
+	QuietDays              []string  `json:"quiet_days" db:"quiet_days"`
+	EscalationAfterMinutes int       `json:"escalation_after_minutes" db:"escalation_after_minutes"`
+	CreatedAt              time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at" db:"updated_at"`
+}
+
 // ─── Trust levels & AI action approval ───────────────────────────────────────
 
 // Trust level constants — how much autonomy AI-initiated actions have per environment.

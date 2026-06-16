@@ -75,6 +75,8 @@ Frontend client: [`frontend/lib/api.ts`](../../frontend/lib/api.ts). Errors are
 | GET | `/orgs/:orgId/analytics?days=30` | — | `{metrics: ReliabilityMetrics, breakdown: ProjectReliabilityRow[]}` (org-wide leadership dashboard) | member |
 | GET | `/orgs/:orgId/reports` | — | `DailySummaryRecord[]` (monthly health reports, `is_monthly=true`) | member |
 | POST | `/orgs/:orgId/reports/generate?month=YYYY-MM` | — | `MonthlyReport` (generate + email admins; month defaults to current) | **admin** |
+| GET | `/orgs/:orgId/oncall-schedule` | — | `OncallSchedule` (defaults when unset) | member |
+| PUT | `/orgs/:orgId/oncall-schedule` | `{timezone, quiet_hours_start:"HH:MM", quiet_hours_end:"HH:MM", quiet_days:[], escalation_after_minutes?}` | `{message}` (create or replace) | **admin** |
 | GET | `/orgs/:orgId/summaries?limit=30` | — | `DailySummaryRecord[]` (daily only, `is_monthly=false`) | member |
 | GET | `/orgs/:orgId/summaries/latest` | — | `{summary}` (most recent or null) | member |
 | POST | `/orgs/:orgId/summaries/generate` | — | `DailySummary` (generate + deliver today; testing) | **admin** |

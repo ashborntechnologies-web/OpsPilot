@@ -622,7 +622,7 @@ export function rejectIncidentAction(token: string, incidentId: string, actionId
 
 // ---- Analytics / leadership dashboard --------------------------------------------
 
-import type { OrgAnalytics, ReliabilityMetrics, UptimePoint, ServiceSLA } from "@/types/api";
+import type { OrgAnalytics, ReliabilityMetrics, UptimePoint, ServiceSLA, OncallSchedule } from "@/types/api";
 
 export function getOrgAnalytics(token: string, orgId: string, days = 30) {
   return request<OrgAnalytics>(`/orgs/${orgId}/analytics?days=${days}`, token);
@@ -651,6 +651,19 @@ export function setEnvironmentSLA(
 
 export function listOrgReports(token: string, orgId: string) {
   return request<DailySummaryRecord[]>(`/orgs/${orgId}/reports`, token);
+}
+
+export function getOncallSchedule(token: string, orgId: string) {
+  return request<OncallSchedule>(`/orgs/${orgId}/oncall-schedule`, token);
+}
+
+export function putOncallSchedule(
+  token: string, orgId: string,
+  body: { timezone: string; quiet_hours_start: string; quiet_hours_end: string; quiet_days: string[]; escalation_after_minutes?: number }
+) {
+  return request<{ message: string }>(`/orgs/${orgId}/oncall-schedule`, token, {
+    method: "PUT", body: JSON.stringify(body),
+  });
 }
 
 export function generateOrgReport(token: string, orgId: string, month?: string) {

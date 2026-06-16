@@ -362,6 +362,18 @@ export interface ServiceSLA {
   updated_at: string;
 }
 
+export interface OncallSchedule {
+  id?: string;
+  org_id: string;
+  timezone: string;
+  quiet_hours_start: string; // "HH:MM"
+  quiet_hours_end: string; // "HH:MM"
+  quiet_days: string[]; // lowercase weekday names
+  escalation_after_minutes: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
 export type PostmortemStatus = "draft" | "published";
 
 export interface ActionItem {

@@ -381,16 +381,30 @@ graph TB
   EVSVC -->|AlertEvaluator| AE["monitor.AlertEngine.EvaluateEvent"]
   EVSVC -->|DiagnosisEnqueuer| Q["Asynq: auto-diagnose on runtime failure"]
   AE -->|dedup + AI summary| ALERTS[(alerts)]
-  AE --> WSB["WS: alert / alert_resolved"]
-  AE --> EMAIL["notify: email owner"]
+  AE --> WSB["WS: alert / alert_resolved (always)"]
+  AE -->|CheckQuietHours| QH{"quiet hours?\n(oncall_schedules)"}
+  QH -->|no, or error severity| EMAIL["notify: email + Slack"]
+  QH -->|yes & warn severity| SUPPRESS["suppressed (DB + WS only)"]
   REC["recovery event"] --> AE
   AE -->|resolve matching open alerts| ALERTS
 ```
 
 `events.Service` is the hub: every `Emit` fans out to the AlertEngine (events →
 deduplicated, AI-summarized alerts, with snooze + auto-resolve on recovery) and the
-diagnosis enqueuer (runtime failures auto-trigger a diagnosis job). Alerts reach the
-user via WebSocket and email (`internal/notify`, a no-op without SMTP).
+diagnosis enqueuer (runtime failures auto-trigger a diagnosis job). The two wiring seams
+this depends on are set up in `main.go`: `eventSvc.SetDiagnosisEnqueuer(queueClient)` (so
+runtime failures enqueue auto-diagnosis) and `go logScanner.Start()` (so CloudWatch log
+anomalies emit events) — both confirmed wired as of 2026-06-16.
+
+- **On-call quiet hours (ADR-016):** before emailing/Slacking, `notifyOwner` calls
+  `CheckQuietHours(orgID)` (evaluates `oncall_schedules` in the org's timezone — quiet hours
+  window, with overnight wrap, or a quiet weekday). During quiet hours, **warn**-severity
+  alerts are suppressed from email + Slack (the `alerts` row and the `alert` WS broadcast
+  still happen, so an engineer at their desk sees it), logged as
+  `alert suppressed during quiet hours: <id>`. **Error**-severity alerts always break through
+  (email + Slack), with `⚠️ Sent outside quiet hours due to error severity` appended to the
+  Slack message. No schedule configured ⇒ never quiet (fail open). Configured at
+  `/settings/organization`.
 
 ---
 

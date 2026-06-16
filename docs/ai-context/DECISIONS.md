@@ -349,6 +349,53 @@ users). `ai_actions` coexists with the advisory `incident_actions`.
 
 ---
 
+## ADR-016 — On-call quiet hours: warn alerts suppressed, error alerts always break through
+**Date:** 2026-06-16 · **Status:** Accepted
+
+**Decision.** Each org can configure an on-call schedule (`oncall_schedules`: timezone,
+quiet-hours window, quiet days). During quiet hours, **warn**-severity alert notifications
+(email + Slack) are suppressed, while the `alerts` row and the real-time `alert` WebSocket
+broadcast still happen. **Error**-severity alerts always notify regardless of the schedule,
+with a note appended to the Slack message. No schedule configured ⇒ never quiet (fail open).
+
+**Context.** Continuous monitoring fires alerts at all hours. Many are warn-level (a brief
+latency blip, tasks momentarily degraded) that don't justify waking someone at 3am — but
+some are error-level (service down) that absolutely do. Paging on everything trains people to
+mute notifications, so the real outage gets ignored too. The goal is to cut nighttime noise
+without ever silencing a real outage.
+
+**Why severity is the breakthrough criterion.** Severity is already assigned at event
+emission (`runtime.service_down` = error; `tasks_degraded`/`high_latency` = warn) and flows
+onto the alert, so it's a signal we already trust and that drives the rest of the system
+(diagnosis, health scores). Using it for paging keeps one consistent notion of "how bad is
+this" rather than inventing a second priority axis. A service being **down** is the canonical
+"wake me up" event; the warn tier is exactly the "can wait until morning" set. So error
+breaking through quiet hours is the whole point — quiet hours suppress *noise*, never
+*outages*.
+
+**Why still write + broadcast warn alerts during quiet hours.** Quiet hours target *push*
+notifications (email/Slack), not the record. An engineer who happens to be at their desk
+should still see the alert appear live in the dashboard, and the history must be complete for
+later review and the analytics dashboard. So suppression is strictly about not *paging* —
+the alert still exists and streams over WebSocket.
+
+**Why fail open.** If the schedule can't be loaded (no row, DB error, bad timezone), the
+safe default is to notify — a missed page is worse than an extra one. `CheckQuietHours`
+returns false on any error.
+
+**Why org-level, not per-environment or per-user.** Quiet hours model a *team's* working
+rhythm, which is an org-wide property; per-environment/per-user schedules add configuration
+burden without a clear use case at this stage (`escalation_after_minutes` is stored for a
+future escalation-policy pass but not yet acted on). Evaluated in the org's timezone so a
+distributed team sets it once.
+
+**Impact.** New `oncall_schedules` table; `monitor.CheckQuietHours` + quiet-hours branch in
+`notifyOwner`; `GET`/`PUT /orgs/:orgId/oncall-schedule`; On-Call Schedule section in
+`/settings/organization`. Slack `PostAlert` is unchanged — the error-severity note is
+appended to a copy of the alert's summary for the Slack post only.
+
+---
+
 ## ADR-015 — Uptime computed from operational events, not external probes
 **Date:** 2026-06-16 · **Status:** Accepted
 

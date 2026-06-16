@@ -118,6 +118,7 @@ func RunMigrations(db *DB) error {
 		addMonthlyFlagToDailySummaries,
 		createServiceSLAsTable,
 		createUptimeSnapshotsTable,
+		createOncallSchedulesTable,
 	}
 
 	for _, m := range migrations {
@@ -741,6 +742,23 @@ CREATE TABLE IF NOT EXISTS uptime_snapshots (
     UNIQUE (environment_id, snapshot_date)
 );
 CREATE INDEX IF NOT EXISTS idx_uptime_snapshots_env ON uptime_snapshots(environment_id, snapshot_date DESC);`
+
+// createOncallSchedulesTable stores per-org quiet-hours configuration used to suppress
+// non-critical (warn) alert notifications outside working hours, reducing alert fatigue.
+// One row per org. quiet_days holds lowercase weekday names (e.g. {saturday,sunday}).
+// Error-severity alerts always notify regardless of this schedule (ADR-016).
+const createOncallSchedulesTable = `
+CREATE TABLE IF NOT EXISTS oncall_schedules (
+    id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id                   UUID NOT NULL UNIQUE REFERENCES organizations(id) ON DELETE CASCADE,
+    timezone                 TEXT NOT NULL DEFAULT 'UTC',
+    quiet_hours_start        TIME NOT NULL DEFAULT '22:00',
+    quiet_hours_end          TIME NOT NULL DEFAULT '08:00',
+    quiet_days               TEXT[] NOT NULL DEFAULT '{}',
+    escalation_after_minutes INT NOT NULL DEFAULT 15,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);`
 
 // createIncidentActionsTable stores remediation actions proposed during an incident
 // (by the AI or a human) and their approval lifecycle.

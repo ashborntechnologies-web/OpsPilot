@@ -45,7 +45,7 @@ import {
   CheckCircle2, XCircle, Clock, Loader2, Cloud,
   RefreshCw, Terminal, AlertTriangle, ChevronDown, ChevronRight,
   Trash2, Eye, EyeOff, KeyRound, Activity, Scaling, Webhook as WebhookIcon, ZapOff,
-  DollarSign, GitPullRequest, Zap,
+  DollarSign, GitPullRequest, Zap, ShieldAlert,
 } from "lucide-react";
 import "@xterm/xterm/css/xterm.css";
 
@@ -164,6 +164,8 @@ export default function ProjectPage() {
   const [currentRiskScore, setCurrentRiskScore] = useState<RiskScore | null>(null);
   // mobile/tablet status drawer
   const [statusDrawerOpen, setStatusDrawerOpen] = useState(false);
+  // mobile/tablet alerts drawer (the AlertsPanel is desktop-only at lg+)
+  const [alertsDrawerOpen, setAlertsDrawerOpen] = useState(false);
   // settings tab state
   const [settingsName, setSettingsName] = useState("");
   const [settingsBranch, setSettingsBranch] = useState("");
@@ -1195,6 +1197,25 @@ export default function ProjectPage() {
         </div>
       )}
 
+      {/* Mobile/tablet alerts drawer (slides in from the right) */}
+      {alertsDrawerOpen && (
+        <div className="lg:hidden fixed inset-0 z-50 flex justify-end">
+          <div className="absolute inset-0 bg-black/40" onClick={() => setAlertsDrawerOpen(false)} />
+          <div className="relative z-10 h-full overflow-y-auto bg-white shadow-xl">
+            <AlertsPanel
+              alerts={alerts}
+              latestInsight={diagnosisResult}
+              onSnooze={handleSnoozeAlert}
+              onResolve={handleResolveAlert}
+              pendingActions={pendingActions}
+              canAct={canAct}
+              onApproveAction={handleApproveAction}
+              onRejectAction={handleRejectAction}
+            />
+          </div>
+        </div>
+      )}
+
       <div className="flex items-stretch">
         {/* LEFT — live status (desktop only) */}
         <div className="hidden xl:block sticky top-0 self-start h-screen">
@@ -1218,17 +1239,26 @@ export default function ProjectPage() {
           </div>
           <div className="flex gap-2">
             <Button variant="outline" className="xl:hidden" onClick={() => setStatusDrawerOpen(true)}>
-              <Activity className="h-4 w-4 mr-2" />
-              Status
+              <Activity className="h-4 w-4 sm:mr-2" />
+              <span className="hidden sm:inline">Status</span>
               {alerts.length > 0 && (
                 <span className="ml-1.5 inline-flex items-center justify-center h-4 min-w-4 px-1 rounded-full bg-red-500 text-white text-[10px] font-semibold">
                   {alerts.length}
                 </span>
               )}
             </Button>
+            <Button variant="outline" className="lg:hidden" onClick={() => setAlertsDrawerOpen(true)}>
+              <ShieldAlert className="h-4 w-4 sm:mr-2" />
+              <span className="hidden sm:inline">Alerts</span>
+              {alerts.length > 0 && (
+                <span className="ml-1.5 inline-flex items-center justify-center h-4 min-w-4 px-1 rounded-full bg-amber-500 text-white text-[10px] font-semibold">
+                  {alerts.length}
+                </span>
+              )}
+            </Button>
             <Button variant="outline" nativeButton={false} render={<Link href={`/projects/${id}/chat`} />}>
-              <MessageSquare className="h-4 w-4 mr-2" />
-              Open Chat
+              <MessageSquare className="h-4 w-4 sm:mr-2" />
+              <span className="hidden sm:inline">Open Chat</span>
             </Button>
           </div>
         </div>
@@ -1283,7 +1313,7 @@ export default function ProjectPage() {
         )}
 
         <Tabs defaultValue="overview">
-          <TabsList className="mb-6">
+          <TabsList className="mb-6 max-w-full overflow-x-auto justify-start">
             <TabsTrigger value="overview">Overview</TabsTrigger>
             <TabsTrigger value="logs">Live Logs</TabsTrigger>
             <TabsTrigger value="deployments">Deployments</TabsTrigger>
@@ -1437,6 +1467,45 @@ export default function ProjectPage() {
                           ))}
                         </ul>
                       )}
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+
+              {/* Pre-deploy risk score (advisory, from the deploy_risk WS message). Shown
+                  whenever a score is present, not just for high/critical (that's the banner). */}
+              {currentRiskScore && (
+                <Card>
+                  <CardContent className="py-4">
+                    <div className="flex items-start gap-3">
+                      <div
+                        className={cn(
+                          "flex h-12 w-12 shrink-0 items-center justify-center rounded-full text-base font-bold",
+                          currentRiskScore.level === "low" && "bg-green-100 text-green-700",
+                          currentRiskScore.level === "medium" && "bg-amber-100 text-amber-700",
+                          currentRiskScore.level === "high" && "bg-orange-100 text-orange-700",
+                          currentRiskScore.level === "critical" && "bg-red-100 text-red-700"
+                        )}
+                      >
+                        {currentRiskScore.score}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium">
+                          Pre-deploy risk: <span className="capitalize">{currentRiskScore.level}</span>
+                        </p>
+                        {(currentRiskScore.explanation || currentRiskScore.top_factor) && (
+                          <p className="text-xs text-muted-foreground mt-0.5">
+                            {currentRiskScore.explanation || currentRiskScore.top_factor}
+                          </p>
+                        )}
+                        {currentRiskScore.factors.filter((f) => f.points > 0).length > 0 && (
+                          <ul className="text-xs text-muted-foreground space-y-0.5 mt-2">
+                            {currentRiskScore.factors.filter((f) => f.points > 0).slice(0, 3).map((f) => (
+                              <li key={f.name}>• {f.reason}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
                     </div>
                   </CardContent>
                 </Card>

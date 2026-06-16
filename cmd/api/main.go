@@ -458,6 +458,10 @@ func main() {
 		org.GET("/reports", analyticsSvc.HandleListReports)
 		org.POST("/reports/generate", middleware.RequireRole(models.RoleAdmin), analyticsSvc.HandleGenerateReport)
 
+		// On-call schedule — quiet hours that suppress warn-level alert notifications (ADR-016).
+		org.GET("/oncall-schedule", alertEngine.HandleGetOncallSchedule)
+		org.PUT("/oncall-schedule", middleware.RequireRole(models.RoleAdmin), alertEngine.HandlePutOncallSchedule)
+
 		// Slack integration — read for any member; install/config/disconnect are admin.
 		org.GET("/slack", slackSvc.HandleGetIntegration)
 		org.GET("/slack/channels", slackSvc.HandleListChannels)

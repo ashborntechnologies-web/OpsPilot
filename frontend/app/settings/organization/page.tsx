@@ -13,13 +13,15 @@ import {
   listOrgMembers, createOrgInvite, updateMemberRole, removeMember,
 } from "@/lib/api";
 import { useActiveOrg } from "@/lib/use-org";
-import { updateSummaryConfig, generateSummaryNow } from "@/lib/api";
+import { updateSummaryConfig, generateSummaryNow, getOncallSchedule, putOncallSchedule } from "@/lib/api";
 import type { OrganizationMember, OrgRole } from "@/types/api";
 import { toast } from "sonner";
-import { Building2, Loader2, Trash2, UserPlus } from "lucide-react";
+import { Building2, Loader2, Trash2, UserPlus, MoonStar } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const ROLES: OrgRole[] = ["admin", "engineer", "viewer"];
+
+const WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
 
 // A curated set of common IANA timezones for the daily-summary picker (any stored value
 // not in this list is shown as an extra option so it's never lost).
@@ -58,12 +60,55 @@ export default function OrganizationSettingsPage() {
   const [savingSummary, setSavingSummary] = useState(false);
   const [testingSummary, setTestingSummary] = useState(false);
 
+  // On-call quiet-hours config.
+  const [ocTz, setOcTz] = useState("UTC");
+  const [ocStart, setOcStart] = useState("22");
+  const [ocEnd, setOcEnd] = useState("08");
+  const [ocDays, setOcDays] = useState<string[]>([]);
+  const [savingOncall, setSavingOncall] = useState(false);
+
   useEffect(() => {
     if (!activeOrg) return;
     setSumEnabled(activeOrg.summary_enabled ?? true);
     setSumHour((activeOrg.summary_time ?? "08:00").slice(0, 2));
     setSumTz(activeOrg.summary_timezone ?? "UTC");
   }, [activeOrg]);
+
+  useEffect(() => {
+    if (!orgId) return;
+    (async () => {
+      const token = await getToken();
+      if (!token) return;
+      try {
+        const oc = await getOncallSchedule(token, orgId);
+        setOcTz(oc.timezone || "UTC");
+        setOcStart((oc.quiet_hours_start || "22:00").slice(0, 2));
+        setOcEnd((oc.quiet_hours_end || "08:00").slice(0, 2));
+        setOcDays(oc.quiet_days ?? []);
+      } catch { /* defaults */ }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orgId]);
+
+  async function handleSaveOncall() {
+    if (!orgId) return;
+    const token = await getToken();
+    if (!token) return;
+    setSavingOncall(true);
+    try {
+      await putOncallSchedule(token, orgId, {
+        timezone: ocTz,
+        quiet_hours_start: `${ocStart}:00`,
+        quiet_hours_end: `${ocEnd}:00`,
+        quiet_days: ocDays,
+      });
+      toast.success("On-call schedule saved");
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+    } finally {
+      setSavingOncall(false);
+    }
+  }
 
   async function handleSaveSummary() {
     if (!orgId) return;
@@ -329,6 +374,92 @@ export default function OrganizationSettingsPage() {
                     </Button>
                     <Button onClick={handleSaveSummary} disabled={savingSummary}>
                       {savingSummary ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
+                      Save
+                    </Button>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* On-call schedule — quiet hours */}
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base flex items-center gap-2">
+                  <MoonStar className="h-4 w-4 text-indigo-600" /> On-Call Schedule
+                </CardTitle>
+                <CardDescription>
+                  Warn-level alerts are suppressed during quiet hours. Error-level alerts always notify.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="flex flex-col sm:flex-row gap-3 sm:items-end">
+                  <div className="flex-1 space-y-1.5">
+                    <Label className="text-xs">Timezone</Label>
+                    <select
+                      value={ocTz}
+                      disabled={!isAdmin}
+                      onChange={(e) => setOcTz(e.target.value)}
+                      className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring disabled:opacity-60"
+                    >
+                      {TIMEZONES.includes(ocTz) ? null : <option value={ocTz}>{ocTz}</option>}
+                      {TIMEZONES.map((tz) => <option key={tz} value={tz}>{tz}</option>)}
+                    </select>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs">Quiet hours start</Label>
+                    <select
+                      value={ocStart}
+                      disabled={!isAdmin}
+                      onChange={(e) => setOcStart(e.target.value)}
+                      className="h-9 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring disabled:opacity-60"
+                    >
+                      {Array.from({ length: 24 }, (_, h) => String(h).padStart(2, "0")).map((h) => (
+                        <option key={h} value={h}>{h}:00</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs">Quiet hours end</Label>
+                    <select
+                      value={ocEnd}
+                      disabled={!isAdmin}
+                      onChange={(e) => setOcEnd(e.target.value)}
+                      className="h-9 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring disabled:opacity-60"
+                    >
+                      {Array.from({ length: 24 }, (_, h) => String(h).padStart(2, "0")).map((h) => (
+                        <option key={h} value={h}>{h}:00</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Quiet days (all-day quiet)</Label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {WEEKDAYS.map((d) => {
+                      const on = ocDays.includes(d);
+                      return (
+                        <button
+                          key={d}
+                          type="button"
+                          disabled={!isAdmin}
+                          onClick={() => setOcDays((prev) => on ? prev.filter((x) => x !== d) : [...prev, d])}
+                          className={cn(
+                            "rounded-md border px-2.5 py-1 text-xs capitalize disabled:opacity-60",
+                            on ? "bg-indigo-600 text-white border-indigo-600" : "hover:bg-zinc-50"
+                          )}
+                        >
+                          {d.slice(0, 3)}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {isAdmin && (
+                  <div className="flex justify-end pt-1">
+                    <Button onClick={handleSaveOncall} disabled={savingOncall}>
+                      {savingOncall ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
                       Save
                     </Button>
                   </div>

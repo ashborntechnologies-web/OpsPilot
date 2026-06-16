@@ -269,6 +269,15 @@ from events, **not** external probes). `total_minutes`, `downtime_minutes`, `upt
 (upsert). Written by `analytics.ComputeUptimeSnapshot`; aggregated (minutes-weighted) into
 the dashboard's reliability metrics and uptime trend.
 
+### `oncall_schedules`
+Per-org on-call quiet-hours config (`createOncallSchedulesTable`, ADR-016). One row per org
+(`org_id UNIQUE`). `timezone` (IANA), `quiet_hours_start`/`quiet_hours_end` (TIME; an
+overnight window like 22:00→08:00 is supported), `quiet_days` (TEXT[] of lowercase weekday
+names, e.g. `{saturday,sunday}`), `escalation_after_minutes` (default 15). Read by
+`monitor.CheckQuietHours` to decide whether to suppress **warn**-severity alert notifications
+(email/Slack); **error** alerts always notify. Managed at `/settings/organization`
+(`GET`/`PUT /orgs/:orgId/oncall-schedule`). No row ⇒ never quiet (fail open).
+
 ### `conversations`
 Chat history per project. `role` (`user`/`assistant`), `message`, classified `intent`,
 `metadata` (JSONB). Source for the intent-classifier training export.

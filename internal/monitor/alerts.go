@@ -342,6 +342,20 @@ func (a *AlertEngine) notifyOwner(ctx context.Context, alert models.Alert, proje
 		return
 	}
 
+	// On-call quiet hours (ADR-016): during quiet hours, warn-severity alerts are
+	// suppressed from email + Slack (the DB row + WS broadcast already happened, so an
+	// engineer at their desk still sees it). Error-severity alerts always break through —
+	// critical issues wake people up — with a note on the Slack message.
+	quiet := false
+	if orgID != nil {
+		quiet, _ = a.CheckQuietHours(ctx, *orgID)
+	}
+	if quiet && alert.Severity != models.SeverityError {
+		slog.Info(fmt.Sprintf("alert suppressed during quiet hours: %s", alert.ID),
+			"component", "monitor.alerts", "alert_id", alert.ID, "org_id", orgID, "severity", alert.Severity)
+		return
+	}
+
 	if enabled {
 		if err := a.emailSvc.SendAlert(ctx, email, projectName, envName, alert.Title, alert.Summary, alertURL); err != nil {
 			slog.Warn("alert engine: email failed", "component", "monitor.alerts",
@@ -351,9 +365,67 @@ func (a *AlertEngine) notifyOwner(ctx context.Context, alert models.Alert, proje
 
 	// Slack — independent of email preferences (channel-level opt-in via connecting Slack).
 	if a.slack != nil && orgID != nil {
-		if err := a.slack.PostAlert(ctx, *orgID, alert, projectName, envName, alertURL); err != nil {
+		slackAlert := alert
+		if quiet {
+			// Reaching here with quiet == true means error severity broke through.
+			slackAlert.Summary = strings.TrimSpace(alert.Summary + "\n⚠️ Sent outside quiet hours due to error severity")
+		}
+		if err := a.slack.PostAlert(ctx, *orgID, slackAlert, projectName, envName, alertURL); err != nil {
 			slog.Warn("alert engine: slack notify failed", "component", "monitor.alerts",
 				"project_id", alert.ProjectID, "error", err)
 		}
 	}
+}
+
+// CheckQuietHours reports whether the org is currently within its configured on-call quiet
+// window (quiet hours or a quiet day, evaluated in the org's timezone). Returns false when no
+// schedule is configured or on any error — failing open so alerts are never silently lost.
+func (a *AlertEngine) CheckQuietHours(ctx context.Context, orgID uuid.UUID) (bool, error) {
+	var tz, startStr, endStr string
+	var quietDays []string
+	err := a.db.Pool.QueryRow(ctx, `
+		SELECT timezone, to_char(quiet_hours_start, 'HH24:MI'), to_char(quiet_hours_end, 'HH24:MI'), quiet_days
+		FROM oncall_schedules WHERE org_id = $1`, orgID).Scan(&tz, &startStr, &endStr, &quietDays)
+	if err != nil {
+		return false, err // no schedule (or error) → not quiet
+	}
+
+	loc, lerr := time.LoadLocation(tz)
+	if lerr != nil {
+		loc = time.UTC
+	}
+	now := time.Now().In(loc)
+
+	// Quiet day? (weekday names are stored lowercase, e.g. "saturday")
+	today := strings.ToLower(now.Weekday().String())
+	for _, d := range quietDays {
+		if strings.ToLower(strings.TrimSpace(d)) == today {
+			return true, nil
+		}
+	}
+
+	// Quiet hours? Supports overnight windows (start > end, e.g. 22:00–08:00).
+	start, ok1 := parseHHMM(startStr)
+	end, ok2 := parseHHMM(endStr)
+	if !ok1 || !ok2 || start == end {
+		return false, nil // unset/degenerate window → only quiet days apply
+	}
+	nowMin := now.Hour()*60 + now.Minute()
+	if start < end {
+		return nowMin >= start && nowMin < end, nil
+	}
+	// Overnight window wraps past midnight.
+	return nowMin >= start || nowMin < end, nil
+}
+
+// parseHHMM parses "HH:MM" into minutes-since-midnight.
+func parseHHMM(s string) (int, bool) {
+	var h, m int
+	if _, err := fmt.Sscanf(strings.TrimSpace(s), "%d:%d", &h, &m); err != nil {
+		return 0, false
+	}
+	if h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, false
+	}
+	return h*60 + m, true
 }

@@ -122,10 +122,17 @@ Status is derived from the code on `main`, not from plans.
 
 **Continuous monitoring**
 - Poller (ECS/ALB health, 60s) + LogScanner (CloudWatch anomaly patterns, 5m) →
-  `runtime.*` operational events.
+  `runtime.*` operational events. Both wired in `main.go` (`go poller.Start()` +
+  `go logScanner.Start()`); auto-diagnosis enqueuer wired via
+  `eventSvc.SetDiagnosisEnqueuer(queueClient)`.
 - Alert engine: dedup, AI summaries, snooze, auto-resolve on recovery; delivered via
-  WebSocket + email; alerts panel + status sidebar in the UI.
+  WebSocket + email + Slack; alerts panel + status sidebar in the UI (both reachable on
+  mobile/tablet via drawers).
 - Auto-diagnosis enqueued on runtime failures (events → diagnosis job).
+- **On-call quiet hours (ADR-016):** per-org schedule (timezone, quiet hours, quiet days) at
+  `/settings/organization`. During quiet hours, warn-severity alerts are suppressed from
+  email/Slack (still written + broadcast over WS); error-severity alerts always notify (with
+  a Slack note). Reduces alert fatigue without dropping critical pages.
 - Watchdog reconciles stuck deploys every 5m.
 
 **Team workspaces & RBAC**

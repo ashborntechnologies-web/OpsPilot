@@ -16,6 +16,42 @@ Format:
 
 ---
 
+## 2026-06-16 — AI on-call layer: quiet hours, risk card, mobile reach (+ wiring verified)
+- **What:** Completed the on-call/operator layer around monitoring.
+  - **On-call quiet hours (ADR-016, new):** `oncall_schedules` table (per-org timezone,
+    quiet-hours window with overnight wrap, quiet weekdays, escalation_after_minutes).
+    `monitor.CheckQuietHours` + a quiet-hours branch in `notifyOwner`: warn alerts suppressed
+    from email/Slack during quiet hours (DB row + WS broadcast still happen, logged
+    `alert suppressed during quiet hours: <id>`); error alerts always notify with
+    `⚠️ Sent outside quiet hours due to error severity` on the Slack message; fail-open when
+    unconfigured. `GET`/`PUT /orgs/:orgId/oncall-schedule` (`monitor/oncall.go`) + an On-Call
+    Schedule section in `/settings/organization` (timezone, hour selectors, weekday toggles).
+  - **Risk score card (new):** the dashboard Overview now renders a pre-deploy risk *card*
+    (score-in-circle color-coded by level, level label, explanation, up to 3 contributing
+    factors) whenever a `deploy_risk` score is present — complementing the existing
+    high/critical banner. (WS handling + `currentRiskScore` state already existed.)
+  - **Mobile responsive (extended):** the AlertsPanel is now reachable below `lg` via a
+    right-side drawer + an "Alerts" top-bar button (mirrors the existing StatusSidebar
+    drawer); top-bar buttons collapse to icons on very small screens; the tab bar scrolls
+    horizontally instead of overflowing. (Used the repo's existing hand-rolled drawer pattern
+    — shadcn `Sheet` is not installed.)
+  - **Verified already-present (no code change, prompt was stale):** Part 1 wiring
+    (`eventSvc.SetDiagnosisEnqueuer(queueClient)`, `go logScanner.Start()`, queue
+    `EnqueueDiagnose` + `handleDiagnose` empty/non-empty deploymentID branch) was already in
+    place; Part 2 build-log display (collapsible bg-zinc-950 terminal, last-300 in state,
+    auto-scroll, clears on done/failed) already implemented; Part 5 `FRAMEWORK_LABELS` already
+    covers all 18 frameworks.
+- **Files:** `pkg/models/{db,types}.go`, `internal/monitor/{alerts,oncall}.go`,
+  `cmd/api/main.go`, `frontend/{types/api.ts,lib/api.ts}`,
+  `frontend/app/settings/organization/page.tsx`, `frontend/app/projects/[id]/page.tsx`.
+- **Why:** prevent alert fatigue (suppress nighttime noise without ever silencing a real
+  outage) and finish the operator-facing UI (risk visibility, alerts reachable on every
+  breakpoint).
+- **Assumptions changed:** alert email/Slack delivery is now gated by org quiet hours for
+  warn severity; error severity is unconditional.
+- **Docs updated:** ARCHITECTURE, BACKEND, DATABASE_SCHEMA, API_CONTRACTS, CURRENT_STATE,
+  DECISIONS (ADR-016), CHANGELOG_AI.
+
 ## 2026-06-16 — Engineering leadership dashboard (SLA/uptime, MTTD/MTTR, monthly report)
 - **What:** A leadership/reliability dashboard plus a monthly operational health report —
   the VP/CTO-facing view of the platform.
