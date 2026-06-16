@@ -123,23 +123,45 @@ account/ARN for the bootstrap template + same-account AssumeRole.
 
 ## `internal/incidents` — incident war room
 - **Purpose:** first-class, lifecycle-tracked incidents with a shared real-time timeline
-  (AI + human) and an approval flow for proposed actions; AI postmortem on resolve. See
-  the ARCHITECTURE war-room flow.
+  (AI + human) and an approval flow for proposed actions. On resolve it **enqueues** async
+  postmortem generation (it no longer renders postmortems itself — that moved to
+  `internal/postmortem`; ADR-014). See the ARCHITECTURE war-room flow.
 - **Files:** `service.go` (`CreateIncident` + dedup + first timeline entry + suggested
-  action; `GeneratePostmortem`; `postTimelineEntry`/`broadcast`), `handlers.go` (list/get/
-  timeline/acknowledge/resolve/postmortem/approve/reject + `requireIncidentRole`).
-- **Key type:** `Service` (deps: db, llm, ws hub); `CreateParams` (the diagnosis→incident
-  bridge). Consumed by `diagnosis` via the `diagnosis.IncidentCreator` interface
-  (`SetIncidentService`) so completed diagnoses open an incident instead of a bare row.
+  action; `PostActionEntry`; `postTimelineEntry`/`broadcast`; `PostmortemEnqueuer` interface
+  + `SetPostmortemEnqueuer`), `handlers.go` (list/get/timeline/acknowledge/resolve/approve/
+  reject + `requireIncidentRole`). `HandleResolve` enqueues and returns
+  `{postmortem_generating:true}`.
+- **Key type:** `Service` (deps: db, llm, ws hub, `postmortems PostmortemEnqueuer`);
+  `CreateParams` (the diagnosis→incident bridge). Consumed by `diagnosis` via the
+  `diagnosis.IncidentCreator` interface (`SetIncidentService`) so completed diagnoses open
+  an incident instead of a bare row.
 - **Realtime:** broadcasts `incident_timeline`/`incident_update`/`incident_action` to the
   war-room WebSocket (`pkg/ws` incident rooms, keyed by incident ID).
-- **Depends on:** `llm` (postmortem), `ws` (broadcast), `middleware` (auth/role), `models`.
+- **Depends on:** `llm`, `ws` (broadcast), `middleware` (auth/role), `models`, and the
+  `PostmortemEnqueuer` seam (satisfied by `*queue.Client`).
+
+## `internal/postmortem` — async postmortem generation
+- **Purpose:** generate a structured, editable, exportable postmortem when an incident is
+  resolved — asynchronously so resolve never blocks on Claude (ADR-014).
+- **Files:** `service.go` (`GeneratePostmortem`: load incident + timeline + ai_actions +
+  deployment + project memory → Claude → parse action items → upsert `postmortems` draft
+  `ON CONFLICT(incident_id)` → mirror to `incidents.postmortem` → `memory.RecordSuccessfulFix`;
+  plus `parseActionItems`/`renderTimeline`/`renderActions`/`renderDeployment`/`renderMemory`),
+  `handlers.go` (`HandleGetByIncident` 404 `{generating}`, `HandleGet`, `HandleUpdate`,
+  `HandlePublish`, `HandleExport` md/print-HTML, `HandleListOrg` + `requireRole`/`loadOne`/
+  `printableHTML`).
+- **Key type:** `Service` (deps: db, llm, `memory` service). Constructed in `main.go`;
+  satisfies the incidents `PostmortemEnqueuer` indirectly via `queue.Client`.
+- **Triggered by:** the Asynq `postmortem:generate` task (`internal/queue` →
+  `s.handlePostmortem`). Idempotent (UNIQUE incident upsert), `MaxRetry(1)`.
+- **Depends on:** `llm` (generation), `memory` (successful-fix learning), `middleware`, `models`.
 
 ## `internal/memory` — long-term project memory
 - **Purpose:** learn facts about each project and feed them into diagnosis prompts.
 - **Files:** `service.go`. **Methods:** `upsert` (dedup via normalized `contentKey`,
   `reference_count++`), `RecordDiagnosisFeedback`, `RecordRecurringFailure`,
-  `RecordDeployPattern`, `GetRelevantMemory`, `FormatForPrompt`.
+  `RecordDeployPattern`, `RecordSuccessfulFix` (a `successful_fix` memory written by the
+  postmortem generator), `GetRelevantMemory`, `FormatForPrompt`.
 - **Depends on:** `llm`, `models`.
 
 ## `internal/events` — operational event hub
@@ -239,8 +261,11 @@ account/ARN for the bootstrap template + same-account AssumeRole.
 
 ## `internal/queue` — async jobs (Asynq/Redis)
 - **`Server`** handlers: `handleDeploy`, `handleProvision`, `handleRollback`,
-  `handleDeleteProject`, `handleDiagnose`, `handleWatchdog`. **`Client`**: `Enqueue*`
-  methods (implements `deploy.Enqueuer`) + Redis pending-mutation store
+  `handleDeleteProject`, `handleDiagnose`, `handleWatchdog`, `handleGenerateSummary`,
+  `handlePostmortem` (`postmortem:generate` → `postmortem.GeneratePostmortem`, `MaxRetry(1)`,
+  idempotent). **`Client`**: `Enqueue*` methods (implements `deploy.Enqueuer`,
+  `events.DiagnosisEnqueuer`, and `incidents.PostmortemEnqueuer` via
+  `EnqueueGeneratePostmortem`) + Redis pending-mutation store
   (`SetPendingMutation`/`GetPendingMutation`). **`Scheduler`**: periodic watchdog
   (`ReconcileStuckResources`) every 5m. Task constructors `New*Task`.
 

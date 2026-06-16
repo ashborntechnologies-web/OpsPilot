@@ -78,8 +78,19 @@ Status is derived from the code on `main`, not from plans.
   action.
 - Real-time war room (`/incidents/[id]`): shared timeline feed (AI + human, live over a
   per-incident WebSocket), engineer update composer, AI-actions approve/reject panel,
-  acknowledge/resolve, and an editable AI postmortem on resolve. Org incident list
-  (`/incidents`) + navbar open-incident badge. Alert emails link to the war room.
+  acknowledge/resolve. Org incident list (`/incidents`) + navbar open-incident badge.
+  Alert emails link to the war room.
+
+**Automated postmortems**
+- On resolve, a postmortem is generated **asynchronously** (Asynq job — ADR-014), so the
+  resolve action returns instantly; the war room polls and shows a "Generating…" state,
+  then a preview. Claude drafts fixed sections (Summary / Timeline / Root Cause /
+  Contributing Factors / What Went Well / Action Items) from the timeline, diagnosis, AI
+  actions, deployment, and project memory; structured action items are parsed out.
+- Editable on `/postmortems/[id]/edit` (markdown + action-item editor, live preview),
+  publishable to the org library (`/orgs/postmortems`, SOC2-framed, searchable/filterable),
+  exportable as markdown or print-ready HTML (Save-as-PDF). Generation also writes the fix
+  to project memory (`successful_fix`) so future diagnoses improve. Navbar "Postmortems" link.
 
 **Infrastructure discovery**
 - Scans connected AWS accounts for existing resources (ECS services/clusters, RDS,

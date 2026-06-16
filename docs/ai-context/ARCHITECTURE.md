@@ -336,8 +336,10 @@ graph TB
     ACK["Acknowledge → investigating"] --> INC
     APPROVE["Approve/Reject AI action"] --> ACT
     RES["Mark Resolved"] -->|resolve| INC
-    RES -->|Claude| PM["postmortem (markdown)\nSummary/Timeline/Root Cause/\nContributing Factors/Action Items"]
-    PM --> INC
+    RES -->|enqueue Asynq job| Q["postmortem:generate"]
+    Q -->|Claude, async| PM["postmortems (draft)\nSummary/Timeline/Root Cause/\nContributing/What Went Well/Action Items"]
+    PM -->|RecordSuccessfulFix| MEM[(project_memory)]
+    EDIT["editor: edit → Publish"] --> PM
   end
   TL & INC & ACT -->|hub.Broadcast(incidentID)| WS["war-room WebSocket\n/ws/incidents/:id"]
   WS --> SUB["all subscribers (live)"]
@@ -353,9 +355,19 @@ graph TB
   socket keyed by incident ID (auth = org membership of the incident). Every timeline
   entry / status / action change is broadcast to all subscribers. Engineers post updates
   over HTTP (`POST /incidents/:id/timeline`), not the socket.
-- **Postmortem:** on resolve, Claude is given the full timeline + root cause + actions +
-  duration and returns markdown with fixed sections; it is stored on the incident and
-  shown editable before the engineer publishes it. Falls back to a template on AI outage.
+- **Postmortem (async — ADR-014):** resolving an incident does **not** block on Claude.
+  `HandleResolve` enqueues a `postmortem:generate` Asynq job and returns
+  `{status:"resolved", postmortem_generating:true}` immediately. The worker
+  (`internal/postmortem.GeneratePostmortem`) loads the timeline + diagnosis + AI actions +
+  deployment + project memory, calls Claude for markdown with fixed sections
+  (Summary / Timeline / Root Cause / Contributing Factors / What Went Well / Action Items),
+  parses out structured action items, and upserts a **draft** row in `postmortems`
+  (`ON CONFLICT(incident_id)` → idempotent). It also writes the resolution to
+  `project_memory` as a `successful_fix` so future diagnoses learn from it, and mirrors the
+  markdown back to `incidents.postmortem` for backward compatibility. The war room polls
+  `GET /incidents/:id/postmortem` (404 `{generating:true}` until ready), then shows a
+  preview; engineers edit it on `/postmortems/:id/edit` and **Publish** it to the org
+  library (`/orgs/postmortems`). Export is markdown or print-ready HTML ("Save as PDF").
 - Alert emails now link to the war room (`/incidents`) instead of the project page.
 
 ## Monitoring & alerting flow

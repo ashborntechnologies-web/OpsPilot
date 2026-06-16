@@ -155,7 +155,8 @@ A diagnosed problem and the unit of the **incident war room** (lifecycle-tracked
 `root_cause`, `resolution`, `raw_logs` (`json:"-"`). War-room fields (added by
 `extendIncidentsForWarRoom`): `title`, `status` (`open`→`investigating`→`resolved`,
 CHECK-constrained), `severity`, `acknowledged_by`/`acknowledged_at`,
-`resolved_by`/`resolved_at`, `postmortem` (AI-generated markdown), `org_id`.
+`resolved_by`/`resolved_at`, `postmortem` (AI-generated markdown — now a backward-compat
+mirror of the canonical `postmortems` row; see below), `org_id`.
 Explainability (added by `addExplainabilityColumns`): `confidence_score` (FLOAT 0.0–1.0,
 nullable) + `evidence` (JSONB array of `{type, description, data, weight}`, default `[]`),
 populated by a second structured Claude call during diagnosis. Created by
@@ -175,6 +176,20 @@ lifecycle. `proposed_by` (`ai`/`human`), `action_type`, `parameters` JSONB, `sta
 (`pending`/`approved`/`executed`/`rejected`), `approved_by`, `executed_at`. The diagnosis's
 suggested fix becomes a pending `suggested_fix` action; approve/reject are gated to
 engineer+. (No autonomous executor yet — approval records the decision.)
+
+### `postmortems`
+Structured, editable, exportable postmortem for a resolved incident (created by
+`createPostmortemsTable`). One per incident: `incident_id UUID UNIQUE` (FK, ON DELETE
+CASCADE), plus `org_id`/`project_id` (FKs) for library scoping. `title`,
+`status` (`draft`/`published`, CHECK-constrained), `content_markdown`, `action_items`
+(JSONB array of `{item, owner, priority, due_date, status}`, default `[]`),
+`generated_at`, `published_at`/`published_by`. Indexed `(org_id, status, created_at DESC)`
+for the org library. Generated **asynchronously** by `internal/postmortem.GeneratePostmortem`
+(an Asynq `postmortem:generate` job enqueued on resolve — ADR-014), which upserts
+`ON CONFLICT(incident_id)` so retries are idempotent, mirrors the markdown to
+`incidents.postmortem`, and writes the resolution to `project_memory` as a `successful_fix`.
+Edited via PATCH, published (→ org library) by engineer+, exported as markdown or
+print-ready HTML.
 
 ### `diagnosis_feedback`
 User rating of an AI diagnosis. `rating` (`helpful`/`not_helpful`/`partially_helpful`)

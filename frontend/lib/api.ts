@@ -606,13 +606,10 @@ export function acknowledgeIncident(token: string, incidentId: string) {
 }
 
 export function resolveIncident(token: string, incidentId: string) {
-  return request<{ status: string; postmortem: string }>(`/incidents/${incidentId}/resolve`, token, { method: "POST" });
-}
-
-export function savePostmortem(token: string, incidentId: string, postmortem: string) {
-  return request<{ message: string }>(`/incidents/${incidentId}/postmortem`, token, {
-    method: "POST", body: JSON.stringify({ postmortem }),
-  });
+  // Postmortem generation is enqueued async (ADR-014); the war room polls
+  // getIncidentPostmortem afterwards.
+  return request<{ status: string; postmortem_generating: boolean }>(
+    `/incidents/${incidentId}/resolve`, token, { method: "POST" });
 }
 
 export function approveIncidentAction(token: string, incidentId: string, actionId: string) {
@@ -621,6 +618,87 @@ export function approveIncidentAction(token: string, incidentId: string, actionI
 
 export function rejectIncidentAction(token: string, incidentId: string, actionId: string) {
   return request<{ message: string; status: string }>(`/incidents/${incidentId}/actions/${actionId}/reject`, token, { method: "POST" });
+}
+
+// ---- Postmortems ----------------------------------------------------------------
+
+import type { Postmortem, ActionItem } from "@/types/api";
+
+// getIncidentPostmortem returns the postmortem, or null while it is still being
+// generated. It bypasses request() because a 404 with {generating:true} is an
+// expected polling state, not an error.
+export async function getIncidentPostmortem(
+  token: string, incidentId: string
+): Promise<{ postmortem: Postmortem | null; generating: boolean }> {
+  const activeOrg = getActiveOrgId();
+  const res = await fetch(`/api/v1/incidents/${incidentId}/postmortem`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(activeOrg ? { "X-Org-Id": activeOrg } : {}),
+    },
+  });
+  if (res.status === 404) {
+    const body = await res.json().catch(() => null);
+    return { postmortem: null, generating: Boolean((body as { generating?: boolean } | null)?.generating) };
+  }
+  if (!res.ok) throw new Error(`failed to load postmortem (HTTP ${res.status})`);
+  return { postmortem: (await res.json()) as Postmortem, generating: false };
+}
+
+export function getPostmortem(token: string, postmortemId: string) {
+  return request<Postmortem>(`/postmortems/${postmortemId}`, token);
+}
+
+export function updatePostmortem(
+  token: string, postmortemId: string,
+  body: { content_markdown?: string; title?: string; action_items?: ActionItem[] }
+) {
+  return request<{ message: string }>(`/postmortems/${postmortemId}`, token, {
+    method: "PATCH", body: JSON.stringify(body),
+  });
+}
+
+export function publishPostmortem(token: string, postmortemId: string) {
+  return request<{ message: string; status: string }>(`/postmortems/${postmortemId}/publish`, token, { method: "POST" });
+}
+
+// exportPostmortem fetches the export with auth (the endpoint requires a bearer
+// token, so a plain link/new-tab won't work). For "md" it downloads a file; for
+// "pdf" it opens the print-ready HTML in a new window which auto-triggers print.
+export async function exportPostmortem(
+  token: string, postmortemId: string, format: "md" | "pdf", filename = "postmortem"
+): Promise<void> {
+  const activeOrg = getActiveOrgId();
+  const res = await fetch(`/api/v1/postmortems/${postmortemId}/export?format=${format}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(activeOrg ? { "X-Org-Id": activeOrg } : {}),
+    },
+  });
+  if (!res.ok) throw new Error(`export failed (HTTP ${res.status})`);
+  const text = await res.text();
+  if (format === "pdf") {
+    const w = window.open("", "_blank");
+    if (w) { w.document.write(text); w.document.close(); }
+    return;
+  }
+  const blob = new Blob([text], { type: "text/markdown" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${filename}.md`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export function listOrgPostmortems(
+  token: string, orgId: string,
+  filters: { project_id?: string; severity?: string; from?: string; to?: string; q?: string } = {}
+) {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(filters)) if (v) qs.set(k, v);
+  const suffix = qs.toString() ? `?${qs}` : "";
+  return request<Postmortem[]>(`/orgs/${orgId}/postmortems${suffix}`, token);
 }
 
 export function incidentWsURL(incidentId: string) {

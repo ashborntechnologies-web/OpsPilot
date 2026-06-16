@@ -114,6 +114,7 @@ func RunMigrations(db *DB) error {
 		addExplainabilityColumns,
 		addTrustLevelToEnvironments,
 		createAIActionsTable,
+		createPostmortemsTable,
 	}
 
 	for _, m := range migrations {
@@ -671,6 +672,27 @@ CREATE TABLE IF NOT EXISTS ai_actions (
 );
 CREATE INDEX IF NOT EXISTS idx_ai_actions_org     ON ai_actions(org_id, status, proposed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ai_actions_project ON ai_actions(project_id, proposed_at DESC);`
+
+// createPostmortemsTable stores one AI-generated, editable, exportable postmortem per
+// incident. action_items is a JSONB array of {item, owner, priority, due_date, status}.
+// The full incident history (published postmortems) doubles as a compliance/SOC2 record.
+const createPostmortemsTable = `
+CREATE TABLE IF NOT EXISTS postmortems (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id      UUID NOT NULL UNIQUE REFERENCES incidents(id) ON DELETE CASCADE,
+    org_id           UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    project_id       UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title            TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published')),
+    content_markdown TEXT NOT NULL DEFAULT '',
+    action_items     JSONB NOT NULL DEFAULT '[]',
+    generated_at     TIMESTAMPTZ,
+    published_at     TIMESTAMPTZ,
+    published_by     UUID REFERENCES users(id),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_postmortems_org ON postmortems(org_id, status, created_at DESC);`
 
 // createIncidentActionsTable stores remediation actions proposed during an incident
 // (by the AI or a human) and their approval lifecycle.

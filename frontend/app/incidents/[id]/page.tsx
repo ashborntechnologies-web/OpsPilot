@@ -13,17 +13,17 @@ import {
 } from "@/components/ui/dialog";
 import {
   getIncident, postIncidentTimeline, acknowledgeIncident, resolveIncident,
-  savePostmortem, approveIncidentAction, rejectIncidentAction, incidentWsURL,
+  getIncidentPostmortem, publishPostmortem, approveIncidentAction, rejectIncidentAction, incidentWsURL,
 } from "@/lib/api";
 import { useActiveOrg } from "@/lib/use-org";
 import { Markdown } from "@/lib/markdown";
 import { ConfidenceBadge, EvidenceSection } from "@/components/ai/explainability";
 import { SEVERITY_BADGE, STATUS_BADGE, timeOpen } from "@/lib/incidents";
-import type { IncidentDetail, IncidentTimelineEntry, IncidentAction, WsMessage } from "@/types/api";
+import type { IncidentDetail, IncidentTimelineEntry, IncidentAction, Postmortem, WsMessage } from "@/types/api";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
-  ArrowLeft, Loader2, Send, CheckCircle2, Bot, Clock, Siren, Server, FileText,
+  ArrowLeft, Loader2, Send, CheckCircle2, Bot, Clock, Siren, Server, FileText, Pencil, Sparkles,
 } from "lucide-react";
 
 export default function WarRoomPage() {
@@ -39,9 +39,10 @@ export default function WarRoomPage() {
   const [busy, setBusy] = useState<string | null>(null); // ack | resolve | action id
   const [, setTick] = useState(0); // drives the live time-open counter
 
-  // postmortem modal
+  // postmortem (generated async on resolve — ADR-014)
+  const [pm, setPm] = useState<Postmortem | null>(null);
+  const [pmGenerating, setPmGenerating] = useState(false);
   const [pmOpen, setPmOpen] = useState(false);
-  const [pmText, setPmText] = useState("");
   const [publishing, setPublishing] = useState(false);
 
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -143,14 +144,37 @@ export default function WarRoomPage() {
     }
   }
 
+  // loadPostmortem fetches the current postmortem (or its generating state).
+  const loadPostmortem = useCallback(async () => {
+    const token = await getToken();
+    if (!token) return;
+    try {
+      const { postmortem, generating } = await getIncidentPostmortem(token, id);
+      setPm(postmortem);
+      setPmGenerating(generating && !postmortem);
+    } catch { /* not generated / not resolved yet */ }
+  }, [getToken, id]);
+
+  // On load and whenever the incident becomes resolved, fetch the postmortem.
+  useEffect(() => {
+    if (detail?.incident.status === "resolved") loadPostmortem().catch(() => {});
+  }, [detail?.incident.status, loadPostmortem]);
+
+  // Poll while generation is in flight (async — ADR-014); stops once it arrives.
+  useEffect(() => {
+    if (!pmGenerating) return;
+    const iv = setInterval(() => { loadPostmortem().catch(() => {}); }, 3000);
+    return () => clearInterval(iv);
+  }, [pmGenerating, loadPostmortem]);
+
   async function handleResolve() {
     const token = await getToken();
     if (!token) return;
     setBusy("resolve");
     try {
-      const { postmortem } = await resolveIncident(token, id);
-      setPmText(postmortem ?? "");
-      setPmOpen(true);
+      const { postmortem_generating } = await resolveIncident(token, id);
+      setPmGenerating(Boolean(postmortem_generating));
+      toast.success("Incident resolved — generating postmortem…");
       await reload();
     } catch (e: unknown) {
       toast.error((e as Error).message);
@@ -160,14 +184,14 @@ export default function WarRoomPage() {
   }
 
   async function handlePublish() {
+    if (!pm) return;
     const token = await getToken();
     if (!token) return;
     setPublishing(true);
     try {
-      await savePostmortem(token, id, pmText);
-      toast.success("Postmortem published");
-      setPmOpen(false);
-      await reload();
+      await publishPostmortem(token, pm.id);
+      toast.success("Postmortem published to the org library");
+      await loadPostmortem();
     } catch (e: unknown) {
       toast.error((e as Error).message);
     } finally {
@@ -209,24 +233,39 @@ export default function WarRoomPage() {
     <div className="min-h-screen bg-zinc-50 flex flex-col">
       <Navbar />
 
-      {/* Postmortem modal */}
+      {/* Postmortem preview modal — read-only; editing happens on the editor page. */}
       <Dialog open={pmOpen} onOpenChange={setPmOpen}>
         <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Postmortem</DialogTitle>
-            <DialogDescription>AI-generated draft — edit as needed, then publish.</DialogDescription>
+            <DialogTitle className="flex items-center gap-2">
+              {pm?.title || "Postmortem"}
+              {pm && (
+                <span className={cn("rounded px-1.5 py-0.5 text-[10px] font-medium capitalize",
+                  pm.status === "published" ? "bg-green-100 text-green-700" : "bg-amber-100 text-amber-700")}>
+                  {pm.status}
+                </span>
+              )}
+            </DialogTitle>
+            <DialogDescription>AI-generated from the incident timeline, diagnosis, and AWS context.</DialogDescription>
           </DialogHeader>
-          <Textarea
-            value={pmText}
-            onChange={(e) => setPmText(e.target.value)}
-            className="min-h-[320px] font-mono text-xs"
-          />
+          {pm ? (
+            <Markdown content={pm.content_markdown} className="text-sm prose-sm max-w-none" />
+          ) : (
+            <p className="text-sm text-muted-foreground">No postmortem available.</p>
+          )}
           <DialogFooter>
-            <Button variant="outline" onClick={() => setPmOpen(false)} disabled={publishing}>Close</Button>
-            <Button onClick={handlePublish} disabled={publishing || !pmText.trim()}>
-              {publishing ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <FileText className="h-4 w-4 mr-1" />}
-              Publish postmortem
-            </Button>
+            <Button variant="outline" onClick={() => setPmOpen(false)}>Close</Button>
+            {pm && canAct && (
+              <Button variant="outline" nativeButton={false} render={<Link href={`/postmortems/${pm.id}/edit`} />}>
+                <Pencil className="h-4 w-4 mr-1" /> Edit
+              </Button>
+            )}
+            {pm && canAct && pm.status !== "published" && (
+              <Button onClick={handlePublish} disabled={publishing}>
+                {publishing ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <FileText className="h-4 w-4 mr-1" />}
+                Publish
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -262,8 +301,13 @@ export default function WarRoomPage() {
               Mark Resolved
             </Button>
           )}
-          {resolved && incident.postmortem && (
-            <Button size="sm" variant="outline" onClick={() => { setPmText(incident.postmortem ?? ""); setPmOpen(true); }}>
+          {resolved && pmGenerating && (
+            <span className="flex items-center gap-1 text-xs text-muted-foreground">
+              <Sparkles className="h-3.5 w-3.5 animate-pulse text-indigo-500" /> Generating postmortem…
+            </span>
+          )}
+          {resolved && pm && (
+            <Button size="sm" variant="outline" onClick={() => setPmOpen(true)}>
               <FileText className="h-3.5 w-3.5 mr-1" /> Postmortem
             </Button>
           )}

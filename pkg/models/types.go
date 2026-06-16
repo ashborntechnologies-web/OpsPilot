@@ -767,6 +767,46 @@ type AIAction struct {
 	ApprovedByName  string `json:"approved_by_name,omitempty" db:"-"`
 }
 
+// ─── Postmortems ──────────────────────────────────────────────────────────────
+
+// Postmortem status constants.
+const (
+	PostmortemDraft     = "draft"
+	PostmortemPublished = "published"
+)
+
+// ActionItem is one follow-up from a postmortem.
+type ActionItem struct {
+	Item     string `json:"item"`
+	Owner    string `json:"owner"`
+	Priority string `json:"priority,omitempty"` // HIGH | MED | LOW
+	DueDate  string `json:"due_date,omitempty"`
+	Status   string `json:"status"` // open | done
+}
+
+// Postmortem is the AI-generated, editable, exportable writeup for a resolved incident.
+type Postmortem struct {
+	ID              uuid.UUID    `json:"id" db:"id"`
+	IncidentID      uuid.UUID    `json:"incident_id" db:"incident_id"`
+	OrgID           uuid.UUID    `json:"org_id" db:"org_id"`
+	ProjectID       uuid.UUID    `json:"project_id" db:"project_id"`
+	Title           string       `json:"title" db:"title"`
+	Status          string       `json:"status" db:"status"`
+	ContentMarkdown string       `json:"content_markdown" db:"content_markdown"`
+	ActionItems     []ActionItem `json:"action_items" db:"-"`
+	GeneratedAt     *time.Time   `json:"generated_at" db:"generated_at"`
+	PublishedAt     *time.Time   `json:"published_at" db:"published_at"`
+	PublishedBy     *uuid.UUID   `json:"published_by" db:"published_by"`
+	CreatedAt       time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time    `json:"updated_at" db:"updated_at"`
+	// Joined/derived (not columns) — populated by list/library queries.
+	ProjectName    string     `json:"project_name,omitempty" db:"-"`
+	IncidentTitle  string     `json:"incident_title,omitempty" db:"-"`
+	Severity       string     `json:"severity,omitempty" db:"-"`
+	IncidentOpened *time.Time `json:"incident_opened,omitempty" db:"-"`
+	IncidentClosed *time.Time `json:"incident_closed,omitempty" db:"-"`
+}
+
 // ValidFramework reports whether the string is a supported framework identifier.
 func ValidFramework(f string) bool {
 	switch f {

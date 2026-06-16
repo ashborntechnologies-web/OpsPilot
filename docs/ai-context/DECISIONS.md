@@ -349,6 +349,54 @@ users). `ai_actions` coexists with the advisory `incident_actions`.
 
 ---
 
+## ADR-014 — Postmortems generated asynchronously, in their own package
+**Date:** 2026-06-15 · **Status:** Accepted
+
+**Decision.** Resolving an incident does **not** generate its postmortem inline. The
+resolve handler enqueues a `postmortem:generate` Asynq job and returns immediately with
+`{status:"resolved", postmortem_generating:true}`. A new `internal/postmortem` package owns
+generation (Claude call), persistence (the `postmortems` table, draft → published), editing,
+and export; the war room polls `GET /incidents/:id/postmortem` (404 `{generating:true}`
+until ready).
+
+**Context.** Generation is a full Claude completion over the whole incident (timeline +
+diagnosis + AI actions + deployment + project memory) — multiple seconds, and it can fail
+or rate-limit. Previously `incidents` generated it synchronously inside resolve and returned
+the markdown in the response.
+
+**Why async.** Resolving an incident is a high-stakes, time-pressured click; it must feel
+instant and must never fail because the LLM is slow or down. Blocking the HTTP response on a
+multi-second Claude call couples incident closure to model availability — exactly the
+"degrade, don't break" violation the core principles warn against. Enqueuing decouples them:
+resolve always succeeds, the postmortem arrives shortly after, and a transient LLM failure
+retries (`MaxRetry(1)`) instead of surfacing as a resolve error. This also matches the
+established pattern — every other multi-second AI/infra job (deploy, diagnosis, summary)
+already goes through Asynq with progress surfaced afterward.
+
+**Why a separate package, not a method on `incidents`.** A postmortem is now a first-class,
+editable, publishable, exportable artifact with its own table, lifecycle (draft/published),
+org-library queries, and export formats — substantially more than incidents' timeline logic.
+Keeping it in `incidents` would also create an import cycle (it needs `memory`, and the queue
+worker needs to call it). `incidents` keeps only a `PostmortemEnqueuer` interface (satisfied
+by `*queue.Client`) injected via `SetPostmortemEnqueuer`.
+
+**Idempotency.** The worker upserts `ON CONFLICT(incident_id)`, so a retry (or a
+double-resolve) overwrites the same draft rather than duplicating. `incidents.postmortem` is
+kept as a backward-compat mirror of `content_markdown`.
+
+**Alternatives.** Synchronous generation (rejected: couples resolve to LLM latency/uptime);
+a method on `incidents` returning over WebSocket (rejected: still needs the table + editor +
+export + library, and the import cycle remains); generating lazily on first view (rejected:
+loses the "fix → memory" learning signal and makes the artifact's existence ambiguous).
+
+**Impact.** New `internal/postmortem` package + `postmortems` table + `postmortem:generate`
+task/handler + `EnqueueGeneratePostmortem`. `HandleResolve` no longer returns markdown;
+`HandleSavePostmortem` removed. New editor (`/postmortems/[id]/edit`) and SOC2-framed library
+(`/orgs/postmortems`) pages + navbar link. Generation writes a `successful_fix` to
+`project_memory`. PDF export is print-ready HTML (no native PDF dependency).
+
+---
+
 ## ADR-008 — Tenant isolation via one ownership middleware
 **Date:** 2025-Q4 · **Status:** Superseded by ADR-009 (RBAC/org membership replaces
 single-user ownership; the "one middleware guard" principle carries forward)

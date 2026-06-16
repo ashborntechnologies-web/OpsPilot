@@ -30,6 +30,7 @@ import (
 	"github.com/ashborntechnologies-web/OpsPilot/internal/monitor"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/notify"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/orgs"
+	"github.com/ashborntechnologies-web/OpsPilot/internal/postmortem"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/prompts"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/queue"
 	"github.com/ashborntechnologies-web/OpsPilot/internal/slack"
@@ -269,6 +270,10 @@ func main() {
 	// diagnoses open a shared, real-time incident with an AI+human timeline.
 	incidentsSvc := incidents.NewService(db, llm.New(os.Getenv("ANTHROPIC_API_KEY")), hub)
 
+	// Postmortems — generated asynchronously when an incident is resolved (ADR-014).
+	postmortemSvc := postmortem.NewService(db, llm.New(os.Getenv("ANTHROPIC_API_KEY")), memorySvc)
+	incidentsSvc.SetPostmortemEnqueuer(queueClient)
+
 	diagnosisSvc := diagnosis.NewService(db, awsSvc, eventSvc, os.Getenv("ANTHROPIC_API_KEY"))
 	diagnosisSvc.SetMemoryService(memorySvc)
 	diagnosisSvc.SetIncidentService(incidentsSvc)
@@ -307,6 +312,7 @@ func main() {
 		diagnosisSvc,
 		discoverySvc,
 		summarySvc,
+		postmortemSvc,
 	)
 	go queueServer.Start()
 	defer queueServer.Stop()
@@ -413,6 +419,13 @@ func main() {
 		protected.POST("/actions/:actionId/approve", trustSvc.HandleApprove)
 		protected.POST("/actions/:actionId/reject", trustSvc.HandleReject)
 
+		// Postmortems — edit/publish/export. Org membership + role checked inside each
+		// handler (the postmortem resolves its own org).
+		protected.GET("/postmortems/:postmortemId", postmortemSvc.HandleGet)
+		protected.PATCH("/postmortems/:postmortemId", postmortemSvc.HandleUpdate)
+		protected.POST("/postmortems/:postmortemId/publish", postmortemSvc.HandlePublish)
+		protected.GET("/postmortems/:postmortemId/export", postmortemSvc.HandleExport)
+
 		// Organizations (team workspaces)
 		protected.POST("/orgs", orgsSvc.HandleCreateOrg)
 		protected.GET("/orgs/me", orgsSvc.HandleListMyOrgs)
@@ -430,6 +443,7 @@ func main() {
 		org.GET("/members", orgsSvc.HandleListMembers)
 		org.GET("/resources", discoverySvc.HandleListOrgResources) // discovered resource inventory
 		org.GET("/incidents", incidentsSvc.HandleListOrgIncidents) // war-room incident list
+		org.GET("/postmortems", postmortemSvc.HandleListOrg)       // published postmortem library (SOC2)
 		org.GET("/actions", trustSvc.HandleListOrgActions)         // pending AI-action approvals
 
 		// Slack integration — read for any member; install/config/disconnect are admin.
@@ -523,7 +537,7 @@ func main() {
 		inc.POST("/timeline", incidentsSvc.HandlePostTimeline)
 		inc.POST("/acknowledge", incidentsSvc.HandleAcknowledge)
 		inc.POST("/resolve", incidentsSvc.HandleResolve)
-		inc.POST("/postmortem", incidentsSvc.HandleSavePostmortem)
+		inc.GET("/postmortem", postmortemSvc.HandleGetByIncident) // 404 {generating} while async generation runs
 		inc.POST("/actions/:actionId/approve", incidentsSvc.HandleApproveAction)
 		inc.POST("/actions/:actionId/reject", incidentsSvc.HandleRejectAction)
 	}

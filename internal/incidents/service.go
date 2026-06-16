@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/ashborntechnologies-web/OpsPilot/internal/llm"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
@@ -22,14 +21,24 @@ import (
 )
 
 type Service struct {
-	db  *models.DB
-	llm *llm.Client
-	hub *ws.Hub
+	db          *models.DB
+	llm         *llm.Client
+	hub         *ws.Hub
+	postmortems PostmortemEnqueuer
+}
+
+// PostmortemEnqueuer enqueues async postmortem generation when an incident is resolved
+// (satisfied by *queue.Client). Injected so resolve never blocks on Claude.
+type PostmortemEnqueuer interface {
+	EnqueueGeneratePostmortem(incidentID string) error
 }
 
 func NewService(db *models.DB, llmClient *llm.Client, hub *ws.Hub) *Service {
 	return &Service{db: db, llm: llmClient, hub: hub}
 }
+
+// SetPostmortemEnqueuer wires async postmortem generation on incident resolve.
+func (s *Service) SetPostmortemEnqueuer(e PostmortemEnqueuer) { s.postmortems = e }
 
 // CreateParams describes a new (or re-diagnosed) incident, produced by the diagnosis
 // pipeline when a deploy fails or a runtime anomaly is detected.
@@ -185,99 +194,8 @@ func (s *Service) broadcast(incidentID uuid.UUID, msgType string, payload any) {
 	s.hub.Broadcast(incidentID.String(), ws.Message{Type: msgType, Payload: string(b)})
 }
 
-// GeneratePostmortem asks Claude to write a markdown postmortem from the incident's full
-// timeline, root cause, actions taken, and duration, stores it, and returns it.
-func (s *Service) GeneratePostmortem(ctx context.Context, incidentID uuid.UUID) (string, error) {
-	var (
-		title, severity, trigger string
-		rootCause, resolution    *string
-		createdAt                time.Time
-		resolvedAt               *time.Time
-	)
-	err := s.db.Pool.QueryRow(ctx, `
-		SELECT COALESCE(title,''), severity, trigger, root_cause, resolution, created_at, resolved_at
-		FROM incidents WHERE id = $1`, incidentID,
-	).Scan(&title, &severity, &trigger, &rootCause, &resolution, &createdAt, &resolvedAt)
-	if err != nil {
-		return "", err
-	}
-
-	timeline := s.renderTimelineText(ctx, incidentID)
-	actions := s.renderActionsText(ctx, incidentID)
-	duration := "unknown"
-	if resolvedAt != nil {
-		duration = resolvedAt.Sub(createdAt).Round(time.Minute).String()
-	}
-
-	system := "You are an SRE writing a concise, blameless postmortem. Output GitHub-" +
-		"flavored markdown with exactly these sections as level-2 headings: " +
-		"## Summary, ## Timeline, ## Root Cause, ## Contributing Factors, ## Action Items. " +
-		"Be specific and factual; do not invent details not present in the input. Keep it tight."
-
-	user := fmt.Sprintf(
-		"Incident: %s\nSeverity: %s\nTrigger: %s\nDuration: %s\n\nRoot cause:\n%s\n\nResolution:\n%s\n\nTimeline:\n%s\n\nActions:\n%s",
-		title, severity, trigger, duration, derefOr(rootCause, "n/a"), derefOr(resolution, "n/a"), timeline, actions)
-
-	md, err := s.llm.Complete(ctx, system, user, 1200)
-	if err != nil {
-		// Fall back to a minimal template so resolution is never blocked by an AI outage.
-		md = fmt.Sprintf("## Summary\n%s (%s, %s).\n\n## Timeline\n%s\n\n## Root Cause\n%s\n\n## Contributing Factors\n_To be filled in._\n\n## Action Items\n- [ ] Review and complete this postmortem.",
-			title, severity, duration, timeline, derefOr(rootCause, "n/a"))
-	}
-
-	if _, err := s.db.Pool.Exec(ctx, `UPDATE incidents SET postmortem = $1 WHERE id = $2`, md, incidentID); err != nil {
-		return md, err
-	}
-	return md, nil
-}
-
-// renderTimelineText renders the timeline as plain text for the postmortem prompt.
-func (s *Service) renderTimelineText(ctx context.Context, incidentID uuid.UUID) string {
-	rows, err := s.db.Pool.Query(ctx, `
-		SELECT t.author_type, COALESCE(u.email,'AI'), t.entry_type, t.content, t.created_at
-		FROM incident_timeline t LEFT JOIN users u ON u.id = t.author_id
-		WHERE t.incident_id = $1 ORDER BY t.created_at ASC`, incidentID)
-	if err != nil {
-		return "n/a"
-	}
-	defer rows.Close()
-	var b strings.Builder
-	for rows.Next() {
-		var authorType, author, entryType, content string
-		var ts time.Time
-		if rows.Scan(&authorType, &author, &entryType, &content, &ts) != nil {
-			continue
-		}
-		if len(content) > 600 {
-			content = content[:600] + "…"
-		}
-		fmt.Fprintf(&b, "- [%s] %s (%s): %s\n", ts.UTC().Format("15:04"), author, entryType, content)
-	}
-	if b.Len() == 0 {
-		return "n/a"
-	}
-	return b.String()
-}
-
-func (s *Service) renderActionsText(ctx context.Context, incidentID uuid.UUID) string {
-	rows, err := s.db.Pool.Query(ctx,
-		`SELECT proposed_by, action_type, status FROM incident_actions WHERE incident_id = $1 ORDER BY created_at ASC`, incidentID)
-	if err != nil {
-		return "n/a"
-	}
-	defer rows.Close()
-	var b strings.Builder
-	for rows.Next() {
-		var by, at, st string
-		if rows.Scan(&by, &at, &st) == nil {
-			fmt.Fprintf(&b, "- %s proposed %s (%s)\n", by, at, st)
-		}
-	}
-	if b.Len() == 0 {
-		return "none"
-	}
-	return b.String()
-}
+// (Postmortem generation moved to internal/postmortem — see ADR-014. Incidents now only
+// enqueues generation on resolve; this package no longer renders postmortems.)
 
 // deriveTitle builds a short incident title from the root cause (first sentence) or the
 // trigger when no root cause is available.
@@ -300,13 +218,6 @@ func deriveTitle(rootCause, trigger string) string {
 	default:
 		return "Incident"
 	}
-}
-
-func derefOr(s *string, fallback string) string {
-	if s == nil || strings.TrimSpace(*s) == "" {
-		return fallback
-	}
-	return *s
 }
 
 // loadIncidentOrg returns the org that owns an incident (for access checks).

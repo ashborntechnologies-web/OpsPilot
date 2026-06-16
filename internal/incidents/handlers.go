@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -230,8 +231,9 @@ func (s *Service) HandleAcknowledge(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "acknowledged", "status": models.IncidentStatusInvestigating})
 }
 
-// HandleResolve marks an incident resolved and generates the AI postmortem draft.
-// POST /incidents/:id/resolve — engineer+.
+// HandleResolve marks an incident resolved and enqueues async postmortem generation
+// (resolving never blocks on Claude — see ADR-014). The war room polls
+// GET /incidents/:id/postmortem until it's ready. POST /incidents/:id/resolve — engineer+.
 func (s *Service) HandleResolve(c *gin.Context) {
 	userID, incidentID, ok := s.requireIncidentRole(c, models.RoleEngineer)
 	if !ok {
@@ -248,38 +250,14 @@ func (s *Service) HandleResolve(c *gin.Context) {
 	if tag.RowsAffected() > 0 {
 		_, _ = s.postTimelineEntry(ctx, incidentID, models.IncidentAuthorHuman, &userID,
 			"Marked resolved.", models.IncidentEntryResolution, nil)
-	}
-	postmortem, err := s.GeneratePostmortem(ctx, incidentID)
-	if err != nil {
-		// Resolution succeeded even if postmortem generation hit an error.
-		c.JSON(http.StatusOK, gin.H{"status": models.IncidentStatusResolved, "postmortem": postmortem, "postmortem_error": err.Error()})
-		return
+		if s.postmortems != nil {
+			if err := s.postmortems.EnqueueGeneratePostmortem(incidentID.String()); err != nil {
+				slog.Warn("incidents: failed to enqueue postmortem", "component", "incidents", "incident", incidentID, "error", err)
+			}
+		}
 	}
 	s.broadcast(incidentID, "incident_update", gin.H{"status": models.IncidentStatusResolved})
-	c.JSON(http.StatusOK, gin.H{"status": models.IncidentStatusResolved, "postmortem": postmortem})
-}
-
-// HandleSavePostmortem persists the (possibly edited) postmortem. POST /incidents/:id/postmortem — engineer+.
-func (s *Service) HandleSavePostmortem(c *gin.Context) {
-	userID, incidentID, ok := s.requireIncidentRole(c, models.RoleEngineer)
-	if !ok {
-		return
-	}
-	var req struct {
-		Postmortem string `json:"postmortem" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "postmortem is required"})
-		return
-	}
-	ctx := c.Request.Context()
-	if _, err := s.db.Pool.Exec(ctx, `UPDATE incidents SET postmortem = $1 WHERE id = $2`, req.Postmortem, incidentID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save postmortem"})
-		return
-	}
-	_, _ = s.postTimelineEntry(ctx, incidentID, models.IncidentAuthorHuman, &userID,
-		"Postmortem published.", models.IncidentEntryResolution, nil)
-	c.JSON(http.StatusOK, gin.H{"message": "postmortem published"})
+	c.JSON(http.StatusOK, gin.H{"status": models.IncidentStatusResolved, "postmortem_generating": true})
 }
 
 // HandleApproveAction approves a pending AI/human-proposed action.

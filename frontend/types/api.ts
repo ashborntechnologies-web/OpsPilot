@@ -295,6 +295,38 @@ export interface IncidentDetail {
   actions: IncidentAction[];
 }
 
+export type PostmortemStatus = "draft" | "published";
+
+export interface ActionItem {
+  item: string;
+  owner?: string;
+  priority?: string;
+  due_date?: string;
+  status?: string;
+}
+
+export interface Postmortem {
+  id: string;
+  incident_id: string;
+  org_id: string;
+  project_id: string;
+  title: string;
+  status: PostmortemStatus;
+  content_markdown: string;
+  action_items: ActionItem[];
+  generated_at: string | null;
+  published_at: string | null;
+  published_by: string | null;
+  created_at: string;
+  updated_at: string;
+  // joined/derived (library list view)
+  project_name?: string;
+  incident_title?: string;
+  severity?: string;
+  incident_opened?: string | null;
+  incident_closed?: string | null;
+}
+
 export interface SlackChannel {
   id: string;
   name: string;

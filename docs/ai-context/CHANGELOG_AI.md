@@ -16,6 +16,46 @@ Format:
 
 ---
 
+## 2026-06-15 — Automated postmortem generation (async)
+- **What:** When an incident is resolved, OpsPilot generates a structured postmortem from
+  the incident data, makes it editable, publishable to an org library, and exportable.
+  - **Async by design (ADR-014):** `HandleResolve` enqueues a `postmortem:generate` Asynq
+    job and returns `{status:"resolved", postmortem_generating:true}` instead of blocking on
+    Claude. The war room polls `GET /incidents/:id/postmortem` (404 `{generating:true}`
+    until ready) and shows a "Generating…" → preview state.
+  - **New `internal/postmortem` package:** `GeneratePostmortem` loads timeline + diagnosis +
+    AI actions + deployment + project memory, calls Claude for fixed-section markdown
+    (Summary / Timeline / Root Cause / Contributing Factors / What Went Well / Action Items),
+    parses structured action items, upserts a `postmortems` draft `ON CONFLICT(incident_id)`,
+    mirrors markdown to `incidents.postmortem`, and writes a `successful_fix` to project
+    memory. Handlers: get-by-incident, get-by-id, PATCH update, publish, export (md /
+    print-ready HTML), org library list (filters: project/severity/date/q).
+  - **Data model:** new `postmortems` table (incident-unique, org/project scoped,
+    draft/published, `action_items` JSONB, generated/published timestamps). `ActionItem` +
+    `Postmortem` models. `memory.RecordSuccessfulFix` added.
+  - **incidents:** synchronous `GeneratePostmortem`/`HandleSavePostmortem` removed; new
+    `PostmortemEnqueuer` interface + `SetPostmortemEnqueuer`. `POST /incidents/:id/postmortem`
+    route removed.
+  - **queue:** `TaskPostmortem`/`PostmortemPayload`/`NewPostmortemTask`/`handlePostmortem`;
+    `Client.EnqueueGeneratePostmortem`; `NewServer` takes `postmortemSvc`.
+  - **Frontend:** war room reworked to async poll + read-only preview modal (Edit → editor,
+    Publish); new editor `/postmortems/[id]/edit` (markdown + action-item editor, live
+    preview, export); new SOC2-framed library `/orgs/postmortems` (search + severity filter);
+    navbar "Postmortems" link. Types + API (`getIncidentPostmortem`, `getPostmortem`,
+    `updatePostmortem`, `publishPostmortem`, `exportPostmortem`, `listOrgPostmortems`;
+    `resolveIncident` return changed; `savePostmortem` removed).
+- **Files:** `internal/postmortem/{service,handlers}.go`, `internal/incidents/{service,handlers}.go`,
+  `internal/queue/server.go`, `internal/memory/service.go`, `pkg/models/{db,types}.go`,
+  `cmd/api/main.go`, `frontend/{types/api.ts,lib/api.ts}`,
+  `frontend/app/incidents/[id]/page.tsx`, `frontend/app/postmortems/[id]/edit/page.tsx`,
+  `frontend/app/orgs/postmortems/page.tsx`, `frontend/components/layout/navbar.tsx`.
+- **Why:** close the incident loop with a durable, compliance-grade record and feed
+  resolutions back into project memory — without coupling incident closure to LLM latency.
+- **Assumptions changed:** postmortems are no longer a synchronous field returned by resolve;
+  the canonical store is the `postmortems` table (`incidents.postmortem` is now a mirror).
+- **Docs updated:** ARCHITECTURE, DATABASE_SCHEMA, API_CONTRACTS, BACKEND, CURRENT_STATE,
+  DECISIONS (ADR-014), CHANGELOG_AI.
+
 ## 2026-06-15 — Environment trust levels & AI-action approval workflow
 - **What:** AI-initiated actions are gated by per-environment trust level; they auto-execute
   within boundaries or require human approval. The "act" step of the AI-DevOps vision.

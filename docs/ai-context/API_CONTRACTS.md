@@ -84,11 +84,22 @@ Frontend client: [`frontend/lib/api.ts`](../../frontend/lib/api.ts). Errors are
 | GET | `/incidents/:incidentId` | — | `{incident, timeline, actions}` | member |
 | POST | `/incidents/:incidentId/timeline` | `{content, entry_type?}` | `IncidentTimelineEntry` (broadcast to war room) | engineer+ |
 | POST | `/incidents/:incidentId/acknowledge` | — | `{status:"investigating"}` | engineer+ |
-| POST | `/incidents/:incidentId/resolve` | — | `{status:"resolved", postmortem}` (AI-generated draft) | engineer+ |
-| POST | `/incidents/:incidentId/postmortem` | `{postmortem}` | `{message}` (publish edited) | engineer+ |
+| POST | `/incidents/:incidentId/resolve` | — | `{status:"resolved", postmortem_generating:true}` (enqueues async generation — ADR-014) | engineer+ |
+| GET | `/incidents/:incidentId/postmortem` | — | `Postmortem`, or `404 {generating:bool}` while still generating | member |
 | POST | `/incidents/:incidentId/actions/:actionId/approve` | — | `{status}` | engineer+ |
 | POST | `/incidents/:incidentId/actions/:actionId/reject` | — | `{status}` | engineer+ |
 | GET (project) | `/projects/:id/incidents` | — | `Incident[]` | member (project tier) |
+
+## Postmortems (RequireAuth; org membership + role checked per handler)
+`:postmortemId` resolves its own org. Generation is async (ADR-014); poll the incident
+endpoint above until it returns a `Postmortem`.
+| Method | Path | Request | Response | Role |
+|---|---|---|---|---|
+| GET | `/postmortems/:postmortemId` | — | `Postmortem` (for the editor) | member |
+| PATCH | `/postmortems/:postmortemId` | `{content_markdown?, title?, action_items?}` | `{message}` | engineer+ |
+| POST | `/postmortems/:postmortemId/publish` | — | `{message, status:"published"}` | engineer+ |
+| GET | `/postmortems/:postmortemId/export?format=md\|pdf` | — | markdown attachment, or print-ready HTML (`pdf`) | member |
+| GET | `/orgs/:orgId/postmortems` | `?project_id=&severity=&from=&to=&q=` | `Postmortem[]` (published only — the org library) | member |
 | POST | `/orgs/:orgId/invites` | `{email, role}` | `{invite, accept_url, email_sent}` | **admin** |
 | PATCH | `/orgs/:orgId/members/:userId` | `{role}` | `{message, role}` | **admin** (can't demote last admin) |
 | DELETE | `/orgs/:orgId/members/:userId` | — | `{message}` | **admin** (can't remove last admin) |
