@@ -2,9 +2,12 @@ package envvars
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"regexp"
+	"strings"
 
+	"github.com/ashborntechnologies-web/OpsPilot/pkg/crypto"
 	"github.com/ashborntechnologies-web/OpsPilot/pkg/models"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
@@ -13,11 +16,30 @@ import (
 )
 
 type Service struct {
-	db *models.DB
+	db      *models.DB
+	encKey  string // ENCRYPTION_KEY — secret env-var values are AES-256-GCM encrypted at rest
+	prevKey string // previous key, for rotation
 }
 
-func NewService(db *models.DB) *Service {
-	return &Service{db: db}
+func NewService(db *models.DB, encKey, prevKey string) *Service {
+	return &Service{db: db, encKey: encKey, prevKey: prevKey}
+}
+
+// encrypted values carry the pkg/crypto version prefix; plaintext (non-secret) values don't.
+func isEncrypted(v string) bool { return strings.HasPrefix(v, "v1:") }
+
+// decryptSecret returns the plaintext for a stored secret value, tolerating legacy
+// pre-encryption plaintext (no prefix) so existing rows keep working until rewritten.
+func (s *Service) decryptSecret(stored string) string {
+	if !isEncrypted(stored) {
+		return stored // legacy plaintext
+	}
+	plain, err := crypto.Decrypt(stored, s.encKey, s.prevKey)
+	if err != nil {
+		slog.Error("envvars: failed to decrypt secret", "component", "envvars", "error", err)
+		return ""
+	}
+	return plain
 }
 
 // resolveEnv parses :id and :envId and verifies the environment belongs to the project.
@@ -112,6 +134,18 @@ func (s *Service) HandleUpsert(c *gin.Context) {
 		return
 	}
 
+	// Secret values are encrypted at rest (AES-256-GCM via pkg/crypto). Non-secret values
+	// are stored plaintext (they're shown in list responses anyway).
+	storedValue := req.Value
+	if req.IsSecret && s.encKey != "" {
+		enc, err := crypto.Encrypt(req.Value, s.encKey)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encrypt secret value"})
+			return
+		}
+		storedValue = enc
+	}
+
 	var v models.EnvVar
 	err := s.db.Pool.QueryRow(c.Request.Context(),
 		`INSERT INTO env_vars (environment_id, key, value, is_secret)
@@ -119,7 +153,7 @@ func (s *Service) HandleUpsert(c *gin.Context) {
 		 ON CONFLICT (environment_id, key)
 		 DO UPDATE SET value = EXCLUDED.value, is_secret = EXCLUDED.is_secret, updated_at = NOW()
 		 RETURNING id, environment_id, key, value, is_secret, created_at, updated_at`,
-		envID, req.Key, req.Value, req.IsSecret,
+		envID, req.Key, storedValue, req.IsSecret,
 	).Scan(&v.ID, &v.EnvironmentID, &v.Key, &v.Value, &v.IsSecret, &v.CreatedAt, &v.UpdatedAt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save env var"})
@@ -147,12 +181,16 @@ func (s *Service) HandleReveal(c *gin.Context) {
 	}
 
 	var value string
+	var isSecret bool
 	err = s.db.Pool.QueryRow(c.Request.Context(),
-		`SELECT value FROM env_vars WHERE id = $1 AND environment_id = $2`, varID, envID,
-	).Scan(&value)
+		`SELECT value, is_secret FROM env_vars WHERE id = $1 AND environment_id = $2`, varID, envID,
+	).Scan(&value, &isSecret)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "env var not found"})
 		return
+	}
+	if isSecret {
+		value = s.decryptSecret(value)
 	}
 	c.JSON(http.StatusOK, gin.H{"value": value})
 }
@@ -186,7 +224,7 @@ func (s *Service) HandleDelete(c *gin.Context) {
 // be injected into the ECS task definition at deploy time.
 func (s *Service) LoadForEnvironment(ctx context.Context, environmentID uuid.UUID) ([]ecstypes.KeyValuePair, error) {
 	rows, err := s.db.Pool.Query(ctx,
-		`SELECT key, value FROM env_vars WHERE environment_id = $1 ORDER BY key ASC`, environmentID)
+		`SELECT key, value, is_secret FROM env_vars WHERE environment_id = $1 ORDER BY key ASC`, environmentID)
 	if err != nil {
 		return nil, err
 	}
@@ -195,8 +233,12 @@ func (s *Service) LoadForEnvironment(ctx context.Context, environmentID uuid.UUI
 	var pairs []ecstypes.KeyValuePair
 	for rows.Next() {
 		var k, v string
-		if err := rows.Scan(&k, &v); err != nil {
+		var isSecret bool
+		if err := rows.Scan(&k, &v, &isSecret); err != nil {
 			continue
+		}
+		if isSecret {
+			v = s.decryptSecret(v) // injected into the task definition in plaintext
 		}
 		pairs = append(pairs, ecstypes.KeyValuePair{
 			Name:  aws.String(k),
@@ -204,4 +246,43 @@ func (s *Service) LoadForEnvironment(ctx context.Context, environmentID uuid.UUI
 		})
 	}
 	return pairs, nil
+}
+
+// EncryptExistingSecrets is a one-time backfill: it encrypts any is_secret rows still stored
+// as plaintext (no crypto version prefix). Safe to run on every startup — already-encrypted
+// rows are skipped. Run after migrations in main.go.
+func (s *Service) EncryptExistingSecrets(ctx context.Context) error {
+	if s.encKey == "" {
+		return nil
+	}
+	rows, err := s.db.Pool.Query(ctx, `SELECT id, value FROM env_vars WHERE is_secret = true`)
+	if err != nil {
+		return err
+	}
+	type row struct {
+		id  uuid.UUID
+		val string
+	}
+	var toEncrypt []row
+	for rows.Next() {
+		var r row
+		if rows.Scan(&r.id, &r.val) == nil && !isEncrypted(r.val) {
+			toEncrypt = append(toEncrypt, r)
+		}
+	}
+	rows.Close()
+
+	for _, r := range toEncrypt {
+		enc, err := crypto.Encrypt(r.val, s.encKey)
+		if err != nil {
+			continue
+		}
+		if _, err := s.db.Pool.Exec(ctx, `UPDATE env_vars SET value = $1 WHERE id = $2`, enc, r.id); err != nil {
+			slog.Error("envvars: backfill encrypt failed", "component", "envvars", "id", r.id, "error", err)
+		}
+	}
+	if len(toEncrypt) > 0 {
+		slog.Info("envvars: encrypted existing plaintext secrets", "component", "envvars", "count", len(toEncrypt))
+	}
+	return nil
 }

@@ -781,6 +781,7 @@ export function updateSlackChannels(
     alert_channel_id?: string | null; alert_channel_name?: string | null;
     deploy_channel_id?: string | null; deploy_channel_name?: string | null;
     summary_channel_id?: string | null; summary_channel_name?: string | null;
+    allow_slack_deploys?: boolean;
   }
 ) {
   return request<{ message: string }>(`/orgs/${orgId}/slack`, token, {

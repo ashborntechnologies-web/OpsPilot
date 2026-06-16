@@ -46,7 +46,7 @@ func newTestRouter(t *testing.T, db *models.DB, awsMock *testutil.MockAWSProvide
 	r := gin.New()
 
 	eventSvc := events.NewService(db)
-	envVarSvc := envvars.NewService(db)
+	envVarSvc := envvars.NewService(db, "test-encryption-key", "")
 	webhookSvc := webhooks.NewService(db)
 	svc := deploy.NewService(db, awsMock, &testutil.MockGitHubProvider{Token: "ghtoken"},
 		nil, &mockEnqueuer{}, eventSvc, envVarSvc, webhookSvc)

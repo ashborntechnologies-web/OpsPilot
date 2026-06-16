@@ -210,7 +210,10 @@ func (s *Service) ExecuteAction(ctx context.Context, actionID uuid.UUID, executo
 			msg, execErr = s.deployer.ApplyPendingMutation(ctx, projectID, uid)
 		}
 	case models.ActionTerminalCommand:
-		execErr = fmt.Errorf("terminal commands cannot be auto-executed")
+		// Terminal commands are never auto-executed (running arbitrary shell from an AI
+		// proposal is out of scope). Nothing currently proposes this type, but if one is
+		// ever approved, record a clear, user-facing reason rather than a generic failure.
+		execErr = fmt.Errorf("terminal commands can't be run automatically — open the project terminal (Terminal tab) to run this manually")
 	default:
 		execErr = fmt.Errorf("unknown action type %q", actionType)
 	}

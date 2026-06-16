@@ -120,6 +120,7 @@ func RunMigrations(db *DB) error {
 		createUptimeSnapshotsTable,
 		createOncallSchedulesTable,
 		addBillingToOrganizations,
+		addSlackDeployToggle,
 	}
 
 	for _, m := range migrations {
@@ -773,6 +774,14 @@ ALTER TABLE organizations
     ADD COLUMN IF NOT EXISTS ai_actions_reset_at   TIMESTAMPTZ NOT NULL DEFAULT NOW();
 UPDATE organizations o SET plan = u.plan
     FROM users u WHERE u.id = o.created_by AND u.plan IS NOT NULL AND u.plan <> 'free';`
+
+// addSlackDeployToggle gates destructive Slack slash commands (deploy/rollback) behind an
+// explicit admin opt-in (default OFF). Slack users aren't mapped to OpsPilot identities/roles
+// (ADR-018), so deploy/rollback are disabled by default; an admin must enable them per
+// workspace. Read commands (status/incidents/help) are always allowed.
+const addSlackDeployToggle = `
+ALTER TABLE slack_integrations
+    ADD COLUMN IF NOT EXISTS allow_slack_deploys BOOLEAN NOT NULL DEFAULT false;`
 
 // createIncidentActionsTable stores remediation actions proposed during an incident
 // (by the AI or a human) and their approval lifecycle.

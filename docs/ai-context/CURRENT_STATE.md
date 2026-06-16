@@ -1,6 +1,6 @@
 # Current State — OpsPilot
 
-Snapshot as of **2026-06-11**. Update whenever a feature's status changes.
+Snapshot as of **2026-06-16**. Update whenever a feature's status changes.
 Status is derived from the code on `main`, not from plans.
 
 ## ✅ Working (implemented & wired)
@@ -148,25 +148,26 @@ Status is derived from the code on `main`, not from plans.
   guarded actions).
 
 **Platform**
-- Billing: plan tiers (free/pro/team), project limit, monthly AI-action metering;
-  usage meter in navbar; notification preferences in settings.
+- Onboarding: live 3-step getting-started checklist on `/projects` (connect GitHub →
+  connect AWS → create project, `components/onboarding/checklist.tsx`) that tracks real
+  completion (probes GitHub repos + AWS accounts) and self-hides once done.
+- Landing page: scoped/revocable IAM trust signal in the hero (above the fold), addressing
+  the BYOC objection before the visitor scrolls.
+- Billing: plan tiers (free/pro/team), project limit, monthly AI-action metering (per-org —
+  ADR-017); usage meter in navbar; notification preferences in settings.
 - Outbound webhooks (deploy events, HMAC-signed, SSRF-guarded).
 - PR preview environments (GitHub webhook → ephemeral `pr-N` env + PR comment).
 - Cost intelligence (30-day Cost Explorer summary).
 - Proprietary posture: trade-secret prompts external; `Proprietary()` headers; admin
   training-data exports behind `ADMIN_API_KEY`; legal pages; `robots.txt` on the API host
   and the frontend (`app/robots.ts` — marketing/legal crawlable, app routes disallowed).
-- Security: Clerk auth, tenant-isolation middleware, encrypted GitHub tokens, request IDs.
+- Security: Clerk auth, tenant-isolation middleware, encrypted GitHub tokens + **encrypted
+  secret env vars** (AES-256-GCM at rest), request IDs.
 
 ## 🟡 Partial / thin
 
-- **Onboarding:** functional but minimal — `/projects` shows an empty-state CTA, not a
-  live multi-step GitHub→AWS→project checklist. New users can dead-end if GitHub/AWS
-  isn't connected first.
 - **HTTPS:** plumbed end-to-end (`certificate_arn` field, CF 443 listener,
   `https_enabled`, URL scheme) but optional and depends on the user supplying an ACM cert.
-- **Landing-page trust signals:** present but in the "how it works" section rather than
-  the hero / above the fold.
 - **Resource mutations / autonomy:** CPU/memory changes are *proposed then confirmed*;
   there is no autonomous remediation yet.
 - **Platform deployment:** no committed platform Dockerfile / CI manifest; runs via
@@ -185,7 +186,11 @@ Status is derived from the code on `main`, not from plans.
 - Platform stack is **not** torn down on project deletion (intended; shared).
 - `internal/deploy/service.go` is ~2700 lines (maintainability risk; see ROADMAP #refactor).
 - Secret env-var values stored plaintext in Postgres (encrypted at rest; no per-secret
-  audit / SSM-backed secret store yet).
+  audit / SSM-backed secret store yet). **Secret env-var values are now AES-256-GCM
+  encrypted at rest** (`pkg/crypto`, keyed by `ENCRYPTION_KEY`) — encrypted on write,
+  decrypted only on the reveal endpoint and at deploy-time task-def injection; a startup
+  backfill encrypts any pre-existing plaintext secrets. (A per-secret audit trail / SSM-backed
+  store is still future work.)
 - Email requires SMTP config; without it, notifications are logged no-ops.
 - **Billing is per-org (ADR-017):** `plan` + AI-action metering live on `organizations`;
   `CheckProjectLimit`/`IncrementAIAction`/`GetUsage` key off `org_id`. Project count and the
@@ -195,28 +200,34 @@ Status is derived from the code on `main`, not from plans.
   the source of truth.)
 - **Analytics charts are dependency-free inline SVG** (`components/analytics/charts.tsx`),
   not recharts (which is not installed) — they cover the uptime line + SLA reference line and
-  the weekly incident bars, but have no interactive tooltips/zoom. Uptime accuracy depends on
+  the weekly incident bars, with hover crosshair + tooltips (no zoom/brush). Uptime accuracy depends on
   the monitor Poller emitting `service_down`/`service_recovered` events; environments with no
   events report 100% (no observed downtime). The monthly report's cost line is best-effort
   (first account via Cost Explorer) and omitted when unavailable.
 - **Diagnosis auto-proposes a rollback** for every deploy-failure diagnosis (in `suggest`
   mode it's just a pending suggestion). `terminal_command` actions are modeled but not
   auto-executable. `change_resources` execution goes through propose+apply.
-- **Slack slash commands aren't tied to a platform user/role** — Slack users aren't
-  mapped to Clerk identities, so anyone in a connected workspace can run `/opspilot
-  deploy` (workspace connection is admin-gated). The alert "Acknowledge" button is a link
-  to the war room (no per-alert incident exists at alert time, so it can't be a true
-  action button). Both noted for a future Slack-identity-linking pass.
+- **Slack slash commands aren't tied to a platform user/role** — Slack users aren't mapped
+  to Clerk identities. Mitigated by ADR-018: destructive commands (`/opspilot deploy`,
+  `rollback`) are **disabled by default** and only work when an admin enables
+  `allow_slack_deploys` per workspace (Settings → Integrations); even then any workspace
+  member can trigger them, so the in-app flow remains the role-enforced path. Read commands
+  (status/incidents/help) are always available. Full Slack→Clerk identity linking is still a
+  future pass. The alert "Acknowledge" button is a link to the war room (no per-alert
+  incident exists at alert time, so it can't be a true action button).
 - Role-aware dashboard guards the action **handlers**, shows a view-only banner, and the
   **primary** action buttons (deploy, rollback, redeploy, scale, retry, cancel, delete
   deployment, add env var, add webhook) are now visually `disabled` with a view-only tooltip
   for viewers. A few admin-only controls (create environment, settings) are gated by render
   conditions rather than the viewer tooltip; backend enforces role regardless.
-- **Discovery scan depends on IAM permissions:** the assumed bootstrap role must allow
-  the read-only `Describe*`/`List*` calls (RDS, ElastiCache, Lambda, S3, SQS, ELBv2,
-  ECS). The current bootstrap template may not grant all of these — missing permissions
-  cause individual scanners to log + skip (no crash). Updating the template's policy is
-  a follow-up.
+- **Discovery scan depends on IAM permissions:** the bootstrap template
+  (`aws.BootstrapTemplate` in `internal/aws/cloudformation.go`, mirrored in `aws.yaml`) now
+  grants the read-only discovery calls — `rds:DescribeDBInstances`,
+  `elasticache:DescribeCacheClusters`, `lambda:ListFunctions`, `s3:ListAllMyBuckets`,
+  `sqs:ListQueues` (+ tag/attribute reads), and `ecs:ListClusters`/`ListServices` — plus
+  `ce:GetCostAndUsage` for cost. **Existing users who connected before this change must
+  update their CloudFormation stack** to pick up the new permissions; until then those
+  scanners log + skip (no crash).
 - Discovery scans only the regions an account is already used in (env + platform stacks),
   defaulting to `us-east-1` for a fresh account. `cloudfront_distribution`/`ec2_instance`
   types are defined but have no dedicated scanner yet. Only discovered **ECS services**

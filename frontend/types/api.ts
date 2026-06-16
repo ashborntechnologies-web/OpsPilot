@@ -422,6 +422,7 @@ export interface SlackIntegration {
   deploy_channel_name: string | null;
   summary_channel_id: string | null;
   summary_channel_name: string | null;
+  allow_slack_deploys: boolean;
   installed_by: string | null;
   created_at: string;
   updated_at: string;

@@ -46,6 +46,7 @@ export default function IntegrationsPage() {
   const [alertCh, setAlertCh] = useState("");
   const [deployCh, setDeployCh] = useState("");
   const [summaryCh, setSummaryCh] = useState("");
+  const [allowDeploys, setAllowDeploys] = useState(false);
   const seeded = useState(false);
 
   // OAuth result toast (?slack=connected|error).
@@ -80,6 +81,7 @@ export default function IntegrationsPage() {
     setAlertCh(integ.alert_channel_id ?? "");
     setDeployCh(integ.deploy_channel_id ?? "");
     setSummaryCh(integ.summary_channel_id ?? "");
+    setAllowDeploys(integ.allow_slack_deploys ?? false);
     seeded[1](true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
@@ -113,6 +115,7 @@ export default function IntegrationsPage() {
         alert_channel_id: alertCh || null, alert_channel_name: channelName(alertCh) || null,
         deploy_channel_id: deployCh || null, deploy_channel_name: channelName(deployCh) || null,
         summary_channel_id: summaryCh || null, summary_channel_name: channelName(summaryCh) || null,
+        allow_slack_deploys: allowDeploys,
       });
       toast.success("Channels updated");
       mutate();
@@ -203,6 +206,27 @@ export default function IntegrationsPage() {
                     <Label className="text-xs">Daily summary</Label>
                     {channelSelect(summaryCh, setSummaryCh)}
                   </div>
+                </div>
+
+                {/* Slack deploy/rollback opt-in — off by default (ADR-018). */}
+                <div className="rounded-md border bg-zinc-50 p-3">
+                  <label className="flex items-start gap-2.5 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={allowDeploys}
+                      disabled={!isAdmin}
+                      onChange={(e) => setAllowDeploys(e.target.checked)}
+                      className="mt-0.5 h-3.5 w-3.5"
+                    />
+                    <span>
+                      <span className="font-medium">Allow <code>/opspilot deploy</code> and <code>rollback</code> from Slack</span>
+                      <span className="block text-xs text-muted-foreground mt-0.5">
+                        Off by default. Slack users aren&apos;t mapped to OpsPilot roles, so <strong>anyone in this
+                        Slack workspace</strong> could trigger deploys when enabled. Leave off to require deploys run
+                        in-app where roles are enforced. Read commands (status, incidents) always work.
+                      </span>
+                    </span>
+                  </label>
                 </div>
 
                 {isAdmin && (

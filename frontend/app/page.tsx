@@ -10,7 +10,7 @@ import { useAuth } from "@clerk/nextjs";
 import { Button } from "@/components/ui/button";
 import {
   Rocket, Activity, Stethoscope, MessageSquare, GitBranch, Cloud, Eye,
-  AlertTriangle, CheckCircle2, ArrowRight,
+  AlertTriangle, CheckCircle2, ArrowRight, ShieldCheck,
 } from "lucide-react";
 
 const FEATURES = [
@@ -96,6 +96,14 @@ export default function LandingPage() {
           OpsPilot monitors your AWS deployments, diagnoses failures automatically,
           and alerts you before users notice something is wrong.
         </p>
+        {/* Trust signal above the fold — addresses the #1 objection (giving AWS access)
+            before the visitor has to scroll to find it. */}
+        <div className="mt-6 inline-flex items-center gap-2 rounded-full border border-green-200 bg-green-50 px-4 py-1.5 text-sm text-green-900">
+          <ShieldCheck className="h-4 w-4 text-green-600 shrink-0" />
+          <span>
+            Runs in <strong>your</strong> AWS account via a <strong>scoped IAM role you control and can revoke anytime</strong> — your credentials never leave it.
+          </span>
+        </div>
         <div className="mt-8 flex justify-center gap-3">
           <Button size="lg" nativeButton={false} render={<Link href="/sign-up" />}>
             Start free

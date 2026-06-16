@@ -57,6 +57,17 @@ func (s *Service) orgForTeam(ctx context.Context, teamID string) (uuid.UUID, str
 	return orgID, token, true
 }
 
+// slackDeploysAllowed reports whether the org has opted into Slack-triggered deploy/rollback
+// (ADR-018). Defaults to false (secure by default) on any error.
+func (s *Service) slackDeploysAllowed(ctx context.Context, orgID uuid.UUID) bool {
+	var allowed bool
+	if err := s.db.Pool.QueryRow(ctx,
+		`SELECT allow_slack_deploys FROM slack_integrations WHERE org_id = $1`, orgID).Scan(&allowed); err != nil {
+		return false
+	}
+	return allowed
+}
+
 // HandleCommand processes /opspilot slash commands. POST /slack/commands (signed).
 // All responses are ephemeral except deploy/rollback confirmations (in_channel).
 func (s *Service) HandleCommand(c *gin.Context) {
@@ -87,6 +98,14 @@ func (s *Service) HandleCommand(c *gin.Context) {
 	case "incidents":
 		c.JSON(http.StatusOK, ephemeral(s.incidentsText(c.Request.Context(), orgID)))
 	case "deploy", "rollback":
+		// Slack users aren't mapped to OpsPilot identities/roles (ADR-018), so destructive
+		// commands are disabled unless an admin explicitly enabled them for this workspace.
+		if !s.slackDeploysAllowed(c.Request.Context(), orgID) {
+			c.JSON(http.StatusOK, ephemeral(
+				"⚠️ Deploy/rollback from Slack is disabled for this workspace. A OpsPilot admin can enable it in Settings → Integrations, "+
+					"or run the action in the app where your role is verified."))
+			return
+		}
 		c.JSON(http.StatusOK, s.confirmAction(c.Request.Context(), orgID, cmd, fields[1:]))
 	default:
 		c.JSON(http.StatusOK, ephemeral(helpText()))
@@ -255,6 +274,16 @@ func (s *Service) HandleInteractivity(c *gin.Context) {
 	projectID, err := uuid.Parse(v.ProjectID)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{"replace_original": true, "text": "Invalid project."})
+		return
+	}
+
+	// Defense-in-depth: re-check the org's Slack-deploy opt-in before executing (ADR-018).
+	// The confirm button is only posted when enabled, but interactivity is a separate signed
+	// request, so don't trust that the gate held at command time.
+	var orgID uuid.UUID
+	if err := s.db.Pool.QueryRow(c.Request.Context(),
+		`SELECT org_id FROM projects WHERE id = $1`, projectID).Scan(&orgID); err != nil || !s.slackDeploysAllowed(c.Request.Context(), orgID) {
+		c.JSON(http.StatusOK, gin.H{"replace_original": true, "text": "Deploy/rollback from Slack is disabled for this workspace."})
 		return
 	}
 

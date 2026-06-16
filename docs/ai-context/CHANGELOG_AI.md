@@ -16,6 +16,59 @@ Format:
 
 ---
 
+## 2026-06-16 — Review batch 3: secret env-var encryption, onboarding, chart tooltips, hero trust
+- **What:** Worked the actionable subset of a product-gaps review (all verified genuinely open).
+  - **#10 Secret env vars encrypted at rest (ADR-019):** `is_secret` values are now
+    AES-256-GCM encrypted via `pkg/crypto` — encrypted on write (`HandleUpsert`), decrypted on
+    reveal + deploy-time `LoadForEnvironment`; `envvars.Service` takes `ENCRYPTION_KEY`; a
+    startup backfill (`EncryptExistingSecrets`) encrypts legacy plaintext rows (idempotent via
+    the `v1:` prefix). No schema change, no new dependency.
+  - **#6 Onboarding checklist:** live 3-step getting-started checklist on `/projects`
+    (`components/onboarding/checklist.tsx`) — probes GitHub (repo list) + AWS (accounts) +
+    projects, highlights the next action, self-hides when complete.
+  - **#7 Chart tooltips:** added hover crosshair + in-SVG tooltip to the uptime line and
+    incident bar charts (`components/analytics/charts.tsx`) — still dependency-free.
+  - **#9 Landing hero trust:** surfaced the scoped/revocable IAM-role guarantee in the hero
+    (above the fold) on the marketing page.
+  - **Deferred (per direction):** #8 staging-first trust, #11 horizontal scaling (multi-day;
+    #11 explicitly not a launch blocker).
+- **Files:** `internal/envvars/service.go`, `cmd/api/main.go`,
+  `internal/deploy/handlers_test.go`, `frontend/app/page.tsx`,
+  `frontend/app/projects/page.tsx`, `frontend/components/onboarding/checklist.tsx`,
+  `frontend/components/analytics/charts.tsx`.
+- **Assumptions changed:** secret env-var values are no longer stored plaintext; the reveal
+  endpoint and deploy path are the only decryption points.
+- **Docs updated:** CURRENT_STATE, DATABASE_SCHEMA, DECISIONS (ADR-019), CHANGELOG_AI.
+
+## 2026-06-16 — Review batch 2: discovery IAM, Slack deploy gating, terminal-cmd msg, timestamp
+- **What:** Worked a second review list — verified each claim against code first.
+  - **#1 Discovery IAM (real):** the *served* bootstrap template is the Go
+    `aws.BootstrapTemplate` (`internal/aws/cloudformation.go`), **not** `aws.yaml` (which the
+    review named). Added the missing read-only discovery permissions to both:
+    `rds:DescribeDBInstances`, `elasticache:DescribeCacheClusters`, `lambda:ListFunctions`,
+    `s3:ListAllMyBuckets`, `sqs:ListQueues` (+ tag/attribute reads) and
+    `ecs:ListClusters`/`ListServices`; `ce:GetCostAndUsage` also added to aws.yaml for parity
+    (already in the Go template). Existing users must update their CF stack to pick these up.
+  - **#2 Slack deploy gating (ADR-018):** `/opspilot deploy|rollback` now disabled by default
+    behind a per-workspace `allow_slack_deploys` flag (admin opt-in). Slack users aren't
+    mapped to OpsPilot roles, so this removes the "any workspace member can deploy prod"
+    default. Gate enforced in `HandleCommand` + re-checked in `HandleInteractivity`. New
+    migration + model field + Settings → Integrations toggle (with risk explanation). Read
+    commands unaffected. Full identity linking still deferred.
+  - **#3 terminal_command (minor):** clearer user-facing result message; confirmed it's
+    unreachable today (nothing proposes that action type) — not a live execution bug.
+  - **#5 timestamp:** CURRENT_STATE snapshot date → 2026-06-16.
+  - **#4 deploy/service.go refactor:** deferred per direction (high-risk behavior-preserving
+    split; belongs in its own PR).
+- **Files:** `internal/aws/cloudformation.go`, `aws.yaml`, `internal/slack/{commands,oauth,service}.go`,
+  `internal/trust/service.go`, `pkg/models/{db,types}.go`,
+  `frontend/{types/api.ts,lib/api.ts,app/settings/integrations/page.tsx}`,
+  `docs/ai-context/CURRENT_STATE.md`.
+- **Assumptions changed:** Slack-triggered deploys are off until an admin opts in per
+  workspace.
+- **Docs updated:** DATABASE_SCHEMA, API_CONTRACTS, CURRENT_STATE, DECISIONS (ADR-018),
+  CHANGELOG_AI.
+
 ## 2026-06-16 — Review batch: per-org billing, quick wins (robots/markdown/cost/deep-link/viewer UX)
 - **What:** Worked a (partly stale) review list — verified each claim against code, fixed
   the genuine items, skipped the already-done ones.

@@ -349,6 +349,86 @@ users). `ai_actions` coexists with the advisory `incident_actions`.
 
 ---
 
+## ADR-019 — Secret env vars encrypted at the application layer
+**Date:** 2026-06-16 · **Status:** Accepted
+
+**Decision.** `is_secret` env-var values are encrypted with AES-256-GCM (`pkg/crypto`, keyed
+by `ENCRYPTION_KEY`) before they're written to Postgres, and decrypted only at the two points
+that legitimately need plaintext: the explicit per-variable reveal endpoint and deploy-time
+task-definition injection. A startup backfill encrypts any pre-existing plaintext secrets.
+Non-secret env vars stay plaintext (they're returned in list responses anyway).
+
+**Context.** Secrets were stored plaintext in `env_vars.value`, relying solely on Postgres
+at-rest disk encryption. The same `pkg/crypto` primitive already protects GitHub and Slack
+tokens, so the building block existed; env-var secrets just hadn't adopted it.
+
+**Why application-layer encryption (vs. relying on DB-at-rest).** Disk encryption only
+protects against physical media theft — it does nothing against a leaked DB dump, a
+compromised read-replica, a `SELECT` by an over-privileged operator, or a log that captured a
+query. Encrypting at the application layer means the value is opaque everywhere except the two
+code paths holding the key, shrinking the blast radius of any database-level exposure. It also
+makes "secret" mean something concrete in the data model rather than just a redaction flag.
+
+**Why not a dedicated secrets store (SSM/Secrets Manager) now.** A managed secret store is the
+stronger end state (per-secret rotation, audit, IAM-scoped access) but it's a larger change:
+per-tenant SSM namespacing, deploy-time resolution, lifecycle management, and cost. Encrypting
+in place with the existing primitive removes the plaintext-at-rest exposure immediately and is
+fully compatible with a later SSM migration. Noted as future work in CURRENT_STATE.
+
+**Why the `v1:` prefix matters here.** `crypto.Decrypt` is prefix-aware, so legacy plaintext
+rows (no prefix) keep working during the transition and the startup backfill is idempotent
+(it skips already-`v1:`-prefixed values). Decrypt failures at deploy time skip the variable
+(and log) rather than injecting ciphertext into the container.
+
+**Impact.** `envvars.Service` now takes `ENCRYPTION_KEY`/`ENCRYPTION_KEY_PREV`; encrypt on
+`HandleUpsert`, decrypt on `HandleReveal` + `LoadForEnvironment`; `EncryptExistingSecrets`
+backfill runs after migrations in `main.go`. No schema change (same `value` column). No new
+dependency (reuses `pkg/crypto`).
+
+---
+
+## ADR-018 — Slack deploy/rollback disabled by default (no Slack→OpsPilot identity)
+**Date:** 2026-06-16 · **Status:** Accepted
+
+**Decision.** The destructive Slack slash commands (`/opspilot deploy`, `/opspilot
+rollback`) are gated behind a per-workspace `slack_integrations.allow_slack_deploys` flag
+that defaults to **false**. An OpsPilot admin must explicitly opt in (Settings →
+Integrations). Read-only commands (`status`, `incidents`, `help`) are always available. The
+gate is enforced at command time and re-checked in the interactivity (Approve button)
+handler.
+
+**Context.** Slack users are not mapped to Clerk/OpsPilot identities — the only mapping is
+`team_id → org`. So a slash command's caller cannot be resolved to an OpsPilot user or
+role; the RBAC that protects the in-app deploy button (engineer+) can't be applied to a
+Slack invocation. As shipped, anyone in a connected Slack workspace could run `/opspilot
+deploy` and trigger a production rollout. The workspace *connection* is admin-gated, but
+individual callers were not checked.
+
+**Why secure-by-default gating rather than full identity linking (now).** Properly closing
+the gap means a Slack-user→OpsPilot-user linking flow (a mapping table, an OAuth/verify
+step, role lookup) — a real feature, not a fix. Until that exists, the responsible default
+is to not expose a production-deploy trigger to unauthenticated-by-us callers. A default-off
+flag removes the dangerous default immediately, keeps the feature available to teams who
+accept the tradeoff (small/trusted workspaces), and doesn't block the future linking work.
+
+**Why keep it possible at all (vs. removing Slack deploys).** Slack-triggered deploys are a
+genuinely useful workflow for some teams; removing the feature outright punishes trusted
+workspaces for a gap that doesn't apply to them. The opt-in surfaces the risk explicitly in
+the UI ("anyone in this Slack workspace could trigger deploys") so the admin enabling it is
+making an informed choice.
+
+**Why re-check in the interactivity handler.** The confirm/Approve button is only posted when
+the gate is open, but Slack interactivity arrives as a separate signed request; defense-in-
+depth means re-resolving the project's org and re-checking the flag before executing, so a
+replayed or crafted payload can't bypass a disabled gate.
+
+**Impact.** `addSlackDeployToggle` migration; `allow_slack_deploys` on `SlackIntegration`;
+`HandleCommand` + `HandleInteractivity` gate checks (`slackDeploysAllowed`); the channel
+PATCH accepts the flag; a default-off toggle with a risk explanation in Settings →
+Integrations. Full Slack↔Clerk identity linking remains a future pass.
+
+---
+
 ## ADR-017 — Billing is per-org (workspace), not per-user
 **Date:** 2026-06-16 · **Status:** Accepted
 

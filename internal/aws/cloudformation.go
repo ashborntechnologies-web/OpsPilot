@@ -86,6 +86,9 @@ Resources:
                   - ecs:DescribeTaskDefinition
                   - ecs:ListTasks
                   - ecs:DescribeTasks
+                  - ecs:ListClusters
+                  - ecs:ListServices
+                  - ecs:ListTagsForResource
                   - ecs:TagResource
                   - ecs:ExecuteCommand
                 Resource: '*'
@@ -229,6 +232,27 @@ Resources:
                 Action:
                   - ce:GetCostAndUsage
                   - ce:GetCostForecast
+                Resource: '*'
+              - Sid: DiscoveryReadOnly
+                Effect: Allow
+                # Read-only calls used by infrastructure discovery (internal/discovery) to
+                # inventory existing resources. Without these the RDS/ElastiCache/Lambda/S3/SQS
+                # scanners silently skip and the inventory is incomplete with no error surfaced.
+                # (ECS/ALB/EC2 discovery is already covered by the ECS list calls and the
+                # elasticloadbalancing:Describe* / ec2:Describe* wildcards above.)
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:ListTagsForResource
+                  - elasticache:DescribeCacheClusters
+                  - elasticache:ListTagsForResource
+                  - lambda:ListFunctions
+                  - lambda:ListTags
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketLocation
+                  - s3:GetBucketTagging
+                  - sqs:ListQueues
+                  - sqs:GetQueueAttributes
+                  - sqs:ListQueueTags
                 Resource: '*'
 
 Outputs:
