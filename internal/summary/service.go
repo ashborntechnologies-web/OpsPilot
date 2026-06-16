@@ -137,10 +137,31 @@ func (s *Service) GenerateDailySummary(ctx context.Context, orgID uuid.UUID, dat
 	return sum, nil
 }
 
-// costChange returns the 7d-vs-previous-7d cost change percentage. Best-effort: returns 0
-// (skipped) when the org has no AWS account or Cost Explorer isn't wired. See CURRENT_STATE.
-func (s *Service) costChange(_ context.Context, _ uuid.UUID) float64 {
-	return 0
+// costChange returns the last-7d-vs-prior-7d platform cost change percentage for the org,
+// via Cost Explorer on the org's first AWS-funded project. Best-effort: returns 0 (omitted
+// from output) when there's no connected account, no prior-period spend, or any API error.
+func (s *Service) costChange(ctx context.Context, orgID uuid.UUID) float64 {
+	if s.awsSvc == nil {
+		return 0
+	}
+	var projectID uuid.UUID
+	if err := s.db.Pool.QueryRow(ctx,
+		`SELECT id FROM projects WHERE org_id = $1 AND account_id IS NOT NULL ORDER BY created_at ASC LIMIT 1`,
+		orgID).Scan(&projectID); err != nil {
+		return 0
+	}
+
+	now := time.Now().UTC()
+	fmtDate := func(t time.Time) string { return t.Format("2006-01-02") }
+	last7, err := s.awsSvc.GetCostTotalForRange(ctx, projectID.String(), fmtDate(now.AddDate(0, 0, -7)), fmtDate(now))
+	if err != nil {
+		return 0
+	}
+	prior7, err := s.awsSvc.GetCostTotalForRange(ctx, projectID.String(), fmtDate(now.AddDate(0, 0, -14)), fmtDate(now.AddDate(0, 0, -7)))
+	if err != nil || prior7 <= 0 {
+		return 0
+	}
+	return (last7 - prior7) / prior7 * 100.0
 }
 
 // analyze asks Claude for a one-paragraph summary and ≤3 recommendations, grounded in the

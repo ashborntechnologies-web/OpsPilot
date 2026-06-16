@@ -1568,7 +1568,8 @@ export default function ProjectPage() {
                                 size="sm"
                                 variant="outline"
                                 onClick={() => { setScaleTarget(env); setScaleReplicas(1); }}
-                                title="Scale ECS service"
+                                disabled={isViewer}
+                                title={isViewer ? VIEW_ONLY_MSG : "Scale ECS service"}
                               >
                                 <Scaling className="h-3 w-3 mr-1" />
                                 Scale
@@ -1576,7 +1577,8 @@ export default function ProjectPage() {
                               <Button
                                 size="sm"
                                 onClick={() => handleDeploy(env)}
-                                disabled={deploying === env.id}
+                                disabled={deploying === env.id || isViewer}
+                                title={isViewer ? VIEW_ONLY_MSG : undefined}
                               >
                                 {deploying === env.id
                                   ? <Loader2 className="h-3 w-3 mr-1 animate-spin" />
@@ -1590,7 +1592,8 @@ export default function ProjectPage() {
                             <Button
                               size="sm"
                               variant="destructive"
-                              disabled={retrying === env.id}
+                              disabled={retrying === env.id || isViewer}
+                              title={isViewer ? VIEW_ONLY_MSG : undefined}
                               onClick={() => handleRetry(env)}
                             >
                               {retrying === env.id
@@ -1893,7 +1896,7 @@ export default function ProjectPage() {
                             {dep.status}
                           </Badge>
                           {dep.status === "live" && (
-                            <Button size="sm" variant="outline" onClick={() => handleRollback(dep)}>
+                            <Button size="sm" variant="outline" disabled={isViewer} title={isViewer ? VIEW_ONLY_MSG : undefined} onClick={() => handleRollback(dep)}>
                               <RotateCcw className="h-3 w-3 mr-1" />
                               Rollback
                             </Button>
@@ -1916,7 +1919,8 @@ export default function ProjectPage() {
                             <Button
                               size="sm"
                               variant="outline"
-                              disabled={redeploying === dep.id}
+                              disabled={redeploying === dep.id || isViewer}
+                              title={isViewer ? VIEW_ONLY_MSG : undefined}
                               onClick={() => handleRedeploy(dep)}
                             >
                               {redeploying === dep.id
@@ -1931,6 +1935,8 @@ export default function ProjectPage() {
                               size="sm"
                               variant="outline"
                               className="text-red-600 hover:text-red-700"
+                              disabled={isViewer}
+                              title={isViewer ? VIEW_ONLY_MSG : undefined}
                               onClick={() => handleCancelDeployment(dep)}
                             >
                               <XCircle className="h-3 w-3 mr-1" />
@@ -1942,6 +1948,8 @@ export default function ProjectPage() {
                               size="sm"
                               variant="ghost"
                               className="text-red-500 hover:text-red-600 hover:bg-red-50 px-2"
+                              disabled={isViewer}
+                              title={isViewer ? VIEW_ONLY_MSG : undefined}
                               onClick={() => handleDeleteOpen(dep)}
                             >
                               <Trash2 className="h-3 w-3" />
@@ -2070,7 +2078,8 @@ export default function ProjectPage() {
                     </button>
                     <Button
                       size="sm"
-                      disabled={!newKey.trim() || !newValue.trim() || savingEnvVar}
+                      disabled={!newKey.trim() || !newValue.trim() || savingEnvVar || isViewer}
+                      title={isViewer ? VIEW_ONLY_MSG : undefined}
                       onClick={handleSaveEnvVar}
                     >
                       {savingEnvVar ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : <Plus className="h-3.5 w-3.5 mr-1" />}
@@ -2190,7 +2199,7 @@ export default function ProjectPage() {
                     ConvDeploy POSTs to these URLs on deploy events. Requests are signed with HMAC-SHA256 when a secret is set.
                   </p>
                 </div>
-                <Button size="sm" onClick={() => setHookDialog(true)}>
+                <Button size="sm" disabled={isViewer} title={isViewer ? VIEW_ONLY_MSG : undefined} onClick={() => setHookDialog(true)}>
                   <Plus className="h-3 w-3 mr-1" /> Add Webhook
                 </Button>
               </div>

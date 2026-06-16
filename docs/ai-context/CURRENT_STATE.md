@@ -154,7 +154,8 @@ Status is derived from the code on `main`, not from plans.
 - PR preview environments (GitHub webhook → ephemeral `pr-N` env + PR comment).
 - Cost intelligence (30-day Cost Explorer summary).
 - Proprietary posture: trade-secret prompts external; `Proprietary()` headers; admin
-  training-data exports behind `ADMIN_API_KEY`; legal pages; `robots.txt` on API host.
+  training-data exports behind `ADMIN_API_KEY`; legal pages; `robots.txt` on the API host
+  and the frontend (`app/robots.ts` — marketing/legal crawlable, app routes disallowed).
 - Security: Clerk auth, tenant-isolation middleware, encrypted GitHub tokens, request IDs.
 
 ## 🟡 Partial / thin
@@ -186,17 +187,18 @@ Status is derived from the code on `main`, not from plans.
 - Secret env-var values stored plaintext in Postgres (encrypted at rest; no per-secret
   audit / SSM-backed secret store yet).
 - Email requires SMTP config; without it, notifications are logged no-ops.
-- **Billing is still per-user** (`CheckProjectLimit`/AI metering key off `user_id`), not
-  per-org — a known seam now that projects are org-owned.
+- **Billing is per-org (ADR-017):** `plan` + AI-action metering live on `organizations`;
+  `CheckProjectLimit`/`IncrementAIAction`/`GetUsage` key off `org_id`. Project count and the
+  monthly AI-action allowance are workspace-wide (so five members share one Free-tier cap).
+  `/users/me` reports the caller's **active org** usage. (No payment integration yet — plans
+  are set directly; the per-user `users.plan`/`ai_actions_*` columns remain but are no longer
+  the source of truth.)
 - **Analytics charts are dependency-free inline SVG** (`components/analytics/charts.tsx`),
   not recharts (which is not installed) — they cover the uptime line + SLA reference line and
   the weekly incident bars, but have no interactive tooltips/zoom. Uptime accuracy depends on
   the monitor Poller emitting `service_down`/`service_recovered` events; environments with no
   events report 100% (no observed downtime). The monthly report's cost line is best-effort
   (first account via Cost Explorer) and omitted when unavailable.
-- **Daily-summary cost-change is stubbed** — `summary.costChange` returns 0 (the
-  `CostChangePct` field + 7d-vs-prior-7d Cost Explorer comparison are not yet implemented;
-  it's omitted from output when 0). Everything else in the summary is real DB data.
 - **Diagnosis auto-proposes a rollback** for every deploy-failure diagnosis (in `suggest`
   mode it's just a pending suggestion). `terminal_command` actions are modeled but not
   auto-executable. `change_resources` execution goes through propose+apply.
@@ -205,9 +207,11 @@ Status is derived from the code on `main`, not from plans.
   deploy` (workspace connection is admin-gated). The alert "Acknowledge" button is a link
   to the war room (no per-alert incident exists at alert time, so it can't be a true
   action button). Both noted for a future Slack-identity-linking pass.
-- Role-aware dashboard guards the action **handlers** + shows a view-only banner;
-  per-button `disabled` styling across every control is a follow-up (backend enforces
-  regardless, so viewers always get 403).
+- Role-aware dashboard guards the action **handlers**, shows a view-only banner, and the
+  **primary** action buttons (deploy, rollback, redeploy, scale, retry, cancel, delete
+  deployment, add env var, add webhook) are now visually `disabled` with a view-only tooltip
+  for viewers. A few admin-only controls (create environment, settings) are gated by render
+  conditions rather than the viewer tooltip; backend enforces role regardless.
 - **Discovery scan depends on IAM permissions:** the assumed bootstrap role must allow
   the read-only `Describe*`/`List*` calls (RDS, ElastiCache, Lambda, S3, SQS, ELBv2,
   ECS). The current bootstrap template may not grant all of these — missing permissions
@@ -219,9 +223,12 @@ Status is derived from the code on `main`, not from plans.
   feed the monitor.
 - **Incident actions are advisory** — approving an AI-proposed action records the decision
   (status + approver + timestamp) but there is no autonomous executor yet; the engineer
-  still performs the fix. Markdown in the war room uses a small built-in renderer (headings/
-  bold/code/lists), not a full markdown engine. Alert emails link to the incident **list**
-  (the specific incident is opened by the diagnosis job that runs after the alert).
+  still performs the fix. The war-room/postmortem markdown renderer (`lib/markdown.tsx`) now
+  covers headings, bold, code, fenced blocks, ordered/unordered lists, **GFM tables,
+  blockquotes, and horizontal rules** (still dependency-free, no raw-HTML passthrough).
+  Alert emails deep-link to the specific war room when an incident is already open for the
+  project/environment, otherwise to the incident list (the diagnosis job that follows the
+  alert opens the specific incident moments later).
 
 ## 🔭 Actively developing
 Continuous-operation intelligence (monitoring → alert → diagnosis → memory loop) and

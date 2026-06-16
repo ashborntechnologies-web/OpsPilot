@@ -149,15 +149,19 @@ func (s *Service) ProcessMessage(ctx context.Context, projectID uuid.UUID, userI
 	}
 
 	// AI-action metering — classification calls Claude, so it counts against the
-	// plan allowance. Checked before any work so the limit message is immediate.
+	// workspace's plan allowance (metered per org — ADR-017). Checked before any work so
+	// the limit message is immediate.
 	if s.billing != nil {
-		if err := s.billing.IncrementAIAction(ctx, userID); err != nil {
-			var limitErr *billing.ErrLimitReached
-			if errors.As(err, &limitErr) {
-				return limitErr.Message, nil
+		var orgID uuid.UUID
+		if err := s.db.Pool.QueryRow(ctx, `SELECT org_id FROM projects WHERE id = $1`, projectID).Scan(&orgID); err == nil && orgID != uuid.Nil {
+			if err := s.billing.IncrementAIAction(ctx, orgID); err != nil {
+				var limitErr *billing.ErrLimitReached
+				if errors.As(err, &limitErr) {
+					return limitErr.Message, nil
+				}
+				// Metering infrastructure failure — don't block the user.
+				slog.Error(fmt.Sprintf("[conversation] AI metering failed: %v", err))
 			}
-			// Metering infrastructure failure — don't block the user.
-			slog.Error(fmt.Sprintf("[conversation] AI metering failed: %v", err))
 		}
 	}
 

@@ -47,6 +47,13 @@ user gets a **personal org** on first login (slug `u-<userid>`), created by
 `backfillPersonalOrgs` (existing users) or `ensurePersonalOrg` in the auth middleware
 (new users). Added by `createOrganizationsTable`.
 
+> **Billing columns on `organizations`** (`addBillingToOrganizations`, ADR-017): `plan`
+> (`free`/`pro`/`team`, default `free`), `ai_actions_this_month`, `ai_actions_reset_at` —
+> plan limits + monthly AI metering are enforced **per workspace**, not per user. Existing
+> orgs inherit the founding user's plan on migration. The per-user `users.plan`/
+> `ai_actions_*` columns remain for backward compatibility but are no longer the source of
+> truth. (Also: `summary_*` delivery-schedule columns — see Daily summary below.)
+
 ### `organization_members` (RBAC)
 A user's `role` in an org: `admin` | `engineer` | `viewer` (CHECK-constrained,
 hierarchical). `UNIQUE(org_id, user_id)`. This is the tenant-isolation primitive —
@@ -62,7 +69,8 @@ membership row is created and `accepted_at` is set. Emailed via `notify.SendOrgI
 Identity, mirrored from Clerk on first authenticated request.
 - `clerk_id` (unique), `email` (unique), `github_token` (**AES-encrypted**, `json:"-"`).
 - Plan/usage/notifications (added later): `plan` (`free`/`pro`/`team`),
-  `ai_actions_this_month`, `ai_actions_reset_at` (monthly metering),
+  `ai_actions_this_month`, `ai_actions_reset_at` (monthly metering — **superseded by the
+  per-org columns on `organizations`; ADR-017**; retained for backward compatibility),
   `notifications_enabled`, `notify_deploy_failed` (default true),
   `notify_deploy_succeeded` (default false), `notify_alert_fired` (default true).
 

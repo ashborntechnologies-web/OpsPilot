@@ -349,6 +349,48 @@ users). `ai_actions` coexists with the advisory `incident_actions`.
 
 ---
 
+## ADR-017 — Billing is per-org (workspace), not per-user
+**Date:** 2026-06-16 · **Status:** Accepted
+
+**Decision.** Plan tier and usage limits (project count cap, monthly AI-action allowance)
+are enforced per **organization** (workspace), not per user. `plan`,
+`ai_actions_this_month`, and `ai_actions_reset_at` move to `organizations`;
+`billing.CheckProjectLimit`/`IncrementAIAction`/`GetUsage` key off `org_id`. `/users/me`
+reports the caller's **active org** usage (via the `X-Org-Id` header).
+
+**Context.** When tenancy moved to orgs (ADR-009), all tenant data (projects, AWS accounts,
+alerts, incidents) became org-owned, but billing still keyed off `user_id`: project counts
+came from `projects WHERE user_id = ...` and AI metering incremented a counter on `users`.
+
+**Why this was a real bug, not just a seam.** With per-user limits, a 5-member workspace on
+the Free tier (1 project / 10 AI actions each) could create 5 projects and run 50 AI actions
+collectively — the workspace as a whole blew past every cap the plan was supposed to enforce.
+Worse, the *same* project counted against whichever member happened to create it, so limits
+were effectively unbounded at the level that matters commercially (the paying entity is the
+workspace). Per-org enforcement makes the limit mean what the pricing page says.
+
+**Why keep the per-user columns.** Dropping `users.plan`/`ai_actions_*` would be a
+destructive, irreversible migration for no functional gain; they're left in place (no longer
+read for limits) so the change is reversible and any external reference doesn't break. The
+org columns are the source of truth.
+
+**How existing orgs are seeded.** The migration backfills each org's `plan` from its founding
+user (`organizations.created_by`) when that user was on a paid plan — so a Pro user's personal
+org stays Pro rather than silently downgrading to Free on first run.
+
+**Why active-org for `/users/me`.** A user can belong to several workspaces with different
+plans; usage is only meaningful relative to one. The frontend already sends `X-Org-Id` on
+every request and reloads on workspace switch, so the navbar usage pill now reflects the
+workspace in view with no extra plumbing.
+
+**Impact.** `addBillingToOrganizations` migration; `billing.Service` methods re-keyed to
+`orgID`; callers updated — `deploy.HandleCreateProject` (uses the already-resolved active
+org), `conversation.ProcessMessage` (resolves the project's org before metering),
+`users.HandleGetMe` (resolves active org via `middleware.ActiveOrg`). No payment integration
+yet — this is limit enforcement, not invoicing.
+
+---
+
 ## ADR-016 — On-call quiet hours: warn alerts suppressed, error alerts always break through
 **Date:** 2026-06-16 · **Status:** Accepted
 

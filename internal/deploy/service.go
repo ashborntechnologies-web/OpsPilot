@@ -255,7 +255,7 @@ func (s *Service) HandleCreateProject(c *gin.Context) {
 	}
 
 	if s.billingSvc != nil {
-		if err := s.billingSvc.CheckProjectLimit(c.Request.Context(), userID); err != nil {
+		if err := s.billingSvc.CheckProjectLimit(c.Request.Context(), orgID); err != nil {
 			var limitErr *billing.ErrLimitReached
 			if errors.As(err, &limitErr) {
 				c.JSON(http.StatusForbidden, gin.H{"error": limitErr.Message})
