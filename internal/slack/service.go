@@ -140,11 +140,11 @@ func (s *Service) loadIntegration(ctx context.Context, orgID uuid.UUID) (*models
 	err := s.db.Pool.QueryRow(ctx, `
 		SELECT id, org_id, team_id, workspace_name, bot_token,
 		       alert_channel_id, alert_channel_name, deploy_channel_id, deploy_channel_name,
-		       summary_channel_id, summary_channel_name, installed_by, created_at, updated_at
+		       summary_channel_id, summary_channel_name, allow_slack_deploys, installed_by, created_at, updated_at
 		FROM slack_integrations WHERE org_id = $1`, orgID,
 	).Scan(&in.ID, &in.OrgID, &in.TeamID, &in.WorkspaceName, &in.BotToken,
 		&in.AlertChannelID, &in.AlertChannelName, &in.DeployChannelID, &in.DeployChannelName,
-		&in.SummaryChannelID, &in.SummaryChannelName, &in.InstalledBy, &in.CreatedAt, &in.UpdatedAt)
+		&in.SummaryChannelID, &in.SummaryChannelName, &in.AllowSlackDeploys, &in.InstalledBy, &in.CreatedAt, &in.UpdatedAt)
 	if err != nil {
 		return nil, nil // not connected (or not found) — callers treat as "no Slack"
 	}

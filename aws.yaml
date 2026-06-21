@@ -63,6 +63,9 @@ Resources:
                   - ecs:DescribeTaskDefinition
                   - ecs:ListTasks
                   - ecs:DescribeTasks
+                  - ecs:ListClusters
+                  - ecs:ListServices
+                  - ecs:ListTagsForResource
                   - ecs:TagResource
                 Resource: '*'
               - Sid: CodeBuild
@@ -154,6 +157,32 @@ Resources:
                   - iam:PassRole
                   - iam:TagRole
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/cdrole-*'
+              - Sid: DiscoveryReadOnly
+                Effect: Allow
+                # Read-only describe/list calls used by infrastructure discovery
+                # (internal/discovery) to inventory existing resources. Without these the
+                # RDS/ElastiCache/Lambda/S3/SQS scanners silently skip and the inventory is
+                # incomplete with no error surfaced to the user.
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:ListTagsForResource
+                  - elasticache:DescribeCacheClusters
+                  - elasticache:ListTagsForResource
+                  - lambda:ListFunctions
+                  - lambda:ListTags
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketLocation
+                  - s3:GetBucketTagging
+                  - sqs:ListQueues
+                  - sqs:GetQueueAttributes
+                  - sqs:ListQueueTags
+                Resource: '*'
+              - Sid: CostExplorer
+                Effect: Allow
+                # Cost intelligence (project cost summary + daily-summary cost change).
+                Action:
+                  - ce:GetCostAndUsage
+                Resource: '*'
               - Sid: STS
                 Effect: Allow
                 Action: sts:GetCallerIdentity

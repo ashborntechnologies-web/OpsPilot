@@ -2,8 +2,10 @@
 
 // Lightweight, dependency-free SVG charts for the leadership dashboard. (recharts is not
 // installed; these render crisply, carry no bundle cost, and cover the two shapes we need:
-// an uptime line with an SLA reference line, and a weekly incident bar chart.)
+// an uptime line with an SLA reference line, and a weekly incident bar chart.) Hover shows
+// an in-SVG crosshair + tooltip — coordinate-consistent with the viewBox, no DOM overlay.
 
+import { useRef, useState } from "react";
 import type { UptimePoint, IncidentPoint } from "@/types/api";
 
 const W = 560; // viewBox width; the SVG scales to its container via width="100%"
@@ -15,8 +17,38 @@ function fmtDay(d: string) {
   return `${m}/${day}`;
 }
 
+// Tooltip renders a small in-SVG label box near (cx, top), clamped horizontally so it
+// doesn't overflow the viewBox. lines[0] is bold-ish (slightly larger).
+function Tooltip({ cx, lines }: { cx: number; lines: string[] }) {
+  const w = Math.max(58, ...lines.map((l) => l.length * 5.6));
+  const x = Math.min(Math.max(cx - w / 2, 2), W - w - 2);
+  const h = 12 + lines.length * 12;
+  return (
+    <g pointerEvents="none">
+      <rect x={x} y={2} width={w} height={h} rx="3" fill="#18181b" opacity="0.92" />
+      {lines.map((l, i) => (
+        <text key={i} x={x + w / 2} y={15 + i * 12} textAnchor="middle" fontSize={i === 0 ? "10" : "9"}
+          fill={i === 0 ? "#fff" : "#d4d4d8"}>{l}</text>
+      ))}
+    </g>
+  );
+}
+
+// nearestIndex maps a mouse event over the plot to the closest data index across the inner
+// plot width.
+function nearestIndex(e: React.MouseEvent<SVGSVGElement>, svg: SVGSVGElement | null, n: number): number {
+  if (!svg || n === 0) return -1;
+  const rect = svg.getBoundingClientRect();
+  const innerW = W - PAD.left - PAD.right;
+  const xView = ((e.clientX - rect.left) / rect.width) * W;
+  const ratio = Math.min(Math.max((xView - PAD.left) / innerW, 0), 1);
+  return Math.round(ratio * (n - 1));
+}
+
 // UptimeLineChart plots uptime % per day with a red dashed SLA reference line.
 export function UptimeLineChart({ points, slaTarget }: { points: UptimePoint[]; slaTarget: number }) {
+  const svgRef = useRef<SVGSVGElement>(null);
+  const [hover, setHover] = useState(-1);
   if (points.length === 0) {
     return <EmptyChart label="No uptime data yet" />;
   }
@@ -37,8 +69,12 @@ export function UptimeLineChart({ points, slaTarget }: { points: UptimePoint[]; 
   const ticks = [yMin, (yMin + yMax) / 2, yMax];
   const labelEvery = Math.ceil(points.length / 8);
 
+  const hp = hover >= 0 && hover < points.length ? points[hover] : null;
+
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" role="img" aria-label="Uptime per day">
+    <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" role="img" aria-label="Uptime per day"
+      onMouseMove={(e) => setHover(nearestIndex(e, svgRef.current, points.length))}
+      onMouseLeave={() => setHover(-1)}>
       {ticks.map((t) => (
         <g key={t}>
           <line x1={PAD.left} y1={y(t)} x2={W - PAD.right} y2={y(t)} stroke="#f4f4f5" />
@@ -59,12 +95,22 @@ export function UptimeLineChart({ points, slaTarget }: { points: UptimePoint[]; 
           <text key={p.date} x={x(i)} y={H - 8} textAnchor="middle" fontSize="9" fill="#a1a1aa">{fmtDay(p.date)}</text>
         ) : null
       )}
+      {/* Hover crosshair + dot + tooltip */}
+      {hp && (
+        <g pointerEvents="none">
+          <line x1={x(hover)} y1={PAD.top} x2={x(hover)} y2={PAD.top + innerH} stroke="#a1a1aa" strokeDasharray="3 3" />
+          <circle cx={x(hover)} cy={y(hp.uptime_pct)} r="3" fill="#6366f1" stroke="#fff" strokeWidth="1.5" />
+          <Tooltip cx={x(hover)} lines={[`${hp.uptime_pct.toFixed(2)}%`, hp.date]} />
+        </g>
+      )}
     </svg>
   );
 }
 
 // IncidentBarChart plots incident counts per week.
 export function IncidentBarChart({ points }: { points: IncidentPoint[] }) {
+  const svgRef = useRef<SVGSVGElement>(null);
+  const [hover, setHover] = useState(-1);
   if (points.length === 0) {
     return <EmptyChart label="No incident data yet" />;
   }
@@ -77,8 +123,19 @@ export function IncidentBarChart({ points }: { points: IncidentPoint[] }) {
   const ticks = [0, Math.ceil(maxCount / 2), maxCount];
   const labelEvery = Math.ceil(points.length / 8);
 
+  // Bars occupy slots, so hit-test by slot rather than nearest line point.
+  const slotIndex = (e: React.MouseEvent<SVGSVGElement>): number => {
+    if (!svgRef.current) return -1;
+    const rect = svgRef.current.getBoundingClientRect();
+    const xView = ((e.clientX - rect.left) / rect.width) * W;
+    const i = Math.floor((xView - PAD.left) / slot);
+    return i >= 0 && i < points.length ? i : -1;
+  };
+  const hp = hover >= 0 && hover < points.length ? points[hover] : null;
+
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" role="img" aria-label="Incidents per week">
+    <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" role="img" aria-label="Incidents per week"
+      onMouseMove={(e) => setHover(slotIndex(e))} onMouseLeave={() => setHover(-1)}>
       {ticks.map((t) => (
         <g key={t}>
           <line x1={PAD.left} y1={y(t)} x2={W - PAD.right} y2={y(t)} stroke="#f4f4f5" />
@@ -91,13 +148,17 @@ export function IncidentBarChart({ points }: { points: IncidentPoint[] }) {
         return (
           <g key={p.week_start}>
             <rect x={cx - barW / 2} y={y(p.count)} width={barW} height={Math.max(0, barH)} rx="2"
-              fill={p.count > 0 ? "#6366f1" : "#e4e4e7"} />
+              fill={p.count > 0 ? "#6366f1" : "#e4e4e7"} opacity={hover < 0 || hover === i ? 1 : 0.5} />
             {i % labelEvery === 0 && (
               <text x={cx} y={H - 8} textAnchor="middle" fontSize="9" fill="#a1a1aa">{fmtDay(p.week_start)}</text>
             )}
           </g>
         );
       })}
+      {hp && (
+        <Tooltip cx={PAD.left + hover * slot + slot / 2}
+          lines={[`${hp.count} incident${hp.count === 1 ? "" : "s"}`, `week of ${hp.week_start}`]} />
+      )}
     </svg>
   );
 }

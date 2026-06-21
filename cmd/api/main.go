@@ -218,7 +218,11 @@ func main() {
 
 	eventSvc := events.NewService(db)
 	awsSvc.SetEvents(eventSvc) // enable account-level audit events (e.g. external_id.generated)
-	envVarSvc := envvars.NewService(db)
+	envVarSvc := envvars.NewService(db, os.Getenv("ENCRYPTION_KEY"), os.Getenv("ENCRYPTION_KEY_PREV"))
+	// Encrypt any pre-existing plaintext secret env vars at rest (one-time, idempotent).
+	if err := envVarSvc.EncryptExistingSecrets(context.Background()); err != nil {
+		slog.Warn(fmt.Sprintf("WARNING: failed to backfill-encrypt secret env vars: %v", err))
+	}
 	webhookSvc := webhooks.NewService(db)
 	terminalSvc := terminal.NewService(db, awsSvc, authSvc)
 	deploySvc := deploy.NewService(db, awsSvc, githubSvc, hub, queueClient, eventSvc, envVarSvc, webhookSvc)

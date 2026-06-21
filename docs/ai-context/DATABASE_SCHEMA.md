@@ -145,7 +145,11 @@ One build+rollout of a commit to an environment.
 ### `env_vars`
 Per-environment key/value injected into the ECS task definition at deploy time.
 `UNIQUE(environment_id, key)`. `is_secret=true` → value redacted in API list responses
-(revealed only via the dedicated reveal endpoint); stored plaintext (DB encrypted at rest).
+(revealed only via the dedicated reveal endpoint) **and AES-256-GCM encrypted at the
+application layer** (`pkg/crypto`, `v1:` prefix, keyed by `ENCRYPTION_KEY`; ADR-019) —
+encrypted on write, decrypted only on reveal and at deploy-time task-def injection. A startup
+backfill (`envvars.EncryptExistingSecrets`) encrypts any legacy plaintext secrets; non-secret
+values are stored plaintext (they're shown in list responses).
 
 ### `operational_events`
 **The AI substrate.** Structured record of every meaningful state transition (deploy/
@@ -243,9 +247,11 @@ window. **`UNIQUE(org_id, resource_type, resource_id)`** makes re-scans idempote
 One Slack workspace connection per org (`UNIQUE(org_id)`). `team_id` maps incoming slash
 commands back to the org; `bot_token` is **encrypted at rest** with ENCRYPTION_KEY
 (`pkg/crypto`, never exposed in JSON). Per-purpose channel routing: `alert_channel_*`,
-`deploy_channel_*`, `summary_channel_*` (id + name). `installed_by` records the admin who
-connected it. Managed by `internal/slack` (OAuth callback writes it; the integrations UI
-updates channels; disconnect deletes it).
+`deploy_channel_*`, `summary_channel_*` (id + name). `allow_slack_deploys` (BOOL, default
+**false** — ADR-018) gates the destructive `/opspilot deploy|rollback` slash commands;
+off by default because Slack users aren't mapped to OpsPilot roles. `installed_by` records
+the admin who connected it. Managed by `internal/slack` (OAuth callback writes it; the
+integrations UI updates channels + the deploy toggle; disconnect deletes it).
 
 ### `daily_summaries`
 One AI-generated morning briefing per org per day (`UNIQUE(org_id, summary_date)`).

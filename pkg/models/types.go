@@ -681,6 +681,7 @@ type SlackIntegration struct {
 	DeployChannelName  *string    `json:"deploy_channel_name" db:"deploy_channel_name"`
 	SummaryChannelID   *string    `json:"summary_channel_id" db:"summary_channel_id"`
 	SummaryChannelName *string    `json:"summary_channel_name" db:"summary_channel_name"`
+	AllowSlackDeploys  bool       `json:"allow_slack_deploys" db:"allow_slack_deploys"`
 	InstalledBy        *uuid.UUID `json:"installed_by" db:"installed_by"`
 	CreatedAt          time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at" db:"updated_at"`

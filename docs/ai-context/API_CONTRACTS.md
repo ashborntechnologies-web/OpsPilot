@@ -70,7 +70,7 @@ Frontend client: [`frontend/lib/api.ts`](../../frontend/lib/api.ts). Errors are
 | GET | `/orgs/:orgId/slack` | — | `{connected, configured, integration?}` | member |
 | GET | `/orgs/:orgId/slack/channels` | — | `SlackChannel[]` (Slack conversations.list) | member |
 | GET | `/orgs/:orgId/slack/install` | — | `{url}` (signed-state OAuth URL) | **admin** |
-| PATCH | `/orgs/:orgId/slack` | `{alert/deploy/summary_channel_id+name}` | `{message}` | **admin** |
+| PATCH | `/orgs/:orgId/slack` | `{alert/deploy/summary_channel_id+name, allow_slack_deploys?}` | `{message}` | **admin** |
 | DELETE | `/orgs/:orgId/slack` | — | `{message}` (disconnect) | **admin** |
 | GET | `/orgs/:orgId/analytics?days=30` | — | `{metrics: ReliabilityMetrics, breakdown: ProjectReliabilityRow[]}` (org-wide leadership dashboard) | member |
 | GET | `/orgs/:orgId/reports` | — | `DailySummaryRecord[]` (monthly health reports, `is_monthly=true`) | member |

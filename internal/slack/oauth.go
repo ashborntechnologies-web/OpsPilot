@@ -212,6 +212,7 @@ func (s *Service) HandleUpdateChannels(c *gin.Context) {
 		DeployChannelName  *string `json:"deploy_channel_name"`
 		SummaryChannelID   *string `json:"summary_channel_id"`
 		SummaryChannelName *string `json:"summary_channel_name"`
+		AllowSlackDeploys  *bool   `json:"allow_slack_deploys"` // optional opt-in for Slack deploy/rollback (ADR-018)
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -222,10 +223,11 @@ func (s *Service) HandleUpdateChannels(c *gin.Context) {
 		    alert_channel_id = $2, alert_channel_name = $3,
 		    deploy_channel_id = $4, deploy_channel_name = $5,
 		    summary_channel_id = $6, summary_channel_name = $7,
+		    allow_slack_deploys = COALESCE($8, allow_slack_deploys),
 		    updated_at = NOW()
 		WHERE org_id = $1`,
 		orgID, req.AlertChannelID, req.AlertChannelName, req.DeployChannelID,
-		req.DeployChannelName, req.SummaryChannelID, req.SummaryChannelName)
+		req.DeployChannelName, req.SummaryChannelID, req.SummaryChannelName, req.AllowSlackDeploys)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update channels"})
 		return
