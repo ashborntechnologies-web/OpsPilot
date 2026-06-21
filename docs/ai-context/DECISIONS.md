@@ -635,3 +635,82 @@ discipline.
 **Impact.** `pkg/middleware/auth.go` (`RequireProjectOwnership`, `UserOwnsProject`); new
 project-scoped handlers just join the group. (Recorded in project memory:
 "new handlers there skip ownership re-checks".)
+
+---
+
+## ADR-020 — Dual onboarding paths (Flow A / Flow B) converging on one trust ladder
+**Date:** 2026-06-21 · **Status:** Accepted (vision-level); promotion mechanics and
+Flow B's IAM role separation are explicitly **not yet designed** — see Open Decisions
+in `ROADMAP.md`.
+
+**Decision.** OpsPilot serves two populations through two onboarding flows that
+converge into a single five-tier trust model, rather than as two separate products:
+
+- **Flow A (new infrastructure).** OpsPilot provisions and deploys from day one.
+  Starts at Tier 2 (execute with approval) by default, because there is no existing
+  production to put at risk.
+- **Flow B (existing infrastructure).** OpsPilot connects read-only — to AWS, repos,
+  and eventually existing monitoring — and starts at Tier 0 (observe only: discover,
+  monitor, diagnose, recommend; no write access at all). It earns Tier 1
+  (recommend — generate reviewable IaC/alarm/runbook artifacts), then Tier 2, then
+  potentially Tier 3, the same way Flow A's environments earn Tier 3: by an explicit,
+  admin-confirmed promotion based on track record, never automatically.
+
+Both flows are governed by the same `trust_level` concept already implemented for
+environments (`suggest`/`supervised`/`autonomous`, ADR-013) — Flow B is a new entry
+point into that model, not a parallel one.
+
+**Context.** The existing product (and `PRODUCT_VISION.md` prior to this revision)
+only described Population A: small teams with no existing AWS footprint. That's a
+real but narrow market. Most companies above the earliest stage already run
+production infrastructure on AWS with their own CI/CD, IaC, and monitoring — they
+will not migrate to adopt a deployment platform, and they will not grant an unproven
+AI write access to production on day one. Without a path for this population, every
+company past ~5 engineers with existing infrastructure was simply unaddressable, and
+infrastructure discovery (ADR-010, already built) had no onboarding story to sit
+underneath.
+
+**Alternatives considered.**
+- *Single onboarding flow, ask everyone to connect read-write from the start* —
+  rejected: this is the status quo and it's exactly what makes Population B
+  unaddressable. No serious engineering org grants write access to an unproven
+  system.
+- *Two separate products (a "deploy platform" and an "observability platform")* —
+  rejected: doubles the surface area to build and maintain, and throws away the
+  actual insight, which is that both populations want the same end state (an AI that
+  diagnoses and eventually acts) — they just need to start from different trust
+  positions to get there safely. Segmenting by product instead of by trust tier would
+  also strand Flow A customers who grow past the "small team" stage with no natural
+  path to the capabilities Flow B customers eventually unlock.
+- *Let Flow B customers request write access immediately, gated only by a checkbox* —
+  rejected: a checkbox is not a trust signal. It would either be ignored (everyone
+  checks it, no actual risk reduction) or distrusted (security teams won't accept
+  "the customer agreed" as the control). The whole point of Flow B is that trust has
+  to be demonstrated with evidence (`ai_actions`, `diagnosis_feedback` already
+  capture the raw data for this, per ADR-012/ADR-013), not asserted.
+
+**Rationale.** The two flows are different starting *positions* on the same ladder,
+not different products, because the thing being sold is identical in both cases — an
+AI that gets more capable and more trusted the longer it operates correctly. Starting
+position should track real risk (does this account currently run anything that
+matters), not company size or segment. This also means every investment already made
+in the trust ladder (explainability — ADR-012, approval flows — ADR-013) pays off for
+both populations simultaneously, rather than needing a separate trust mechanism built
+for Flow B specifically.
+
+**Explicitly deferred, not decided here.**
+- The exact thresholds for tier promotion (incident count, time window, false-positive
+  rate) — flagged in `PRODUCT_VISION.md` as the single most important open mechanism
+  in the product. "Trust is earned over time" is not itself a mechanism.
+- Whether Flow B's read-only IAM role is enforced by policy alone or also
+  belt-and-suspenders-checked in the application layer before any write call.
+- Tier 1 (IaC generation) implementation — real, scoped, multi-month future work; not
+  to be estimated or started opportunistically.
+- Whether a Tier 3 grant is durable once given or requires periodic re-confirmation.
+
+**Impact.** `PRODUCT_VISION.md` rewritten around the two-population framing and the
+trust ladder table. `ROADMAP.md` near-term priority list reordered around Flow B's
+read-only onboarding path. No code changes yet — this ADR records the vision-level
+decision; the promotion-mechanics and IAM-role-separation designs are tracked as open
+decisions and must be resolved before either is handed to Claude Code as an
+implementation prompt.
